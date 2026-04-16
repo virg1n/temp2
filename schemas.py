@@ -361,6 +361,8 @@ class RuntimeSettings:
     unload_red_after_generation: bool = True
     unload_socratic_after_use: bool = True
     empty_cuda_cache_on_unload: bool = True
+    task_execution_timeout_seconds: float = 5.0
+    task_execution_max_output_chars: int = 2000
 
     @classmethod
     def from_dict(cls, data: JsonDict | None) -> "RuntimeSettings":
@@ -372,6 +374,8 @@ class RuntimeSettings:
             unload_red_after_generation=bool(payload.get("unload_red_after_generation", True)),
             unload_socratic_after_use=bool(payload.get("unload_socratic_after_use", True)),
             empty_cuda_cache_on_unload=bool(payload.get("empty_cuda_cache_on_unload", True)),
+            task_execution_timeout_seconds=float(payload.get("task_execution_timeout_seconds", 5.0)),
+            task_execution_max_output_chars=int(payload.get("task_execution_max_output_chars", 2000)),
         )
 
 
@@ -457,6 +461,7 @@ class TaskCandidate:
     educational_value: str
     source_model: str
     source_adapter_path: str | None
+    observed_failure: str | None = None
     raw_payload: JsonDict = field(default_factory=dict)
 
     @property

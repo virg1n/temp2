@@ -148,7 +148,7 @@ training:
     warmup_ratio: 0.03
     weight_decay: 0.0
     optim: adamw_torch
-    max_length: 3072
+    max_length: 1024
     bf16: true
     fp16: false
     gradient_checkpointing: true
@@ -183,3 +183,5 @@ runtime:
   unload_red_after_generation: true
   unload_socratic_after_use: true
   empty_cuda_cache_on_unload: true
+  task_execution_timeout_seconds: 5.0
+  task_execution_max_output_chars: 2000

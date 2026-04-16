@@ -6,6 +6,7 @@ from environment_engine import EnvironmentEngine
 from logging_utils import get_logger, log_event
 from prompts import build_socratic_messages, build_socratic_user_prompt
 from schemas import HintCandidate, PipelineSettings, TaskCandidate
+from task_execution import execute_buggy_task
 
 
 LOGGER = get_logger(__name__)
@@ -16,12 +17,24 @@ class SocraticHintGenerator:
         self.environment = environment
         self.settings = settings
 
+    def _ensure_observed_failure(self, task: TaskCandidate) -> None:
+        if task.observed_failure is not None:
+            return
+        observed_failure = execute_buggy_task(
+            task.buggy_python,
+            task.asserts,
+            timeout_seconds=self.settings.runtime.task_execution_timeout_seconds,
+            max_output_chars=self.settings.runtime.task_execution_max_output_chars,
+        )
+        task.observed_failure = observed_failure
+
     def generate_hints(self, tasks: list[TaskCandidate]) -> list[HintCandidate]:
         model = self.environment.load_socratic()
         num_hints = self.settings.training.socratic.num_hints_per_task
         results: list[HintCandidate] = []
 
         for task in tasks:
+            self._ensure_observed_failure(task)
             prompt_text = build_socratic_user_prompt(task)
             messages = build_socratic_messages(task)
             outputs = model.generate(

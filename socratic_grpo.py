@@ -80,10 +80,20 @@ class SocraticGRPOTrainerWrapper:
             for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
                 items.append((f"grpo-item-{idx}", _prompt_to_user_text(prompt), _completion_to_text(completion)))
             evaluations = self.assessor.score_prompt_completion_pairs(items)
-            return [
+            rewards = [
                 float(evaluations.get(item_id).scores.final_reward if item_id in evaluations else 0.0)
                 for item_id, _, _ in items
             ]
+            if rewards and all(reward == 0.0 for reward in rewards):
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "grpo_zero_reward_batch",
+                    "All GRPO rewards were zero for the current batch",
+                    batch_size=len(rewards),
+                    sample_feedback=[evaluations[item_id].judge_feedback for item_id, _, _ in items[:2] if item_id in evaluations],
+                )
+            return rewards
 
         return reward_fn
 
@@ -162,8 +172,9 @@ class SocraticGRPOTrainerWrapper:
             "deepspeed": trainer_settings.deepspeed,
             "report_to": "none",
             "ddp_find_unused_parameters": False,
-            "model_init_kwargs": {"trust_remote_code": self.settings.models.socratic.trust_remote_code},
         }
+        if isinstance(model_for_trainer, str):
+            cfg_kwargs["model_init_kwargs"] = {"trust_remote_code": self.settings.models.socratic.trust_remote_code}
         cfg = GRPOConfig(**_filter_kwargs_for_init(GRPOConfig, cfg_kwargs))
         if isinstance(model_for_trainer, str):
             allowed = _allowed_init_params(GRPOConfig) or set()

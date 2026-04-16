@@ -40,6 +40,7 @@ def _task_from_dict(data: dict) -> TaskCandidate:
         educational_value=str(data.get("educational_value", "")),
         source_model=str(data.get("source_model", "")),
         source_adapter_path=data.get("source_adapter_path"),
+        observed_failure=data.get("observed_failure"),
         raw_payload=dict(data.get("raw_payload", {})),
     )
 

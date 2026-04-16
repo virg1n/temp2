@@ -41,16 +41,24 @@ class RedTaskGenerator:
         self.environment = environment
         self.settings = settings
 
-    def _to_task_candidate(self, payload: dict[str, Any], adapter_path: str | None) -> TaskCandidate | None:
-        topic = str(payload.get("topic", "")).strip()
+    def _to_task_candidate(
+        self,
+        payload: dict[str, Any],
+        adapter_path: str | None,
+        expected_topic: CurriculumTopic,
+    ) -> TaskCandidate | None:
+        declared_topic = str(payload.get("topic", "")).strip()
+        topic = expected_topic.name
         task_statement = str(payload.get("task_statement", "")).strip()
         buggy_python = str(payload.get("buggy_python", "")).strip()
         bug_summary = str(payload.get("bug_summary", "")).strip()
         educational_value = str(payload.get("educational_value", "")).strip()
         asserts = _normalize_asserts(payload.get("asserts"))
-        if not topic or not task_statement or not buggy_python or not asserts:
+        if not task_statement or not buggy_python or not asserts:
             return None
         task_id = _stable_task_id(topic, task_statement, buggy_python, asserts)
+        raw_payload = dict(payload)
+        raw_payload["declared_topic"] = declared_topic
         return TaskCandidate(
             task_id=task_id,
             topic=topic,
@@ -61,7 +69,8 @@ class RedTaskGenerator:
             educational_value=educational_value,
             source_model=self.settings.models.red.model_name_or_path,
             source_adapter_path=adapter_path,
-            raw_payload=payload,
+            observed_failure=None,
+            raw_payload=raw_payload,
         )
 
     def generate_for_topics(self, topics: list[CurriculumTopic], *, use_base_model: bool = False) -> list[TaskCandidate]:
@@ -81,7 +90,7 @@ class RedTaskGenerator:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                candidate = self._to_task_candidate(item, adapter_path)
+                candidate = self._to_task_candidate(item, adapter_path, topic)
                 if candidate is None:
                     continue
                 candidates.append(candidate)

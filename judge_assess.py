@@ -68,13 +68,47 @@ class HintJudgeAssessor:
             batch = items[start : start + batch_size]
             messages = build_hint_assessment_messages(batch)
             raw = judge.generate(messages, generation=self.settings.models.judge.generation, num_return_sequences=1)
-            payload = extract_json(raw[0] if raw else "")
-            verdicts = payload if isinstance(payload, list) else []
-            verdict_map = {
-                str(item.get("item_id")): item
-                for item in verdicts
-                if isinstance(item, dict) and item.get("item_id") is not None
-            }
+            raw_text = raw[0] if raw else ""
+            payload = extract_json(raw_text)
+            verdicts = []
+            if isinstance(payload, list):
+                verdicts = payload
+            elif isinstance(payload, dict):
+                verdicts = payload.get("items") or payload.get("results") or payload.get("scores") or []
+            verdict_map: dict[str, dict[str, object]] = {}
+
+            if isinstance(verdicts, list):
+                for index, item in enumerate(verdicts):
+                    if isinstance(item, (int, float)) and len(verdicts) == len(batch):
+                        score = _clamp_score(item)
+                        verdict_map[batch[index][0]] = {
+                            "item_id": batch[index][0],
+                            "no_solution_reveal": score,
+                            "bug_localization": score,
+                            "usefulness": score,
+                            "socratic_style": score,
+                            "technical_accuracy": score,
+                            "feedback": "Scalar score fallback",
+                        }
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    item_id = item.get("item_id") or item.get("task_id")
+                    if item_id is None and len(verdicts) == len(batch):
+                        item_id = batch[index][0]
+                    if item_id is not None:
+                        verdict_map[str(item_id)] = item
+
+            if not verdict_map:
+                preview = raw_text[:300].replace("\n", "\\n")
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "hint_assessment_parse_miss",
+                    "Judge hint assessment did not return usable item ids",
+                    batch_size=len(batch),
+                    raw_preview=preview,
+                )
 
             for item_id, prompt_text, hint_text in batch:
                 verdict = verdict_map.get(item_id, {})

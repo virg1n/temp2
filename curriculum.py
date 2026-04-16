@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 
 from logging_utils import get_logger, log_event
 from schemas import CurriculumSettings, CurriculumState, CurriculumTopic, TaskOutcome, TopicStats
@@ -16,6 +17,47 @@ class CurriculumManager:
         self.state = state
         self.topic_map = {topic.name: topic for topic in settings.topics}
         self._initial_weights = {topic.name: topic.initial_weight for topic in settings.topics}
+        self._topic_aliases = self._build_topic_aliases()
+        self._canonicalize_state()
+
+    def _normalize_key(self, topic_name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", topic_name.strip().lower())
+
+    def _build_topic_aliases(self) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for topic in self.settings.topics:
+            key = self._normalize_key(topic.name)
+            aliases[key] = topic.name
+            if key.endswith("s"):
+                aliases.setdefault(key[:-1], topic.name)
+            else:
+                aliases.setdefault(key + "s", topic.name)
+        return aliases
+
+    def normalize_topic_name(self, topic_name: str) -> str:
+        key = self._normalize_key(topic_name)
+        return self._topic_aliases.get(key, topic_name.strip())
+
+    def _canonicalize_state(self) -> None:
+        merged_weights: dict[str, list[float]] = {topic.name: [] for topic in self.settings.topics}
+        for raw_topic, weight in self.state.topic_weights.items():
+            canonical = self.normalize_topic_name(raw_topic)
+            merged_weights.setdefault(canonical, []).append(float(weight))
+        self.state.topic_weights = {
+            topic: (sum(values) / len(values) if values else self._initial_weights.get(topic, 1.0))
+            for topic, values in merged_weights.items()
+        }
+
+        merged_stats: dict[str, TopicStats] = {topic.name: TopicStats() for topic in self.settings.topics}
+        for raw_topic, stats in self.state.topic_stats.items():
+            canonical = self.normalize_topic_name(raw_topic)
+            current = merged_stats.setdefault(canonical, TopicStats())
+            current.attempts += int(stats.attempts)
+            current.valid_tasks += int(stats.valid_tasks)
+            current.cumulative_reward += float(stats.cumulative_reward)
+        self.state.topic_stats = merged_stats
+        if self.state.last_topic is not None:
+            self.state.last_topic = self.normalize_topic_name(self.state.last_topic)
 
     def _weighted_sample_without_replacement(self, rng: random.Random, count: int) -> list[CurriculumTopic]:
         available = list(self.settings.topics)
@@ -102,5 +144,5 @@ class CurriculumManager:
         )
 
     def topic_description(self, topic_name: str) -> str:
-        topic = self.topic_map.get(topic_name)
+        topic = self.topic_map.get(self.normalize_topic_name(topic_name))
         return topic.description if topic is not None else topic_name
