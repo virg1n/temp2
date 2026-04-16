@@ -15,10 +15,12 @@ from red_generation import RedTaskGenerator
 from schemas import (
     HintEvaluation,
     PipelineSettings,
+    RejectedTask,
     ReplayRecord,
     TaskCandidate,
     TaskOutcome,
     ValidatedTask,
+    ValidationResult,
     dataclass_to_dict,
 )
 from socratic_generation import SocraticHintGenerator
@@ -82,25 +84,35 @@ class AdversarialCurriculumPipeline:
             },
         )
 
-    def _generate_valid_tasks(self, topics) -> list[ValidatedTask]:
-        valid_tasks = self.validator.validate_candidates(self.red_generator.generate_for_topics(topics))
-        if len(valid_tasks) >= self.settings.judge.min_valid_tasks:
-            return valid_tasks
+    def _merge_validation_results(self, base: ValidationResult, extra: ValidationResult) -> ValidationResult:
+        seen_valid_ids = {item.task.task_id for item in base.valid_tasks}
+        seen_rejected_ids = {item.task.task_id for item in base.rejected_tasks}
+        for item in extra.valid_tasks:
+            if item.task.task_id not in seen_valid_ids:
+                base.valid_tasks.append(item)
+                seen_valid_ids.add(item.task.task_id)
+        for item in extra.rejected_tasks:
+            if item.task.task_id not in seen_rejected_ids and item.task.task_id not in seen_valid_ids:
+                base.rejected_tasks.append(item)
+                seen_rejected_ids.add(item.task.task_id)
+        return base
+
+    def _generate_valid_tasks(self, topics) -> ValidationResult:
+        result = self.validator.validate_candidates(self.red_generator.generate_for_topics(topics))
+        if len(result.valid_tasks) >= self.settings.judge.min_valid_tasks:
+            return result
 
         if self.settings.runtime.retry_invalid_generation_once:
-            retry_valid = self.validator.validate_candidates(self.red_generator.generate_for_topics(topics))
-            known_ids = {item.task.task_id for item in valid_tasks}
-            valid_tasks.extend([item for item in retry_valid if item.task.task_id not in known_ids])
-            if len(valid_tasks) >= self.settings.judge.min_valid_tasks:
-                return valid_tasks
+            retry_result = self.validator.validate_candidates(self.red_generator.generate_for_topics(topics))
+            result = self._merge_validation_results(result, retry_result)
+            if len(result.valid_tasks) >= self.settings.judge.min_valid_tasks:
+                return result
 
         self._reset_red_state("insufficient_valid_tasks_after_retry")
-        fallback_valid = self.validator.validate_candidates(
+        fallback_result = self.validator.validate_candidates(
             self.red_generator.generate_for_topics(topics, use_base_model=True)
         )
-        known_ids = {item.task.task_id for item in valid_tasks}
-        valid_tasks.extend([item for item in fallback_valid if item.task.task_id not in known_ids])
-        return valid_tasks
+        return self._merge_validation_results(result, fallback_result)
 
     def _build_outcomes(
         self,
@@ -138,6 +150,28 @@ class AdversarialCurriculumPipeline:
             records.append(ReplayRecord(task=validated.task, outcome=outcome, label=label))
         return outcomes, records
 
+    def _build_rejected_records(self, rejected_tasks: list[RejectedTask]) -> list[ReplayRecord]:
+        records: list[ReplayRecord] = []
+        for rejected in rejected_tasks:
+            label = classify_record_label(
+                0.0,
+                failure_threshold=self.settings.buffer.failure_reward_threshold,
+                easy_threshold=self.settings.buffer.easy_reward_threshold,
+                valid=False,
+            )
+            outcome = TaskOutcome(
+                task_id=rejected.task.task_id,
+                topic=rejected.task.topic,
+                average_reward=0.0,
+                best_reward=0.0,
+                hint_count=0,
+                label=label,
+                validation_score=rejected.judge_score,
+                validation_feedback=rejected.judge_feedback,
+            )
+            records.append(ReplayRecord(task=rejected.task, outcome=outcome, label=label))
+        return records
+
     def _maybe_train_socratic(self, round_index: int) -> None:
         threshold = self.settings.training.socratic.update_every_tasks
         if len(self.pending_grpo_tasks) < threshold:
@@ -167,11 +201,15 @@ class AdversarialCurriculumPipeline:
                     topics = self.curriculum.sample_topics(round_index, self.random)
                     self.curriculum.register_topics(topics)
 
-                valid_tasks = self._generate_valid_tasks(topics)
+                validation_result = self._generate_valid_tasks(topics)
                 if self.settings.runtime.unload_red_after_generation:
                     self.environment.unload_red()
 
+                valid_tasks = validation_result.valid_tasks
                 if not valid_tasks:
+                    rejected_records = self._build_rejected_records(validation_result.rejected_tasks)
+                    if rejected_records:
+                        self.buffer.add_many(rejected_records)
                     self.state.round_index = round_index + 1
                     self.storage.save_state(self.state)
                     continue
@@ -182,7 +220,8 @@ class AdversarialCurriculumPipeline:
                     self.environment.unload_socratic()
 
                 outcomes, replay_records = self._build_outcomes(valid_tasks, evaluations)
-                self.buffer.add_many(replay_records)
+                rejected_records = self._build_rejected_records(validation_result.rejected_tasks)
+                self.buffer.add_many(replay_records + rejected_records)
                 self.curriculum.update_from_outcomes(outcomes)
                 self.pending_grpo_tasks.extend([item.task for item in valid_tasks])
                 self._maybe_train_socratic(round_index)
@@ -194,6 +233,7 @@ class AdversarialCurriculumPipeline:
                     "round_index": round_index,
                     "topics": [topic.name for topic in topics],
                     "valid_tasks": [item.task.task_id for item in valid_tasks],
+                    "rejected_tasks": [item.task.task_id for item in validation_result.rejected_tasks],
                     "outcomes": [dataclass_to_dict(outcome) for outcome in outcomes],
                     "socratic_state": dataclass_to_dict(self.state.socratic),
                     "red_state": dataclass_to_dict(self.state.red),
@@ -205,6 +245,7 @@ class AdversarialCurriculumPipeline:
                         "round_index": round_index,
                         "topics": [topic.name for topic in topics],
                         "valid_task_count": len(valid_tasks),
+                        "rejected_task_count": len(validation_result.rejected_tasks),
                         "average_rewards": {outcome.task_id: outcome.average_reward for outcome in outcomes},
                     },
                 )

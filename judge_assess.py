@@ -63,9 +63,30 @@ class HintJudgeAssessor:
         judge = self.environment.load_judge()
         evaluations: dict[str, HintEvaluation] = {}
         batch_size = self.settings.judge.hint_assessment_batch_size
+        total_batches = (len(items) + batch_size - 1) // batch_size
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "hint_assessment_started",
+            "Starting hint assessment",
+            total_items=len(items),
+            batch_size=batch_size,
+            total_batches=total_batches,
+        )
 
         for start in range(0, len(items), batch_size):
             batch = items[start : start + batch_size]
+            batch_index = (start // batch_size) + 1
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "hint_assessment_batch_started",
+                "Starting hint assessment batch",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                batch_items=len(batch),
+            )
             messages = build_hint_assessment_messages(batch)
             raw = judge.generate(messages, generation=self.settings.models.judge.generation, num_return_sequences=1)
             raw_text = raw[0] if raw else ""
@@ -124,6 +145,16 @@ class HintJudgeAssessor:
                         "judge_payload": verdict,
                     },
                 )
+
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "hint_assessment_batch_finished",
+                "Finished hint assessment batch",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                accumulated_evaluations=len(evaluations),
+            )
 
         log_event(
             LOGGER,

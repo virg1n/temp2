@@ -25,6 +25,9 @@ class SocraticHintGenerator:
             task.asserts,
             timeout_seconds=self.settings.runtime.task_execution_timeout_seconds,
             max_output_chars=self.settings.runtime.task_execution_max_output_chars,
+            execution_mode=self.settings.runtime.task_execution_mode,
+            sandbox_command=self.settings.runtime.task_execution_sandbox_command,
+            allow_unsafe_host_execution=self.settings.runtime.allow_unsafe_host_execution,
         )
         task.observed_failure = observed_failure
 

@@ -8,7 +8,7 @@ from environment_engine import EnvironmentEngine
 from logging_utils import get_logger, log_event
 from models_factory import extract_json
 from prompts import build_task_validation_messages
-from schemas import PipelineSettings, TaskCandidate, ValidatedTask
+from schemas import PipelineSettings, RejectedTask, TaskCandidate, ValidatedTask, ValidationResult
 from storage import StorageManager
 
 
@@ -35,14 +35,24 @@ class TaskJudgeValidator:
         self.storage = storage
         self.seen_hashes = storage.load_seen_tasks()
 
-    def _dedupe_candidates(self, candidates: list[TaskCandidate]) -> list[tuple[TaskCandidate, str]]:
+    def _dedupe_candidates(self, candidates: list[TaskCandidate]) -> tuple[list[tuple[TaskCandidate, str]], list[RejectedTask]]:
         unique: list[tuple[TaskCandidate, str]] = []
+        rejected: list[RejectedTask] = []
         batch_seen: set[str] = set()
         duplicates = 0
         for candidate in candidates:
             key = _dedupe_key(candidate)
             if key in self.seen_hashes or key in batch_seen:
                 duplicates += 1
+                rejected.append(
+                    RejectedTask(
+                        task=candidate,
+                        dedupe_key=key,
+                        rejection_reason="duplicate",
+                        judge_score=0.0,
+                        judge_feedback="Duplicate of a previously seen or same-batch task",
+                    )
+                )
                 self.storage.append_event(
                     "task_rejected",
                     {
@@ -63,12 +73,12 @@ class TaskJudgeValidator:
             unique_count=len(unique),
             duplicate_count=duplicates,
         )
-        return unique
+        return unique, rejected
 
-    def validate_candidates(self, candidates: list[TaskCandidate]) -> list[ValidatedTask]:
-        deduped = self._dedupe_candidates(candidates)
+    def validate_candidates(self, candidates: list[TaskCandidate]) -> ValidationResult:
+        deduped, rejected_tasks = self._dedupe_candidates(candidates)
         if not deduped:
-            return []
+            return ValidationResult(valid_tasks=[], rejected_tasks=rejected_tasks)
 
         judge = self.environment.load_judge()
         valid_tasks: list[ValidatedTask] = []
@@ -102,6 +112,15 @@ class TaskJudgeValidator:
                     valid_tasks.append(validated)
                     self.seen_hashes.add(key)
                 else:
+                    rejected_tasks.append(
+                        RejectedTask(
+                            task=candidate,
+                            dedupe_key=key,
+                            rejection_reason="semantic_validation_failed",
+                            judge_score=score,
+                            judge_feedback=feedback,
+                        )
+                    )
                     self.storage.append_event(
                         "task_rejected",
                         {
@@ -120,6 +139,7 @@ class TaskJudgeValidator:
             "task_validation_finished",
             "Completed semantic task validation",
             valid_count=len(valid_tasks),
+            rejected_count=len(rejected_tasks),
             requested_min=self.settings.judge.min_valid_tasks,
         )
-        return valid_tasks
+        return ValidationResult(valid_tasks=valid_tasks, rejected_tasks=rejected_tasks)

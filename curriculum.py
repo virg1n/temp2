@@ -58,6 +58,8 @@ class CurriculumManager:
         self.state.topic_stats = merged_stats
         if self.state.last_topic is not None:
             self.state.last_topic = self.normalize_topic_name(self.state.last_topic)
+        if self.state.last_topic_batch_signature is None and self.state.last_topic is not None:
+            self.state.last_topic_batch_signature = self.state.last_topic
 
     def _weighted_sample_without_replacement(self, rng: random.Random, count: int) -> list[CurriculumTopic]:
         available = list(self.settings.topics)
@@ -90,15 +92,15 @@ class CurriculumManager:
         return topics
 
     def register_topics(self, topics: list[CurriculumTopic]) -> bool:
-        reset_required = False
-        for topic in topics:
-            if topic.name == self.state.last_topic:
-                self.state.consecutive_topic_repetitions += 1
-            else:
-                self.state.last_topic = topic.name
-                self.state.consecutive_topic_repetitions = 1
-            if self.state.consecutive_topic_repetitions >= self.settings.repeated_topic_reset_threshold:
-                reset_required = True
+        normalized_topics = [self.normalize_topic_name(topic.name) for topic in topics]
+        batch_signature = "|".join(sorted(normalized_topics))
+        if batch_signature == self.state.last_topic_batch_signature:
+            self.state.consecutive_topic_repetitions += 1
+        else:
+            self.state.consecutive_topic_repetitions = 1
+        self.state.last_topic_batch_signature = batch_signature
+        self.state.last_topic = normalized_topics[-1] if normalized_topics else None
+        reset_required = self.state.consecutive_topic_repetitions >= self.settings.repeated_topic_reset_threshold
 
         log_event(
             LOGGER,
@@ -106,6 +108,7 @@ class CurriculumManager:
             "topic_repetition_updated",
             "Updated topic repetition tracker",
             last_topic=self.state.last_topic,
+            last_topic_batch_signature=self.state.last_topic_batch_signature,
             consecutive=self.state.consecutive_topic_repetitions,
             threshold=self.settings.repeated_topic_reset_threshold,
         )
@@ -115,6 +118,7 @@ class CurriculumManager:
         self.state.topic_weights = dict(self._initial_weights)
         self.state.topic_stats = {topic.name: TopicStats() for topic in self.settings.topics}
         self.state.last_topic = None
+        self.state.last_topic_batch_signature = None
         self.state.consecutive_topic_repetitions = 0
         log_event(LOGGER, logging.WARNING, "curriculum_reset", "Curriculum reset to initial weights")
 

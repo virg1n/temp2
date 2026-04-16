@@ -12,14 +12,39 @@ def execute_buggy_task(
     *,
     timeout_seconds: float,
     max_output_chars: int,
+    execution_mode: str,
+    sandbox_command: list[str],
+    allow_unsafe_host_execution: bool,
 ) -> str:
     script = buggy_python.rstrip() + "\n\n" + "\n".join(asserts) + "\n"
     with tempfile.TemporaryDirectory(prefix="acl_task_") as tmp_dir:
         script_path = Path(tmp_dir) / "task.py"
         script_path.write_text(script, encoding="utf-8")
+
+        mode = execution_mode.strip().lower()
+        if mode == "disabled":
+            return "None"
+        if mode == "sandbox":
+            if not sandbox_command:
+                return "Execution unavailable: sandbox mode is enabled but no sandbox command is configured"
+            command = [
+                part.format(
+                    python=sys.executable,
+                    script_path=str(script_path),
+                    workdir=tmp_dir,
+                )
+                for part in sandbox_command
+            ]
+        elif mode == "host":
+            if not allow_unsafe_host_execution:
+                return "Execution blocked: unsafe host execution is disabled"
+            command = [sys.executable, "-I", str(script_path)]
+        else:
+            return f"Execution unavailable: unsupported execution mode '{execution_mode}'"
+
         try:
             result = subprocess.run(
-                [sys.executable, "-I", str(script_path)],
+                command,
                 cwd=tmp_dir,
                 capture_output=True,
                 text=True,

@@ -363,6 +363,9 @@ class RuntimeSettings:
     empty_cuda_cache_on_unload: bool = True
     task_execution_timeout_seconds: float = 5.0
     task_execution_max_output_chars: int = 2000
+    task_execution_mode: str = "disabled"
+    task_execution_sandbox_command: list[str] = field(default_factory=list)
+    allow_unsafe_host_execution: bool = False
 
     @classmethod
     def from_dict(cls, data: JsonDict | None) -> "RuntimeSettings":
@@ -376,6 +379,9 @@ class RuntimeSettings:
             empty_cuda_cache_on_unload=bool(payload.get("empty_cuda_cache_on_unload", True)),
             task_execution_timeout_seconds=float(payload.get("task_execution_timeout_seconds", 5.0)),
             task_execution_max_output_chars=int(payload.get("task_execution_max_output_chars", 2000)),
+            task_execution_mode=str(payload.get("task_execution_mode", "disabled")),
+            task_execution_sandbox_command=[str(item) for item in _as_list(payload.get("task_execution_sandbox_command"))],
+            allow_unsafe_host_execution=bool(payload.get("allow_unsafe_host_execution", False)),
         )
 
 
@@ -422,6 +428,7 @@ class CurriculumState:
     topic_weights: dict[TopicLabel, float]
     topic_stats: dict[TopicLabel, TopicStats]
     last_topic: TopicLabel | None = None
+    last_topic_batch_signature: str | None = None
     consecutive_topic_repetitions: int = 0
 
 
@@ -479,6 +486,21 @@ class ValidatedTask:
     judge_passed: bool
     judge_score: float
     judge_feedback: str
+
+
+@dataclass(slots=True)
+class RejectedTask:
+    task: TaskCandidate
+    dedupe_key: str
+    rejection_reason: str
+    judge_score: float
+    judge_feedback: str
+
+
+@dataclass(slots=True)
+class ValidationResult:
+    valid_tasks: list[ValidatedTask] = field(default_factory=list)
+    rejected_tasks: list[RejectedTask] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -87,6 +87,7 @@ class StorageManager:
             topic_weights={k: float(v) for k, v in raw["curriculum"]["topic_weights"].items()},
             topic_stats=topic_stats,
             last_topic=raw["curriculum"].get("last_topic"),
+            last_topic_batch_signature=raw["curriculum"].get("last_topic_batch_signature"),
             consecutive_topic_repetitions=int(raw["curriculum"].get("consecutive_topic_repetitions", 0)),
         )
         return PipelineState(

@@ -2,7 +2,7 @@ run_name: adversarial-python-curriculum
 
 models:
   socratic:
-    model_name_or_path: ./Hints_Not_Answers/runs/socratic_sft/model
+    model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model
     adapter_path: null
     initial_adapter_path: null
     trust_remote_code: true
@@ -12,9 +12,9 @@ models:
     quantization:
       load_in_8bit: false
     generation:
-      max_new_tokens: 220
-      temperature: 0.85
-      top_p: 0.92
+      max_new_tokens: 420
+      temperature: 1.10
+      top_p: 0.98
       repetition_penalty: 1.05
       do_sample: true
       num_return_sequences: 4
@@ -22,7 +22,7 @@ models:
       stop_strings: ["<|im_end|>"]
 
   red:
-    model_name_or_path: Qwen/Qwen3-32B
+    model_name_or_path: Qwen/Qwen2.5-32B-Instruct
     adapter_path: null
     initial_adapter_path: null
     trust_remote_code: true
@@ -40,11 +40,11 @@ models:
       repetition_penalty: 1.05
       do_sample: true
       num_return_sequences: 1
-      enable_thinking: true
+      enable_thinking: false
       stop_strings: ["<|im_end|>"]
 
   judge:
-    model_name_or_path: Qwen/Qwen3-32B
+    model_name_or_path: Qwen/Qwen2.5-32B-Instruct
     adapter_path: null
     initial_adapter_path: null
     trust_remote_code: true
@@ -57,7 +57,7 @@ models:
       llm_int8_threshold: 6.0
     generation:
       max_new_tokens: 1000
-      temperature: 0.0
+      temperature: 0.6
       top_p: 1.0
       repetition_penalty: 1.0
       do_sample: false
@@ -115,7 +115,7 @@ training:
     output_dir: artifacts/socratic_grpo
     update_every_tasks: 8
     num_hints_per_task: 4
-    learning_rate: 1.0e-5
+    learning_rate: 4.0e-5
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 4
@@ -140,8 +140,8 @@ training:
 
   red:
     output_dir: artifacts/red_training
-    update_every_rounds: 2
-    learning_rate: 1.0e-4
+    update_every_rounds: 1
+    learning_rate: 2.0e-4
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 4
@@ -185,3 +185,6 @@ runtime:
   empty_cuda_cache_on_unload: true
   task_execution_timeout_seconds: 5.0
   task_execution_max_output_chars: 2000
+  task_execution_mode: disabled
+  task_execution_sandbox_command: []
+  allow_unsafe_host_execution: false
