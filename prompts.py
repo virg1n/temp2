@@ -123,11 +123,11 @@ def build_hint_assessment_messages(items: Iterable[tuple[str, str, str]]) -> lis
         "For each item, return JSON with fields:\n"
         "[{"
         '"item_id":"...", '
-        '"no_solution_reveal":0.0, '
-        '"bug_localization":0.0, '
-        '"usefulness":0.0, '
-        '"socratic_style":0.0, '
-        '"technical_accuracy":0.0, '
+        '"no_solution_reveal":0.3, '
+        '"bug_localization":0.2, '
+        '"usefulness":0.1, '
+        '"socratic_style":0.2, '
+        '"technical_accuracy":0.3, '
         '"feedback":"short reason"'
         "}]\n\n"
         "All scores must be in [0.0, 1.0]. Penalize direct answers, corrected code, and hidden reasoning markers.\n\n"

@@ -6,7 +6,8 @@ from environment_engine import EnvironmentEngine
 from logging_utils import get_logger, log_event
 from models_factory import extract_json
 from prompts import build_hint_assessment_messages, render_hint_batch
-from schemas import HintCandidate, HintCriterionScores, HintEvaluation, PipelineSettings
+from schemas import HintCandidate, HintCriterionScores, HintEvaluation, PipelineSettings, dataclass_to_dict
+from storage import StorageManager
 
 
 LOGGER = get_logger(__name__)
@@ -21,17 +22,51 @@ def _clamp_score(value: object) -> float:
 
 
 class HintJudgeAssessor:
-    def __init__(self, environment: EnvironmentEngine, settings: PipelineSettings) -> None:
+    def __init__(self, environment: EnvironmentEngine, settings: PipelineSettings, storage: StorageManager | None = None) -> None:
         self.environment = environment
         self.settings = settings
+        self.storage = storage
+
+    def _score_source(self, payload: dict[str, object]) -> dict[str, object]:
+        nested_scores = payload.get("scores")
+        if isinstance(nested_scores, dict):
+            merged = dict(nested_scores)
+            merged.update(payload)
+            return merged
+        return payload
+
+    def _get_score(self, payload: dict[str, object], *keys: str, fallback: float = 0.0) -> float:
+        for key in keys:
+            if key in payload:
+                return _clamp_score(payload.get(key))
+        return fallback
 
     def _combine_scores(self, payload: dict[str, object], hint_text: str) -> HintCriterionScores:
         weights = self.settings.judge.reward_weights
-        no_solution_reveal = _clamp_score(payload.get("no_solution_reveal"))
-        bug_localization = _clamp_score(payload.get("bug_localization"))
-        usefulness = _clamp_score(payload.get("usefulness"))
-        socratic_style = _clamp_score(payload.get("socratic_style"))
-        technical_accuracy = _clamp_score(payload.get("technical_accuracy"))
+        source = self._score_source(payload)
+        scalar_fallback = self._get_score(source, "overall_score", "score", fallback=0.0)
+        no_solution_reveal = self._get_score(
+            source,
+            "no_solution_reveal",
+            "solution_reveal_score",
+            "non_reveal",
+            fallback=scalar_fallback,
+        )
+        bug_localization = self._get_score(
+            source,
+            "bug_localization",
+            "bug_location",
+            "bug_identification",
+            fallback=scalar_fallback,
+        )
+        usefulness = self._get_score(source, "usefulness", "helpfulness", fallback=scalar_fallback)
+        socratic_style = self._get_score(source, "socratic_style", "style", fallback=scalar_fallback)
+        technical_accuracy = self._get_score(
+            source,
+            "technical_accuracy",
+            "accuracy",
+            fallback=scalar_fallback,
+        )
 
         weighted = (
             no_solution_reveal * weights.no_solution_reveal
@@ -57,7 +92,13 @@ class HintJudgeAssessor:
             final_reward=final_reward,
         )
 
-    def score_prompt_completion_pairs(self, items: list[tuple[str, str, str]]) -> dict[str, HintEvaluation]:
+    def score_prompt_completion_pairs(
+        self,
+        items: list[tuple[str, str, str]],
+        *,
+        context: str = "default",
+        round_index: int | None = None,
+    ) -> dict[str, HintEvaluation]:
         if not items:
             return {}
         judge = self.environment.load_judge()
@@ -146,6 +187,31 @@ class HintJudgeAssessor:
                     },
                 )
 
+            if self.storage is not None:
+                self.storage.append_event(
+                    "hint_assessment_batch_dump",
+                    {
+                        "context": context,
+                        "round_index": round_index,
+                        "batch_index": batch_index,
+                        "total_batches": total_batches,
+                        "raw_judge_response": raw_text,
+                        "parsed_judge_response": payload,
+                        "items": [
+                            {
+                                "item_id": item_id,
+                                "task_prompt": prompt_text,
+                                "hint_text": hint_text,
+                                "judge_feedback": evaluations[item_id].judge_feedback,
+                                "scores": dataclass_to_dict(evaluations[item_id].scores),
+                                "judge_payload": evaluations[item_id].raw_payload.get("judge_payload", {}),
+                            }
+                            for item_id, prompt_text, hint_text in batch
+                            if item_id in evaluations
+                        ],
+                    },
+                )
+
             log_event(
                 LOGGER,
                 logging.INFO,
@@ -165,6 +231,10 @@ class HintJudgeAssessor:
         )
         return evaluations
 
-    def assess_hints(self, hints: list[HintCandidate]) -> list[HintEvaluation]:
-        results = self.score_prompt_completion_pairs(render_hint_batch(hints))
+    def assess_hints(self, hints: list[HintCandidate], *, round_index: int | None = None) -> list[HintEvaluation]:
+        results = self.score_prompt_completion_pairs(
+            render_hint_batch(hints),
+            context="pipeline_hint_assessment",
+            round_index=round_index,
+        )
         return [results[hint.hint_id] for hint in hints if hint.hint_id in results]

@@ -57,6 +57,11 @@ class EnvironmentEngine:
         self._red = None
         self._red_signature = None
 
+    def unload_judge(self) -> None:
+        if self._judge is not None:
+            self._judge.unload(empty_cuda_cache=self.settings.runtime.empty_cuda_cache_on_unload)
+        self._judge = None
+
     def unload_socratic(self) -> None:
         if self._socratic is not None:
             self._socratic.unload(empty_cuda_cache=self.settings.runtime.empty_cuda_cache_on_unload)
@@ -64,8 +69,6 @@ class EnvironmentEngine:
         self._socratic_signature = None
 
     def close(self) -> None:
+        self.unload_judge()
         self.unload_red()
         self.unload_socratic()
-        if self._judge is not None:
-            self._judge.unload(empty_cuda_cache=self.settings.runtime.empty_cuda_cache_on_unload)
-        self._judge = None

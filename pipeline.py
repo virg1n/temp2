@@ -41,10 +41,10 @@ class AdversarialCurriculumPipeline:
         self.curriculum = CurriculumManager(settings.curriculum, self.state.curriculum)
         self.buffer = ReplayBuffer(settings.buffer)
         self.validator = TaskJudgeValidator(self.environment, settings, storage)
-        self.assessor = HintJudgeAssessor(self.environment, settings)
+        self.assessor = HintJudgeAssessor(self.environment, settings, storage)
         self.red_generator = RedTaskGenerator(self.environment, settings)
         self.socratic_generator = SocraticHintGenerator(self.environment, settings)
-        self.socratic_trainer = SocraticGRPOTrainerWrapper(settings, self.assessor)
+        self.socratic_trainer = SocraticGRPOTrainerWrapper(settings, self.assessor, storage)
         self.red_trainer = RedTrainer(settings)
         self.pending_grpo_tasks: list[TaskCandidate] = []
         self.topic_descriptions = {topic.name: topic.description for topic in settings.curriculum.topics}
@@ -184,6 +184,9 @@ class AdversarialCurriculumPipeline:
     def _maybe_train_red(self, round_index: int) -> None:
         if (round_index + 1) % self.settings.training.red.update_every_rounds != 0:
             return
+        self.environment.unload_judge()
+        self.environment.unload_red()
+        self.environment.unload_socratic()
         sft_examples = self.buffer.build_red_sft_examples(self.topic_descriptions)
         dpo_pairs = self.buffer.build_dpo_pairs(self.topic_descriptions)
         previous_adapter = self.state.red.active_adapter_path
@@ -215,7 +218,7 @@ class AdversarialCurriculumPipeline:
                     continue
 
                 hints = self.socratic_generator.generate_hints([item.task for item in valid_tasks])
-                evaluations = self.assessor.assess_hints(hints)
+                evaluations = self.assessor.assess_hints(hints, round_index=round_index)
                 if self.settings.runtime.unload_socratic_after_use:
                     self.environment.unload_socratic()
 

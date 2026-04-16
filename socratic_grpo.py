@@ -18,7 +18,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from judge_assess import HintJudgeAssessor
 from logging_utils import get_logger, log_event
 from prompts import build_socratic_messages
-from schemas import PipelineSettings, SocraticState, TaskCandidate
+from schemas import PipelineSettings, SocraticState, TaskCandidate, dataclass_to_dict
+from storage import StorageManager
 
 try:
     from trl import GRPOConfig, GRPOTrainer
@@ -66,25 +67,48 @@ def _completion_to_text(completion: Any) -> str:
 
 
 class SocraticGRPOTrainerWrapper:
-    def __init__(self, settings: PipelineSettings, assessor: HintJudgeAssessor) -> None:
+    def __init__(self, settings: PipelineSettings, assessor: HintJudgeAssessor, storage: StorageManager) -> None:
         self.settings = settings
         self.assessor = assessor
+        self.storage = storage
 
     def _build_dataset(self, tasks: list[TaskCandidate]) -> Dataset:
         records = [{"prompt": build_socratic_messages(task)} for task in tasks]
         return Dataset.from_list(records)
 
-    def _build_reward_fn(self):
+    def _build_reward_fn(self, round_index: int, reward_stats: dict[str, int]):
         def reward_fn(*, prompts: list[Any], completions: list[Any], **_: Any) -> list[float]:
             items: list[tuple[str, str, str]] = []
             for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
                 items.append((f"grpo-item-{idx}", _prompt_to_user_text(prompt), _completion_to_text(completion)))
-            evaluations = self.assessor.score_prompt_completion_pairs(items)
+            evaluations = self.assessor.score_prompt_completion_pairs(
+                items,
+                context="grpo_reward",
+                round_index=round_index,
+            )
             rewards = [
                 float(evaluations.get(item_id).scores.final_reward if item_id in evaluations else 0.0)
                 for item_id, _, _ in items
             ]
+            reward_stats["total_batches"] += 1
             if rewards and all(reward == 0.0 for reward in rewards):
+                reward_stats["zero_batches"] += 1
+                self.storage.append_event(
+                    "grpo_zero_reward_batch_details",
+                    {
+                        "round_index": round_index,
+                        "batch_size": len(rewards),
+                        "items": [
+                            {
+                                "item_id": item_id,
+                                "task_prompt": prompt_text,
+                                "completion_text": completion_text,
+                                "evaluation": dataclass_to_dict(evaluations[item_id]) if item_id in evaluations else None,
+                            }
+                            for item_id, prompt_text, completion_text in items
+                        ],
+                    },
+                )
                 log_event(
                     LOGGER,
                     logging.WARNING,
@@ -113,12 +137,13 @@ class SocraticGRPOTrainerWrapper:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        reward_funcs = [self._build_reward_fn()]
+        reward_stats = {"total_batches": 0, "zero_batches": 0}
+        reward_funcs = [self._build_reward_fn(round_index, reward_stats)]
         model_for_trainer: Any = model_path
         peft_config: Any | None = None
         model_load_kwargs: dict[str, Any] = {
             "trust_remote_code": self.settings.models.socratic.trust_remote_code,
-            "torch_dtype": torch.bfloat16
+            "dtype": torch.bfloat16
             if self.settings.models.socratic.torch_dtype.lower() in {"bf16", "bfloat16"}
             else torch.float16,
         }
@@ -195,6 +220,26 @@ class SocraticGRPOTrainerWrapper:
 
         trainer = GRPOTrainer(**trainer_kwargs)
         trainer.train()
+
+        if reward_stats["total_batches"] > 0 and reward_stats["zero_batches"] == reward_stats["total_batches"]:
+            self.storage.append_event(
+                "socratic_grpo_skipped_zero_reward",
+                {
+                    "round_index": round_index,
+                    "task_count": len(tasks),
+                    "total_batches": reward_stats["total_batches"],
+                },
+            )
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "socratic_grpo_skipped_zero_reward",
+                "Skipped Socratic adapter promotion because every GRPO reward batch was zero",
+                round_index=round_index,
+                task_count=len(tasks),
+                total_batches=reward_stats["total_batches"],
+            )
+            return state
 
         if trainer_settings.full_ft:
             model_out = output_dir / "model"

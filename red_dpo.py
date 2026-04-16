@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -31,6 +32,15 @@ except Exception:  # pragma: no cover - version compatibility
 
 
 LOGGER = get_logger(__name__)
+
+
+def _device_map_label(device_map: Any) -> str:
+    if isinstance(device_map, dict):
+        try:
+            return json.dumps(device_map, sort_keys=True)
+        except Exception:
+            return str(device_map)
+    return str(device_map)
 
 
 def _allowed_init_params(cls: Any) -> set[str] | None:
@@ -101,14 +111,39 @@ class RedTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _model_load_kwargs(self) -> dict[str, Any]:
+    def _training_device_map(self) -> str | dict[str, Any]:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            return "auto"
+        return self.settings.models.red.device_map
+
+    def _training_max_memory(self, device_map: Any) -> dict[int, str] | None:
+        if device_map != "auto" or not torch.cuda.is_available():
+            return None
+        if torch.cuda.device_count() <= 1:
+            return None
+        max_memory: dict[int, str] = {}
+        for index in range(torch.cuda.device_count()):
+            total_bytes = torch.cuda.get_device_properties(index).total_memory
+            usable_gib = max(1, int((total_bytes * 0.90) / (1024**3)))
+            max_memory[index] = f"{usable_gib}GiB"
+        return max_memory
+
+    def _model_load_kwargs(self, *, training_mode: bool = False) -> dict[str, Any]:
+        device_map = self._training_device_map() if training_mode else self.settings.models.red.device_map
         kwargs: dict[str, Any] = {
             "trust_remote_code": self.settings.models.red.trust_remote_code,
-            "device_map": self.settings.models.red.device_map,
+            "device_map": device_map,
             "low_cpu_mem_usage": True,
-            "torch_dtype": torch.bfloat16 if self.settings.models.red.torch_dtype.lower() in {"bf16", "bfloat16"} else torch.float16,
+            "dtype": torch.bfloat16 if self.settings.models.red.torch_dtype.lower() in {"bf16", "bfloat16"} else torch.float16,
             "use_cache": False,
         }
+        if training_mode:
+            max_memory = self._training_max_memory(device_map)
+            if max_memory is not None:
+                kwargs["max_memory"] = max_memory
+                offload_dir = Path(self.settings.training.red.output_dir) / "offload"
+                offload_dir.mkdir(parents=True, exist_ok=True)
+                kwargs["offload_folder"] = str(offload_dir)
         if self.settings.models.red.quantization.load_in_8bit:
             from transformers import BitsAndBytesConfig
 
@@ -126,7 +161,7 @@ class RedTrainer:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model = AutoModelForCausalLM.from_pretrained(model_path, **self._model_load_kwargs())
+        model = AutoModelForCausalLM.from_pretrained(model_path, **self._model_load_kwargs(training_mode=True))
         if self.settings.models.red.quantization.load_in_8bit:
             model = prepare_model_for_kbit_training(
                 model,
@@ -159,7 +194,7 @@ class RedTrainer:
     def _load_reference_model(self, model_path: str, adapter_path: str | None) -> Any:
         from peft import PeftModel
 
-        ref_model = AutoModelForCausalLM.from_pretrained(model_path, **self._model_load_kwargs())
+        ref_model = AutoModelForCausalLM.from_pretrained(model_path, **self._model_load_kwargs(training_mode=True))
         if adapter_path:
             ref_model = PeftModel.from_pretrained(ref_model, adapter_path, is_trainable=False)
         ref_model.eval()
@@ -188,6 +223,7 @@ class RedTrainer:
         model_path = self.settings.models.red.model_name_or_path
         adapter_path = state.active_adapter_path or self.settings.models.red.adapter_path
         last_error: torch.OutOfMemoryError | None = None
+        training_device_map = self._training_device_map()
 
         for max_length in self._candidate_max_lengths(training.max_length):
             output_dir = Path(training.output_dir) / f"round_{round_index:05d}" / "sft" / f"len_{max_length}"
@@ -204,6 +240,7 @@ class RedTrainer:
                     round_index=round_index,
                     max_length=max_length,
                     example_count=len(examples),
+                    training_device_map=_device_map_label(training_device_map),
                 )
                 model, tokenizer = self._load_trainable_model(model_path, adapter_path)
                 dataset = self._build_sft_dataset(tokenizer, examples)
@@ -256,6 +293,7 @@ class RedTrainer:
                     "Red SFT hit OOM and will retry with a shorter max length",
                     round_index=round_index,
                     max_length=max_length,
+                    training_device_map=_device_map_label(training_device_map),
                 )
             finally:
                 self._cleanup_training_objects(trainer, model, tokenizer)
@@ -268,6 +306,7 @@ class RedTrainer:
         training = self.settings.training.red
         model_path = self.settings.models.red.model_name_or_path
         last_error: torch.OutOfMemoryError | None = None
+        training_device_map = self._training_device_map()
 
         for max_length in self._candidate_max_lengths(training.max_length):
             output_dir = Path(training.output_dir) / f"round_{round_index:05d}" / "dpo" / f"len_{max_length}"
@@ -285,6 +324,7 @@ class RedTrainer:
                     round_index=round_index,
                     max_length=max_length,
                     pair_count=len(pairs),
+                    training_device_map=_device_map_label(training_device_map),
                 )
                 model, tokenizer = self._load_trainable_model(model_path, adapter_path)
                 ref_model = self._load_reference_model(model_path, adapter_path)
@@ -340,6 +380,7 @@ class RedTrainer:
                     "Red DPO hit OOM and will retry with a shorter max length",
                     round_index=round_index,
                     max_length=max_length,
+                    training_device_map=_device_map_label(training_device_map),
                 )
             finally:
                 self._cleanup_training_objects(trainer, ref_model, model, tokenizer)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import os
@@ -112,7 +113,7 @@ class TransformersChatModel:
         model_kwargs: dict[str, Any] = {
             "trust_remote_code": self.config.trust_remote_code,
             "device_map": self.config.device_map,
-            "torch_dtype": _torch_dtype_from_name(self.config.torch_dtype),
+            "dtype": _torch_dtype_from_name(self.config.torch_dtype),
             "low_cpu_mem_usage": True,
         }
         if quantization_config is not None:
@@ -177,16 +178,29 @@ class TransformersChatModel:
         generate_kwargs: dict[str, Any] = {
             "max_new_tokens": int(gen.max_new_tokens),
             "do_sample": bool(gen.do_sample),
-            "temperature": float(gen.temperature),
-            "top_p": float(gen.top_p),
             "repetition_penalty": float(gen.repetition_penalty),
             "num_return_sequences": requested,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
-        if not gen.do_sample:
-            generate_kwargs.pop("temperature", None)
-            generate_kwargs.pop("top_p", None)
+        if gen.do_sample:
+            generate_kwargs["temperature"] = float(gen.temperature)
+            generate_kwargs["top_p"] = float(gen.top_p)
+        else:
+            try:
+                generation_config = copy.deepcopy(self.model.generation_config)
+                generation_config.do_sample = False
+                generation_config.max_new_tokens = int(gen.max_new_tokens)
+                generation_config.repetition_penalty = float(gen.repetition_penalty)
+                generation_config.num_return_sequences = requested
+                generation_config.pad_token_id = self.tokenizer.pad_token_id
+                generation_config.eos_token_id = self.tokenizer.eos_token_id
+                for field_name in ("temperature", "top_p", "top_k"):
+                    if hasattr(generation_config, field_name):
+                        setattr(generation_config, field_name, None)
+                generate_kwargs = {"generation_config": generation_config}
+            except Exception:
+                pass
 
         with torch.no_grad():
             outputs = self.model.generate(**inputs, **generate_kwargs)

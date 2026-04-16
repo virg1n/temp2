@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +122,17 @@ class StorageManager:
     def append_event(self, event: str, payload: dict[str, Any]) -> None:
         _ensure_parent(self.events_path)
         with self.events_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"event": event, **payload}, ensure_ascii=False) + "\n")
+            handle.write(
+                json.dumps(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "event": event,
+                        **payload,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
     def save_round_snapshot(self, round_index: int, payload: dict[str, Any]) -> Path:
         path = self.round_snapshots_dir / f"round_{round_index:05d}.json"
