@@ -70,7 +70,7 @@ socratic:
   grpo:
     update_every_episodes: 4
     min_episodes_before_update: 2
-    max_training_examples: 12
+    max_training_examples: 10
     learning_rate: 5.0e-5
     epochs: 1
     per_device_batch_size: 1
@@ -90,7 +90,7 @@ socratic:
     full_ft: false
 
 judge:
-  model_name_or_path: Qwen/Qwen2.5-32B-Instruct
+  model_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen2.5-32B-Instruct/
   tokenizer_name_or_path:
   base_adapter_path:
   quantization: 8bit
@@ -118,7 +118,7 @@ judge:
     repetition_penalty: 1.0
 
 red:
-  model_name_or_path: Qwen/Qwen2.5-32B-Instruct
+  model_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen2.5-32B-Instruct/
   tokenizer_name_or_path:
   base_adapter_path:
   quantization:
