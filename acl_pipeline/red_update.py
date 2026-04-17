@@ -17,8 +17,8 @@ from datasets import Dataset
 from .config import PipelineConfig
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error, render_chat_messages
-from .prompts import RED_SYSTEM_PROMPT
-from .schemas import EpisodeRecord, PythonTask, RedTrainingExample
+from .prompts import RED_SYSTEM_PROMPT, build_red_training_prompt
+from .schemas import EpisodeRecord, PythonTask, RedRejectedExample, RedTrainingExample
 from .storage import SimpleStorage
 
 try:
@@ -48,12 +48,20 @@ class RedUpdateResult:
 
 
 def serialize_task_json(task: PythonTask) -> str:
+    spec = dict(task.metadata.get("red_spec") or {})
+    metadata = {
+        key: value
+        for key, value in dict(task.metadata).items()
+        if key in {"failure_mode", "difficulty", "observed_failure", "execution_status"}
+    }
     payload = {
         "topic": task.topic,
+        "target_function": spec.get("target_function", ""),
+        "intended_bug": spec.get("intended_bug", task.metadata.get("failure_mode", "")),
+        "expected_first_failure": spec.get("expected_first_failure", task.observed_failure()),
         "statement": task.statement,
-        "buggy_solution": task.buggy_solution,
-        "failing_asserts": list(task.failing_asserts),
-        "metadata": dict(task.metadata),
+        "buggy_solution": task.combined_program(),
+        "metadata": metadata,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -105,6 +113,7 @@ def _build_sft_dataset(
 
 def _build_dpo_dataset(
     hard_examples: List[RedTrainingExample],
+    rejected_examples: List[RedRejectedExample],
     recent_episodes: List[EpisodeRecord],
     *,
     limit: int,
@@ -133,7 +142,47 @@ def _build_dpo_dataset(
             }
         )
 
+    remaining = max(0, limit - len(rows))
+    if remaining > 0:
+        for item in rejected_examples[-remaining:]:
+            chosen_episode = easy_by_topic.get(item.topic) or global_easy
+            if chosen_episode is None:
+                continue
+            chosen = serialize_task_json(chosen_episode.task)
+            rejected = str(item.rejected_completion or "").strip()
+            if not rejected or rejected == chosen:
+                continue
+            rows.append(
+                {
+                    "prompt": item.prompt,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
+            )
+
     return Dataset.from_list(rows)
+
+
+def _recent_episode_examples(episodes: List[EpisodeRecord], *, limit: int) -> List[RedTrainingExample]:
+    rows: List[RedTrainingExample] = []
+    for episode in sorted(episodes, key=lambda item: item.judge.normalized_reward, reverse=True)[:limit]:
+        weakness_summary = str(episode.metadata.get("weakness_summary") or "general weakness probing")
+        rows.append(
+            RedTrainingExample(
+                example_id=f"recent_{episode.episode_id}",
+                topic=episode.topic,
+                prompt=build_red_training_prompt(episode.topic, weakness_summary),
+                chosen_completion=serialize_task_json(episode.task),
+                rejected_completion=None,
+                reward=episode.judge.normalized_reward,
+                task=episode.task,
+                metadata={
+                    "episode_id": episode.episode_id,
+                    "source": "recent_episode",
+                },
+            )
+        )
+    return rows
 
 
 class RedUpdater:
@@ -147,13 +196,26 @@ class RedUpdater:
         self,
         *,
         hard_examples: List[RedTrainingExample],
+        rejected_examples: List[RedRejectedExample],
         recent_episodes: List[EpisodeRecord],
         step: int,
         adapter_path: Optional[str],
     ) -> RedUpdateResult:
         settings = self.config.red.update
-        if len(hard_examples) < settings.min_hard_examples:
-            reason = f"need_{settings.min_hard_examples}_hard_examples_have_{len(hard_examples)}"
+        chosen_examples = list(hard_examples)
+        if len(chosen_examples) < settings.min_hard_examples:
+            fallback = _recent_episode_examples(
+                recent_episodes,
+                limit=settings.min_hard_examples - len(chosen_examples),
+            )
+            existing_ids = {item.task.task_id for item in chosen_examples}
+            for item in fallback:
+                if item.task.task_id not in existing_ids:
+                    chosen_examples.append(item)
+                    existing_ids.add(item.task.task_id)
+
+        if len(chosen_examples) < settings.min_hard_examples:
+            reason = f"need_{settings.min_hard_examples}_chosen_examples_have_{len(chosen_examples)}"
             self.logger.event("red_update_skip", reason=reason)
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
@@ -180,7 +242,7 @@ class RedUpdater:
                     session.model = model
 
                 sft_dataset = _build_sft_dataset(
-                    hard_examples[-settings.max_sft_examples :],
+                    chosen_examples[-settings.max_sft_examples :],
                     tokenizer=session.tokenizer,
                     enable_thinking=self.config.red.enable_thinking,
                 )
@@ -218,6 +280,7 @@ class RedUpdater:
                 if attempt["dpo_enabled"] and DPOTrainer is not None and DPOConfig is not None:
                     dpo_dataset = _build_dpo_dataset(
                         hard_examples,
+                        rejected_examples,
                         recent_episodes,
                         limit=settings.max_dpo_pairs,
                     )
@@ -262,6 +325,8 @@ class RedUpdater:
                     step=step,
                     adapter_path=str(save_dir),
                     hard_examples=len(hard_examples),
+                    chosen_examples=len(chosen_examples),
+                    rejected_examples=len(rejected_examples),
                     recent_episodes=len(recent_episodes),
                     attempt=attempt_index,
                 )

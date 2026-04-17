@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool
 from .prompts import build_judge_batch_messages, build_socratic_messages
-from .schemas import JudgeOutput, PythonTask
+from .schemas import JudgeOutput, PythonTask, SocraticHint
+from .text_quality import detect_corrupted_hint_text
 
 
 def _extract_json(text: str) -> Optional[Any]:
@@ -61,6 +62,29 @@ class JudgeService:
             total += float(criteria_scores.get(key, 0.0)) * float(weight)
         return max(0.0, min(10.0, total / total_weight))
 
+    def _task_assessment(self, item: Any) -> Dict[str, Any]:
+        threshold = float(self.model_pool.config.judge.bad_task_threshold)
+        if not isinstance(item, dict):
+            return {
+                "task_quality": 5.0,
+                "use_for_socratic": True,
+                "red_rejection_reason": "",
+            }
+        try:
+            task_quality = max(0.0, min(10.0, float(item.get("task_quality", 5.0))))
+        except Exception:
+            task_quality = 5.0
+        explicit = item.get("use_for_socratic")
+        if explicit is None:
+            use_for_socratic = task_quality > threshold
+        else:
+            use_for_socratic = bool(explicit)
+        return {
+            "task_quality": task_quality,
+            "use_for_socratic": use_for_socratic,
+            "red_rejection_reason": str(item.get("red_rejection_reason") or "").strip(),
+        }
+
     def _apply_batch_spread(self, scores: List[float]) -> List[float]:
         strength = float(self.model_pool.config.judge.batch_spread_strength)
         if len(scores) < 2 or strength <= 0:
@@ -111,8 +135,17 @@ class JudgeService:
             raw_items = [0.0] * len(rows)
 
         criteria_list = [self._coerce_criteria_scores(item) for item in raw_items]
+        assessments = [self._task_assessment(item) for item in raw_items]
+        corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
+        for index, corruption in enumerate(corruption_flags):
+            if corruption["is_corrupted"]:
+                criteria_list[index] = {key: 0.0 for key in self._weights()}
         raw_scores = [self._weighted_score(criteria) for criteria in criteria_list]
         adjusted_scores = self._apply_batch_spread(raw_scores) if apply_batch_spread else list(raw_scores)
+        for index, corruption in enumerate(corruption_flags):
+            if corruption["is_corrupted"]:
+                raw_scores[index] = 0.0
+                adjusted_scores[index] = 0.0
 
         return [
             {
@@ -120,8 +153,18 @@ class JudgeService:
                 "raw_score": raw_score,
                 "adjusted_score": adjusted_score,
                 "raw_response": raw,
+                "task_quality": assessment["task_quality"],
+                "use_for_socratic": assessment["use_for_socratic"],
+                "red_rejection_reason": assessment["red_rejection_reason"],
+                "hint_corruption": corruption,
             }
-            for criteria, raw_score, adjusted_score in zip(criteria_list, raw_scores, adjusted_scores)
+            for criteria, raw_score, adjusted_score, assessment, corruption in zip(
+                criteria_list,
+                raw_scores,
+                adjusted_scores,
+                assessments,
+                corruption_flags,
+            )
         ]
 
     def score_pairs(
@@ -139,25 +182,27 @@ class JudgeService:
         return [float(item["adjusted_score"]) for item in details]
 
     def evaluate(self, task: PythonTask, hint_text: str) -> JudgeOutput:
-        return self.evaluate_batch([task], [hint_text], apply_batch_spread=False)[0]
+        hint = SocraticHint(task_id=task.task_id, text=hint_text, raw_text=hint_text)
+        return self.evaluate_batch([task], [hint], apply_batch_spread=False)[0]
 
     def evaluate_batch(
         self,
         tasks: List[PythonTask],
-        hint_texts: List[str],
+        hints: List[SocraticHint],
         *,
         apply_batch_spread: bool,
     ) -> List[JudgeOutput]:
         if not tasks:
             return []
         prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in tasks]
+        hint_texts = [hint.raw_text or hint.text for hint in hints]
         details_list = self.score_pair_details(
             prompt_texts,
             hint_texts,
             apply_batch_spread=apply_batch_spread,
         )
         outputs: List[JudgeOutput] = []
-        for task, details in zip(tasks, details_list):
+        for task, hint, details in zip(tasks, hints, details_list):
             raw_score = float(details["raw_score"])
             adjusted_score = float(details["adjusted_score"])
             judge = JudgeOutput(
@@ -170,6 +215,12 @@ class JudgeService:
                     "topic": task.topic,
                     "raw_score": raw_score,
                     "adjusted_score": adjusted_score,
+                    "task_quality": float(details["task_quality"]),
+                    "use_for_socratic": bool(details["use_for_socratic"]),
+                    "red_rejection_reason": str(details["red_rejection_reason"]),
+                    "hint_corruption": dict(details["hint_corruption"]),
+                    "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
+                    "hint_clean_text": hint.text,
                 },
             )
             self.logger.debug_dump("judge_eval", task=task, judge=judge)

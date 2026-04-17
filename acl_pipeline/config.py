@@ -12,6 +12,7 @@ class RuntimeConfig:
     seed: int = 42
     total_episodes: int = 100
     debug_all: bool = False
+    iteration_size: int = 8
     checkpoint_every_episodes: int = 25
     log_level: str = "INFO"
 
@@ -23,6 +24,8 @@ class TaskExecutionConfig:
     timeout_seconds: int = 12
     max_red_generation_attempts: int = 4
     capture_max_chars: int = 1600
+    min_code_lines_for_repair: int = 15
+    probabilistic_repair_probability: float = 0.5
 
 
 @dataclass
@@ -139,6 +142,7 @@ class JudgeConfig(RoleConfig):
     )
     batch_spread_strength: float = 0.15
     episode_batch_size: int = 4
+    bad_task_threshold: float = 3.0
 
 
 @dataclass
@@ -153,6 +157,7 @@ class CurriculumConfig:
     topics: List[TopicConfig] = field(default_factory=list)
     reward_ema_alpha: float = 0.2
     low_reward_boost: float = 1.5
+    iteration_weak_topic_boost: float = 0.15
     repeat_topic_reset_threshold: int = 5
 
 
@@ -306,6 +311,7 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         },
         batch_spread_strength=float(payload.get("batch_spread_strength", 0.15)),
         episode_batch_size=int(payload.get("episode_batch_size", 4)),
+        bad_task_threshold=float(payload.get("bad_task_threshold", 3.0)),
     )
 
 
@@ -341,6 +347,7 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         seed=int(runtime_raw.get("seed", 42)),
         total_episodes=int(runtime_raw.get("total_episodes", 100)),
         debug_all=bool(runtime_raw.get("debug_all", False)),
+        iteration_size=int(runtime_raw.get("iteration_size", 8)),
         checkpoint_every_episodes=int(runtime_raw.get("checkpoint_every_episodes", 25)),
         log_level=str(runtime_raw.get("log_level", "INFO")).upper(),
     )
@@ -353,6 +360,8 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         timeout_seconds=int(task_execution_raw.get("timeout_seconds", 12)),
         max_red_generation_attempts=int(task_execution_raw.get("max_red_generation_attempts", 4)),
         capture_max_chars=int(task_execution_raw.get("capture_max_chars", 1600)),
+        min_code_lines_for_repair=int(task_execution_raw.get("min_code_lines_for_repair", 15)),
+        probabilistic_repair_probability=float(task_execution_raw.get("probabilistic_repair_probability", 0.5)),
     )
 
     storage = StorageConfig(
@@ -368,6 +377,7 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         ],
         reward_ema_alpha=float(curriculum_raw.get("reward_ema_alpha", 0.2)),
         low_reward_boost=float(curriculum_raw.get("low_reward_boost", 1.5)),
+        iteration_weak_topic_boost=float(curriculum_raw.get("iteration_weak_topic_boost", 0.15)),
         repeat_topic_reset_threshold=int(curriculum_raw.get("repeat_topic_reset_threshold", 5)),
     )
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .logging_utils import StructuredLogger
 from .prompts import build_socratic_messages
 from .schemas import PythonTask, SocraticHint
+from .text_quality import detect_corrupted_hint_text
 
 if TYPE_CHECKING:
     from .modeling import RoleSession
@@ -30,11 +31,16 @@ def sanitize_socratic_text(text: str) -> str:
 def generate_socratic_hint(session: RoleSession, task: PythonTask, logger: StructuredLogger) -> SocraticHint:
     raw = session.generate([build_socratic_messages(task)])[0]
     cleaned = sanitize_socratic_text(raw)
+    corruption = detect_corrupted_hint_text(raw)
     hint = SocraticHint(
         task_id=task.task_id,
         text=cleaned,
         raw_text=raw,
-        metadata={"topic": task.topic},
+        metadata={
+            "topic": task.topic,
+            "is_corrupted": corruption["is_corrupted"],
+            "corruption_reasons": corruption["reasons"],
+        },
     )
     logger.debug_dump("socratic_hint", task=task, hint=hint)
     return hint

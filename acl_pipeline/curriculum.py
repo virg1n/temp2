@@ -31,6 +31,26 @@ class CurriculumManager:
             "Generate a task that is likely to expose the same weakness more clearly."
         )
 
+    def weakest_topic(self) -> Optional[str]:
+        if not self.running_topic_rewards:
+            return None
+        return min(
+            self.running_topic_rewards,
+            key=lambda name: (self.running_topic_rewards.get(name, 0.5), name),
+        )
+
+    def apply_iteration_focus_boost(self) -> Tuple[Optional[str], CurriculumState]:
+        weakest = self.weakest_topic()
+        if weakest is None:
+            return None, self.snapshot()
+
+        self.weights[weakest] = max(
+            1e-3,
+            float(self.weights.get(weakest, self.initial_weights.get(weakest, 1.0)))
+            * (1.0 + float(self.config.iteration_weak_topic_boost)),
+        )
+        return weakest, self.snapshot()
+
     def observe(self, topic: str, reward: float) -> Tuple[bool, CurriculumState]:
         reward = max(0.0, min(1.0, float(reward)))
         alpha = self.config.reward_ema_alpha

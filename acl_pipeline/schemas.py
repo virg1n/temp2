@@ -26,6 +26,9 @@ class PythonTask:
     failing_asserts: List[str]
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def non_empty_line_count(self) -> int:
+        return len([line for line in (self.buggy_solution or "").splitlines() if line.strip()])
+
     def combined_program(self) -> str:
         body = (self.buggy_solution or "").rstrip()
         tests = "\n".join(x.strip() for x in self.failing_asserts if x.strip())
@@ -87,6 +90,18 @@ class CurriculumState:
 
 
 @dataclass
+class RedTaskSpec:
+    topic: str
+    target_function: str
+    intended_bug: str
+    expected_first_failure: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RedTrainingExample:
     example_id: str
     topic: str
@@ -101,6 +116,21 @@ class RedTrainingExample:
         payload = asdict(self)
         payload["task"] = self.task.to_dict()
         return payload
+
+
+@dataclass
+class RedRejectedExample:
+    example_id: str
+    topic: str
+    prompt: str
+    rejected_completion: str
+    rejection_reason: str
+    task_quality: Optional[float] = None
+    spec: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

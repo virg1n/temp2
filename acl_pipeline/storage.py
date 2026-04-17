@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .schemas import CurriculumState, EpisodeRecord, PythonTask, RedTrainingExample
+from .schemas import CurriculumState, EpisodeRecord, PythonTask, RedRejectedExample, RedTrainingExample
 
 
 class SimpleStorage:
@@ -22,6 +22,7 @@ class SimpleStorage:
 
         self.episodes_path = self.root_dir / "episodes.jsonl"
         self.hard_examples_path = self.root_dir / "hard_examples.jsonl"
+        self.red_rejections_path = self.root_dir / "red_rejections.jsonl"
         self.pointers_path = self.state_dir / "pointers.json"
         self.curriculum_path = self.state_dir / "curriculum.json"
 
@@ -60,6 +61,21 @@ class SimpleStorage:
             payload["task"] = PythonTask(**payload["task"])
             rows.append(RedTrainingExample(**payload))
         return rows
+
+    def append_red_rejected_example(self, example: RedRejectedExample) -> None:
+        rows = self.load_red_rejected_examples(limit=self.hard_buffer_max_size - 1)
+        rows.append(example)
+        with self.red_rejections_path.open("w", encoding="utf-8") as fh:
+            for row in rows[-self.hard_buffer_max_size :]:
+                fh.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+
+    def load_red_rejected_examples(self, limit: Optional[int] = None) -> List[RedRejectedExample]:
+        if not self.red_rejections_path.exists():
+            return []
+        lines = self.red_rejections_path.read_text(encoding="utf-8").splitlines()
+        if limit is not None:
+            lines = lines[-int(limit) :]
+        return [RedRejectedExample(**json.loads(line)) for line in lines]
 
     def save_curriculum_state(self, state: CurriculumState) -> None:
         self.curriculum_path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
