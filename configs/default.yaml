@@ -13,7 +13,7 @@ task_execution:
   capture_max_chars: 1600
 
 storage:
-  root_dir: ./runs/acl_pipeline
+  root_dir: ./runs/acl_pipeline_17_04
   keep_last_n_checkpoints: 3
   hard_buffer_max_size: 2048
 
@@ -93,8 +93,8 @@ judge:
   enable_thinking: false
   reward_weights:
     no_solution_reveal: 0.3
-    bug_localization: 0.25
-    usefulness: 0.2
+    bug_localization: 0.2
+    usefulness: 0.25
     socratic_style: 0.15
     technical_accuracy: 0.1
   batch_spread_strength: 0.15
