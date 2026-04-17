@@ -2,27 +2,19 @@ from __future__ import annotations
 
 import argparse
 
-from logging_utils import setup_logging
-from pipeline import AdversarialCurriculumPipeline
-from storage import StorageManager, load_settings
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--settings", default="settings.yaml", help="Path to YAML settings file")
-    parser.add_argument("--log-level", default="INFO", help="Python logging level")
-    parser.add_argument("--max-rounds", type=int, default=None, help="Optional override for runtime.max_rounds")
-    return parser.parse_args()
+from acl_pipeline.config import load_config
 
 
 def main() -> None:
-    args = parse_args()
-    setup_logging(args.log_level)
-    settings = load_settings(args.settings)
-    if args.max_rounds is not None:
-        settings.runtime.max_rounds = args.max_rounds
-    storage = StorageManager(settings)
-    pipeline = AdversarialCurriculumPipeline(settings, storage)
+    parser = argparse.ArgumentParser(description="Adversarial curriculum training for Socratic Python debugging.")
+    parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML config.")
+    parser.add_argument("--debug-all", action="store_true", help="Print full task/hint/judge/reset details.")
+    args = parser.parse_args()
+
+    config = load_config(args.config, debug_all_override=args.debug_all)
+    from acl_pipeline.pipeline import AdversarialCurriculumPipeline
+
+    pipeline = AdversarialCurriculumPipeline(config)
     pipeline.run()
 
 
