@@ -16,7 +16,7 @@ task_execution:
   probabilistic_repair_probability: 0.5
 
 storage:
-  root_dir: ./runs/acl_pipeline_17_04
+  root_dir: ./runs/17_04
   keep_last_n_checkpoints: 3
   hard_buffer_max_size: 2048
 
