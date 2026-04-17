@@ -9,12 +9,13 @@ from .judge import JudgeService
 from .logging_utils import build_logger
 from .modeling import ModelPool
 from .prompts import build_red_training_prompt
-from .red_generation import RedTaskGenerator
+from .red_generation import RedTaskGenerator, fallback_task
 from .red_update import RedUpdater, serialize_task_json
 from .schemas import EpisodeRecord, RedTrainingExample
 from .socratic_generation import generate_socratic_hint
 from .socratic_grpo import SocraticGrpoUpdater
 from .storage import SimpleStorage
+from .task_execution import execute_task, task_meets_shape_requirements
 
 
 class AdversarialCurriculumPipeline:
@@ -47,8 +48,56 @@ class AdversarialCurriculumPipeline:
         self.current_socratic_adapter = pointers.get("socratic_adapter_path") or config.socratic.base_adapter_path
         self.current_red_adapter = pointers.get("red_adapter_path") or config.red.base_adapter_path
 
+    def _attach_execution(self, task, execution_result) -> None:
+        task.metadata["execution"] = execution_result.to_dict()
+        task.metadata["execution_status"] = execution_result.status
+        task.metadata["observed_failure"] = execution_result.error_message
+
+    def _generate_verified_task(self, topic: str, weakness_summary: str):
+        red_session = self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
+        try:
+            for attempt in range(1, self.config.task_execution.max_red_generation_attempts + 1):
+                task = self.red_generator.generate_task(
+                    red_session,
+                    topic=topic,
+                    weakness_summary=weakness_summary,
+                )
+                if not task_meets_shape_requirements(task, self.config.task_execution):
+                    self.logger.warning(
+                        "red_task_rejected_shape",
+                        topic=topic,
+                        attempt=attempt,
+                        code_lines=len([line for line in task.buggy_solution.splitlines() if line.strip()]),
+                        assert_count=len([line for line in task.failing_asserts if line.strip().startswith("assert ")]),
+                    )
+                    continue
+
+                if self.config.task_execution.enabled:
+                    execution = execute_task(task, self.config.task_execution)
+                    self._attach_execution(task, execution)
+                    if execution.status == "passed" and self.config.task_execution.reject_passed_tasks:
+                        self.logger.warning(
+                            "red_task_rejected_clean",
+                            topic=topic,
+                            attempt=attempt,
+                            error_message=execution.error_message,
+                        )
+                        continue
+                return task
+        finally:
+            red_session.unload()
+
+        fallback = fallback_task(topic, "exhausted_generation_attempts")
+        if self.config.task_execution.enabled:
+            execution = execute_task(fallback, self.config.task_execution)
+            self._attach_execution(fallback, execution)
+        return fallback
+
     def _build_hard_example(self, episode: EpisodeRecord, weakness_summary: str) -> RedTrainingExample:
-        prompt = build_red_training_prompt(episode.topic, weakness_summary)
+        prompt = (
+            build_red_training_prompt(episode.topic, weakness_summary)
+            + f" Reproduced failure: {episode.task.observed_failure()[:600]}"
+        )
         return RedTrainingExample(
             example_id=uuid4().hex[:16],
             topic=episode.topic,
@@ -61,6 +110,7 @@ class AdversarialCurriculumPipeline:
                 "episode_id": episode.episode_id,
                 "socratic_score": episode.judge.score,
                 "weakness_summary": weakness_summary,
+                "observed_failure": episode.task.observed_failure(),
             },
         )
 
@@ -84,8 +134,10 @@ class AdversarialCurriculumPipeline:
             topic=episode.topic,
             weakness_summary=weakness_summary,
             broken_code=episode.task.combined_program(),
+            execution=episode.task.metadata.get("execution"),
             socratic_hint=episode.hint.text,
             judge_grade=episode.judge.score,
+            judge_criteria=episode.judge.criteria_scores,
             task_metadata=episode.task.metadata,
         )
 
@@ -118,16 +170,7 @@ class AdversarialCurriculumPipeline:
             for episode_id in range(start_episode + 1, final_episode + 1):
                 topic = self.curriculum.sample_topic(self.rng)
                 weakness_summary = self.curriculum.weakness_summary(topic)
-
-                red_session = self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
-                try:
-                    task = self.red_generator.generate_task(
-                        red_session,
-                        topic=topic,
-                        weakness_summary=weakness_summary,
-                    )
-                finally:
-                    red_session.unload()
+                task = self._generate_verified_task(topic, weakness_summary)
 
                 socratic_session = self.model_pool.get_socratic(
                     model_source=self.current_socratic_model,

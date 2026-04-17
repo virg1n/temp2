@@ -17,6 +17,18 @@ class RuntimeConfig:
 
 
 @dataclass
+class TaskExecutionConfig:
+    enabled: bool = True
+    python_executable: str = "python"
+    timeout_seconds: int = 12
+    max_red_generation_attempts: int = 4
+    capture_max_chars: int = 1600
+    min_code_lines: int = 24
+    min_asserts: int = 3
+    reject_passed_tasks: bool = True
+
+
+@dataclass
 class TopicConfig:
     name: str
     weight: float = 1.0
@@ -61,8 +73,8 @@ class LoRASettings:
 
 @dataclass
 class SocraticGrpoSettings:
-    update_every_episodes: int = 16
-    min_episodes_before_update: int = 8
+    update_every_episodes: int = 8
+    min_episodes_before_update: int = 4
     max_training_examples: int = 64
     learning_rate: float = 1e-5
     epochs: int = 1
@@ -85,9 +97,9 @@ class SocraticGrpoSettings:
 
 @dataclass
 class RedUpdateSettings:
-    update_every_episodes: int = 32
-    min_hard_examples: int = 24
-    hard_reward_threshold: float = 0.45
+    update_every_episodes: int = 12
+    min_hard_examples: int = 8
+    hard_reward_threshold: float = 0.6
     max_sft_examples: int = 256
     max_dpo_pairs: int = 128
     learning_rate: float = 5e-5
@@ -119,7 +131,16 @@ class SocraticConfig(RoleConfig):
 
 @dataclass
 class JudgeConfig(RoleConfig):
-    pass
+    reward_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "no_solution_reveal": 0.30,
+            "bug_localization": 0.25,
+            "usefulness": 0.20,
+            "socratic_style": 0.15,
+            "technical_accuracy": 0.10,
+        }
+    )
+    batch_spread_strength: float = 0.15
 
 
 @dataclass
@@ -147,6 +168,7 @@ class StorageConfig:
 @dataclass
 class PipelineConfig:
     runtime: RuntimeConfig
+    task_execution: TaskExecutionConfig
     storage: StorageConfig
     curriculum: CurriculumConfig
     socratic: SocraticConfig
@@ -197,8 +219,8 @@ def _lora(payload: Optional[Dict[str, Any]]) -> LoRASettings:
 def _socratic_grpo(payload: Optional[Dict[str, Any]]) -> SocraticGrpoSettings:
     payload = dict(payload or {})
     return SocraticGrpoSettings(
-        update_every_episodes=int(payload.get("update_every_episodes", 16)),
-        min_episodes_before_update=int(payload.get("min_episodes_before_update", 8)),
+        update_every_episodes=int(payload.get("update_every_episodes", 8)),
+        min_episodes_before_update=int(payload.get("min_episodes_before_update", 4)),
         max_training_examples=int(payload.get("max_training_examples", 64)),
         learning_rate=float(payload.get("learning_rate", 1e-5)),
         epochs=int(payload.get("epochs", 1)),
@@ -223,9 +245,9 @@ def _socratic_grpo(payload: Optional[Dict[str, Any]]) -> SocraticGrpoSettings:
 def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
     payload = dict(payload or {})
     return RedUpdateSettings(
-        update_every_episodes=int(payload.get("update_every_episodes", 32)),
-        min_hard_examples=int(payload.get("min_hard_examples", 24)),
-        hard_reward_threshold=float(payload.get("hard_reward_threshold", 0.45)),
+        update_every_episodes=int(payload.get("update_every_episodes", 12)),
+        min_hard_examples=int(payload.get("min_hard_examples", 8)),
+        hard_reward_threshold=float(payload.get("hard_reward_threshold", 0.6)),
         max_sft_examples=int(payload.get("max_sft_examples", 256)),
         max_dpo_pairs=int(payload.get("max_dpo_pairs", 128)),
         learning_rate=float(payload.get("learning_rate", 5e-5)),
@@ -269,6 +291,8 @@ def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
 
 def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
     base = _role(payload)
+    reward_weights = dict(payload.get("reward_weights") or {})
+    default_weights = JudgeConfig(model_name_or_path=base.model_name_or_path).reward_weights
     return JudgeConfig(
         model_name_or_path=base.model_name_or_path,
         tokenizer_name_or_path=base.tokenizer_name_or_path,
@@ -278,6 +302,11 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         hardware=base.hardware,
         generation=base.generation,
         lora=base.lora,
+        reward_weights={
+            key: float(reward_weights.get(key, value))
+            for key, value in default_weights.items()
+        },
+        batch_spread_strength=float(payload.get("batch_spread_strength", 0.15)),
     )
 
 
@@ -302,6 +331,7 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
     raw = _read_yaml(Path(path))
 
     runtime_raw = dict(raw.get("runtime") or {})
+    task_execution_raw = dict(raw.get("task_execution") or {})
     storage_raw = dict(raw.get("storage") or {})
     curriculum_raw = dict(raw.get("curriculum") or {})
     topics_raw = curriculum_raw.get("topics") or []
@@ -317,6 +347,17 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
     )
     if debug_all_override:
         runtime.debug_all = True
+
+    task_execution = TaskExecutionConfig(
+        enabled=bool(task_execution_raw.get("enabled", True)),
+        python_executable=str(task_execution_raw.get("python_executable", "python")),
+        timeout_seconds=int(task_execution_raw.get("timeout_seconds", 12)),
+        max_red_generation_attempts=int(task_execution_raw.get("max_red_generation_attempts", 4)),
+        capture_max_chars=int(task_execution_raw.get("capture_max_chars", 1600)),
+        min_code_lines=int(task_execution_raw.get("min_code_lines", 24)),
+        min_asserts=int(task_execution_raw.get("min_asserts", 3)),
+        reject_passed_tasks=bool(task_execution_raw.get("reject_passed_tasks", True)),
+    )
 
     storage = StorageConfig(
         root_dir=str(storage_raw.get("root_dir", "./runs/acl_pipeline")),
@@ -336,6 +377,7 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
 
     return PipelineConfig(
         runtime=runtime,
+        task_execution=task_execution,
         storage=storage,
         curriculum=curriculum,
         socratic=_socratic_role(dict(raw["socratic"])),

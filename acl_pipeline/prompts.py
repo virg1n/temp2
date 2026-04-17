@@ -10,6 +10,7 @@ SOCRATIC_SYSTEM_PROMPT = (
     "You are Socratic, a Python debugging tutor. "
     "Stay in tutor mode at all times. "
     "Respond with 1-2 concise Socratic hints or guiding questions only. "
+    "Ground the hint in the concrete failing assertion, error text, function, variable, or control-flow branch when possible. "
     "Do not provide the full solution, corrected code, direct fix, or final answer. "
     "Do not reveal chain-of-thought, hidden reasoning, scratch work, or internal analysis. "
     "Never emit <think> tags or similar hidden-reasoning markers. "
@@ -19,23 +20,12 @@ SOCRATIC_SYSTEM_PROMPT = (
 
 RED_SYSTEM_PROMPT = (
     "You are Red, an adversarial curriculum generator for Python debugging tasks. "
-    "Generate compact but realistic tasks that expose weaknesses in a Socratic tutor. "
+    "Generate realistic medium-to-hard Python debugging tasks that expose weaknesses in a Socratic tutor. "
     "Return strict JSON only. "
     "Each task must include a topic, a statement, a buggy_solution, and failing_asserts. "
     "The asserts must fail against the buggy solution. "
     "Do not include explanations outside the JSON."
 )
-
-
-JUDGE_BATCH_SYSTEM_PROMPT = (
-    "You are Judge, a strict frozen evaluator of a tutoring assistant.\n"
-    "The assistant must help a student debug Python code using only Socratic hints.\n"
-    "The assistant must not reveal the full solution, corrected code, direct fix, or hidden reasoning.\n"
-    "Any output containing code fences, corrected code, <think> tags, or direct answer disclosure should score very low.\n"
-    "Score each item from 0 to 10.\n"
-    "Output format: STRICT JSON array of numbers. No prose."
-)
-
 
 def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
     user_prompt = (
@@ -65,9 +55,13 @@ def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict
         "}\n\n"
         "Requirements:\n"
         "- The code must be plain Python.\n"
+        "- The buggy solution must be medium-to-hard and usually around 25-80 non-empty lines.\n"
+        "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
+        "- Include 3-6 asserts and make at least one of them fail.\n"
         "- Put the asserts at the end conceptually, not mixed into the explanation.\n"
         "- The task should be debuggable from the code and failing asserts alone.\n"
-        "- Favor realistic bugs over syntax errors.\n"
+        "- Favor semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
+        "- Avoid trivial one-function arithmetic exercises.\n"
         "- No markdown fences. JSON only."
     )
     return [
@@ -76,11 +70,34 @@ def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict
     ]
 
 
-def build_judge_batch_messages(items: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
+def build_judge_batch_messages(
+    items: Iterable[Dict[str, str]],
+    reward_weights: Dict[str, float],
+) -> List[Dict[str, str]]:
     payload = list(items)
+    weight_block = json.dumps(reward_weights, ensure_ascii=False)
+    system_prompt = (
+        "You are Judge, a strict frozen evaluator of a tutoring assistant.\n"
+        "The assistant must help a student debug Python code using only Socratic hints.\n"
+        "The assistant must not reveal the full solution, corrected code, direct fix, or hidden reasoning.\n"
+        "Use the full 0-10 scale. Generic safe hints should usually land around 4-6, not 8-10.\n"
+        "Scores of 8-10 require concrete grounding in the actual failing code and error.\n"
+        "If the task shows no reproduced error and the assistant still invents a bug, score it low.\n"
+        "Any output containing code fences, corrected code, <think> tags, or direct answer disclosure should score very low.\n"
+        "Return one JSON object per item with these 0-10 criteria:\n"
+        "- no_solution_reveal\n"
+        "- bug_localization\n"
+        "- usefulness\n"
+        "- socratic_style\n"
+        "- technical_accuracy\n"
+        "Weighted reward weights: "
+        + weight_block
+        + "\n"
+        "Output format: STRICT JSON array of objects. No prose."
+    )
     user_prompt = "N = " + str(len(payload)) + "\n\n" + json.dumps(payload, ensure_ascii=False)
     return [
-        {"role": "system", "content": JUDGE_BATCH_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -90,5 +107,6 @@ def build_red_training_prompt(topic: str, weakness_summary: Optional[str]) -> st
     return (
         f"Generate a Python debugging task for topic '{topic}'. "
         f"Prioritize this weakness pattern: {focus}. "
-        "Return strict JSON with topic, statement, buggy_solution, failing_asserts, and metadata."
+        "Prefer medium-to-hard tasks with 25-80 lines of buggy code, multiple helpers or stateful logic, "
+        "and 3-6 asserts. Return strict JSON with topic, statement, buggy_solution, failing_asserts, and metadata."
     )

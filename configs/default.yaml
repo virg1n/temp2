@@ -5,6 +5,16 @@ runtime:
   checkpoint_every_episodes: 25
   log_level: INFO
 
+task_execution:
+  enabled: true
+  python_executable: python
+  timeout_seconds: 12
+  max_red_generation_attempts: 4
+  capture_max_chars: 1600
+  min_code_lines: 24
+  min_asserts: 3
+  reject_passed_tasks: true
+
 storage:
   root_dir: ./runs/acl_pipeline
   keep_last_n_checkpoints: 3
@@ -57,8 +67,8 @@ socratic:
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
   grpo:
-    update_every_episodes: 16
-    min_episodes_before_update: 8
+    update_every_episodes: 8
+    min_episodes_before_update: 4
     max_training_examples: 64
     learning_rate: 1.0e-5
     epochs: 1
@@ -84,6 +94,13 @@ judge:
   base_adapter_path:
   quantization: 8bit
   enable_thinking: false
+  reward_weights:
+    no_solution_reveal: 0.3
+    bug_localization: 0.25
+    usefulness: 0.2
+    socratic_style: 0.15
+    technical_accuracy: 0.1
+  batch_spread_strength: 0.15
   hardware:
     gpu_ids: [0]
     persistent: true
@@ -124,9 +141,9 @@ red:
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
   update:
-    update_every_episodes: 32
-    min_hard_examples: 24
-    hard_reward_threshold: 0.45
+    update_every_episodes: 12
+    min_hard_examples: 8
+    hard_reward_threshold: 0.6
     max_sft_examples: 256
     max_dpo_pairs: 128
     learning_rate: 5.0e-5

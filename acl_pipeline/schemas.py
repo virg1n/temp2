@@ -5,6 +5,19 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
+class TaskExecutionResult:
+    status: str
+    returncode: int
+    error_message: str
+    stdout: str = ""
+    stderr: str = ""
+    duration_seconds: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class PythonTask:
     task_id: str
     topic: str
@@ -53,6 +66,7 @@ class JudgeOutput:
     score: float
     normalized_reward: float
     raw_text: str
+    criteria_scores: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

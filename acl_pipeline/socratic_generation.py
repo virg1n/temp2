@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from .logging_utils import StructuredLogger
-from .modeling import RoleSession
 from .prompts import build_socratic_messages
 from .schemas import PythonTask, SocraticHint
+
+if TYPE_CHECKING:
+    from .modeling import RoleSession
 
 
 def sanitize_socratic_text(text: str) -> str:
