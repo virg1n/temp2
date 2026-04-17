@@ -63,23 +63,10 @@ class AdversarialCurriculumPipeline:
         *,
         requested_topic: str,
         task,
-        execution_result,
     ) -> List[str]:
         reasons: List[str] = []
-        code_lines = [line for line in task.buggy_solution.splitlines() if line.strip()]
-        assert_count = sum(1 for line in task.failing_asserts if line.strip().startswith("assert "))
-        fn_markers = sum(1 for line in code_lines if line.lstrip().startswith(("def ", "class ")))
-
         if self._normalize_topic(task.topic) != self._normalize_topic(requested_topic):
             reasons.append("wrong topic")
-        if len(code_lines) <= 10:
-            reasons.append("too short")
-        if assert_count < 3:
-            reasons.append(f"only {assert_count} asserts")
-        if fn_markers <= 1 and len(code_lines) <= 14:
-            reasons.append("trivial")
-        if execution_result is not None and execution_result.status == "passed":
-            reasons.append("passed execution")
         return reasons
 
     def _generate_repair_or_skip(self, topic: str, weakness_summary: str) -> Optional[Any]:
@@ -103,7 +90,6 @@ class AdversarialCurriculumPipeline:
                         self._candidate_rejection_reasons(
                             requested_topic=topic,
                             task=task,
-                            execution_result=execution,
                         )
                     )
 
