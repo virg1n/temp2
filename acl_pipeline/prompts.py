@@ -55,9 +55,9 @@ def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict
         "}\n\n"
         "Requirements:\n"
         "- The code must be plain Python.\n"
-        "- The buggy solution must be medium-to-hard and usually around 25-80 non-empty lines.\n"
+        "- The buggy solution must be medium-to-hard and usually around 35-80 non-empty lines.\n"
         "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
-        "- Include 3-6 asserts and make at least one of them fail.\n"
+        "- Include 3 asserts and make at least one of them fail.\n"
         "- Put the asserts at the end conceptually, not mixed into the explanation.\n"
         "- The task should be debuggable from the code and failing asserts alone.\n"
         "- Favor semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
@@ -68,6 +68,19 @@ def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict
         {"role": "system", "content": RED_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def build_red_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[str, str]:
+    reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
+    return {
+        "role": "user",
+        "content": (
+            f"Repair the previous task for topic '{topic}'. "
+            f"Rejection reasons: {reasons}. "
+            "Return a new strict JSON task. Keep the same topic. "
+            "Make the bug real, keep the code realistic, and ensure the asserts expose the failure."
+        ),
+    }
 
 
 def build_judge_batch_messages(
@@ -82,6 +95,10 @@ def build_judge_batch_messages(
         "The assistant must not reveal the full solution, corrected code, direct fix, or hidden reasoning.\n"
         "Use the full 0-10 scale. Generic safe hints should usually land around 4-6, not 8-10.\n"
         "Scores of 8-10 require concrete grounding in the actual failing code and error.\n"
+        "8-10 only if the hint names the exact failing assertion, function, variable, or state transition and asks a precise debugging question.\n"
+        "6-7 if the hint is directionally helpful but still somewhat generic.\n"
+        "3-5 if it sounds Socratic but could apply to many unrelated tasks.\n"
+        "0-2 if it invents facts, ignores the reproduced error, reveals the fix, or gives code.\n"
         "If the task shows no reproduced error and the assistant still invents a bug, score it low.\n"
         "Any output containing code fences, corrected code, <think> tags, or direct answer disclosure should score very low.\n"
         "Return one JSON object per item with these 0-10 criteria:\n"

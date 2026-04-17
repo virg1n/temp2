@@ -23,9 +23,6 @@ class TaskExecutionConfig:
     timeout_seconds: int = 12
     max_red_generation_attempts: int = 4
     capture_max_chars: int = 1600
-    min_code_lines: int = 24
-    min_asserts: int = 3
-    reject_passed_tasks: bool = True
 
 
 @dataclass
@@ -99,9 +96,9 @@ class SocraticGrpoSettings:
 class RedUpdateSettings:
     update_every_episodes: int = 12
     min_hard_examples: int = 8
-    hard_reward_threshold: float = 0.6
     max_sft_examples: int = 256
     max_dpo_pairs: int = 128
+    mining_bottom_fraction: float = 0.25
     learning_rate: float = 5e-5
     epochs: int = 1
     per_device_batch_size: int = 1
@@ -141,6 +138,7 @@ class JudgeConfig(RoleConfig):
         }
     )
     batch_spread_strength: float = 0.15
+    episode_batch_size: int = 4
 
 
 @dataclass
@@ -247,9 +245,9 @@ def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
     return RedUpdateSettings(
         update_every_episodes=int(payload.get("update_every_episodes", 12)),
         min_hard_examples=int(payload.get("min_hard_examples", 8)),
-        hard_reward_threshold=float(payload.get("hard_reward_threshold", 0.6)),
         max_sft_examples=int(payload.get("max_sft_examples", 256)),
         max_dpo_pairs=int(payload.get("max_dpo_pairs", 128)),
+        mining_bottom_fraction=float(payload.get("mining_bottom_fraction", 0.25)),
         learning_rate=float(payload.get("learning_rate", 5e-5)),
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),
@@ -307,6 +305,7 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
             for key, value in default_weights.items()
         },
         batch_spread_strength=float(payload.get("batch_spread_strength", 0.15)),
+        episode_batch_size=int(payload.get("episode_batch_size", 4)),
     )
 
 
@@ -354,9 +353,6 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         timeout_seconds=int(task_execution_raw.get("timeout_seconds", 12)),
         max_red_generation_attempts=int(task_execution_raw.get("max_red_generation_attempts", 4)),
         capture_max_chars=int(task_execution_raw.get("capture_max_chars", 1600)),
-        min_code_lines=int(task_execution_raw.get("min_code_lines", 24)),
-        min_asserts=int(task_execution_raw.get("min_asserts", 3)),
-        reject_passed_tasks=bool(task_execution_raw.get("reject_passed_tasks", True)),
     )
 
     storage = StorageConfig(

@@ -66,9 +66,3 @@ def execute_task(task: PythonTask, config: TaskExecutionConfig) -> TaskExecution
                 stderr=stderr,
                 duration_seconds=duration,
             )
-
-
-def task_meets_shape_requirements(task: PythonTask, config: TaskExecutionConfig) -> bool:
-    code_lines = [line for line in task.buggy_solution.splitlines() if line.strip()]
-    assert_lines = [line for line in task.failing_asserts if line.strip().startswith("assert ")]
-    return len(code_lines) >= config.min_code_lines and len(assert_lines) >= config.min_asserts

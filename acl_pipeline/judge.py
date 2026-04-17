@@ -139,19 +139,39 @@ class JudgeService:
         return [float(item["adjusted_score"]) for item in details]
 
     def evaluate(self, task: PythonTask, hint_text: str) -> JudgeOutput:
-        prompt_text = build_socratic_messages(task)[-1]["content"]
-        details = self.score_pair_details([prompt_text], [hint_text], apply_batch_spread=False)[0]
-        raw_score = float(details["raw_score"])
-        judge = JudgeOutput(
-            task_id=task.task_id,
-            score=raw_score,
-            normalized_reward=raw_score / 10.0,
-            raw_text=str(details["raw_response"]),
-            criteria_scores=dict(details["criteria_scores"]),
-            metadata={
-                "topic": task.topic,
-                "adjusted_score": float(details["adjusted_score"]),
-            },
+        return self.evaluate_batch([task], [hint_text], apply_batch_spread=False)[0]
+
+    def evaluate_batch(
+        self,
+        tasks: List[PythonTask],
+        hint_texts: List[str],
+        *,
+        apply_batch_spread: bool,
+    ) -> List[JudgeOutput]:
+        if not tasks:
+            return []
+        prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in tasks]
+        details_list = self.score_pair_details(
+            prompt_texts,
+            hint_texts,
+            apply_batch_spread=apply_batch_spread,
         )
-        self.logger.debug_dump("judge_eval", task=task, judge=judge)
-        return judge
+        outputs: List[JudgeOutput] = []
+        for task, details in zip(tasks, details_list):
+            raw_score = float(details["raw_score"])
+            adjusted_score = float(details["adjusted_score"])
+            judge = JudgeOutput(
+                task_id=task.task_id,
+                score=raw_score,
+                normalized_reward=adjusted_score / 10.0,
+                raw_text=str(details["raw_response"]),
+                criteria_scores=dict(details["criteria_scores"]),
+                metadata={
+                    "topic": task.topic,
+                    "raw_score": raw_score,
+                    "adjusted_score": adjusted_score,
+                },
+            )
+            self.logger.debug_dump("judge_eval", task=task, judge=judge)
+            outputs.append(judge)
+        return outputs
