@@ -127,6 +127,7 @@ class RoleConfig:
 @dataclass
 class SocraticConfig(RoleConfig):
     grpo: SocraticGrpoSettings = field(default_factory=SocraticGrpoSettings)
+    train_hardware: Optional[HardwareAllocation] = None
 
 
 @dataclass
@@ -143,6 +144,7 @@ class JudgeConfig(RoleConfig):
     batch_spread_strength: float = 0.15
     episode_batch_size: int = 4
     bad_task_threshold: float = 3.0
+    batch_gpu_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +291,9 @@ def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
         generation=base.generation,
         lora=base.lora,
         grpo=_socratic_grpo(payload.get("grpo")),
+        train_hardware=_hardware(payload.get("train_hardware") or payload.get("training_hardware"))
+        if payload.get("train_hardware") or payload.get("training_hardware")
+        else None,
     )
 
 
@@ -312,6 +317,7 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         batch_spread_strength=float(payload.get("batch_spread_strength", 0.15)),
         episode_batch_size=int(payload.get("episode_batch_size", 4)),
         bad_task_threshold=float(payload.get("bad_task_threshold", 3.0)),
+        batch_gpu_ids=[int(x) for x in payload.get("batch_gpu_ids", [])],
     )
 
 

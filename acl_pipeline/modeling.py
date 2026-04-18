@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -53,6 +53,10 @@ def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
     max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in hardware.gpu_ids}
     max_memory["cpu"] = f"{hardware.cpu_offload_gib}GiB"
     return max_memory
+
+
+def single_gpu_hardware(hardware: HardwareAllocation, gpu_id: int) -> HardwareAllocation:
+    return replace(hardware, gpu_ids=[int(gpu_id)])
 
 
 def render_chat_messages(
@@ -389,6 +393,20 @@ class ModelPool:
             )
         return self._judge
 
+    def load_judge_replica(self, gpu_id: int) -> RoleSession:
+        return load_role_session(
+            role_name=f"judge_replica_{gpu_id}",
+            model_name_or_path=self.config.judge.model_name_or_path,
+            tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
+            hardware=single_gpu_hardware(self.config.judge.hardware, gpu_id),
+            generation=self.config.judge.generation,
+            quantization=self.config.judge.quantization,
+            enable_thinking=self.config.judge.enable_thinking,
+            logger=self.logger,
+            adapter_path=self.config.judge.base_adapter_path,
+            trainable=False,
+        )
+
     def get_socratic(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
         if (
@@ -420,11 +438,12 @@ class ModelPool:
 
     def load_socratic_trainable(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
+        hardware = self.config.socratic.train_hardware or self.config.socratic.hardware
         return load_role_session(
             role_name="socratic_train",
             model_name_or_path=source,
             tokenizer_name_or_path=self.config.socratic.tokenizer_name_or_path,
-            hardware=self.config.socratic.hardware,
+            hardware=hardware,
             generation=self.config.socratic.generation,
             quantization=self.config.socratic.quantization,
             enable_thinking=False,
@@ -434,12 +453,13 @@ class ModelPool:
             gradient_checkpointing=self.config.socratic.grpo.gradient_checkpointing,
         )
 
-    def load_red_generation(self, *, adapter_path: Optional[str] = None) -> RoleSession:
+    def load_red_generation(self, *, adapter_path: Optional[str] = None, gpu_id: Optional[int] = None) -> RoleSession:
+        hardware = self.config.red.hardware if gpu_id is None else single_gpu_hardware(self.config.red.hardware, gpu_id)
         return load_role_session(
-            role_name="red_generation",
+            role_name="red_generation" if gpu_id is None else f"red_generation_{gpu_id}",
             model_name_or_path=self.config.red.model_name_or_path,
             tokenizer_name_or_path=self.config.red.tokenizer_name_or_path,
-            hardware=self.config.red.hardware,
+            hardware=hardware,
             generation=self.config.red.generation,
             quantization=self.config.red.generation_quantization,
             enable_thinking=self.config.red.enable_thinking,

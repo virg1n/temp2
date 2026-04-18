@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -19,7 +20,7 @@ from .prompts import (
 )
 from .red_generation import RedTaskGenerator
 from .red_update import RedUpdater, serialize_task_json
-from .schemas import EpisodeRecord, RedTaskSpec, RedTrainingExample
+from .schemas import EpisodeRecord, RedRejectedExample, RedTaskSpec, RedTrainingExample
 from .socratic_generation import generate_socratic_hint
 from .socratic_grpo import SocraticGrpoUpdater
 from .storage import SimpleStorage
@@ -299,9 +300,12 @@ class AdversarialCurriculumPipeline:
             judge_adjusted_score=episode.judge.metadata.get("adjusted_score"),
             judge_criteria=episode.judge.criteria_scores,
             judge_task_quality=episode.judge.metadata.get("task_quality"),
-            judge_use_for_socratic=episode.judge.metadata.get("use_for_socratic"),
-            judge_red_rejection_reason=episode.judge.metadata.get("red_rejection_reason"),
+            judge_task_is_valid=episode.judge.metadata.get("task_is_valid_for_socratic"),
+            judge_task_rejection_reason=episode.judge.metadata.get("task_rejection_reason"),
+            judge_hint_is_valid=episode.judge.metadata.get("hint_is_valid_for_socratic"),
+            judge_hint_rejection_reason=episode.judge.metadata.get("hint_rejection_reason"),
             hint_corruption=episode.judge.metadata.get("hint_corruption"),
+            hint_quality=episode.judge.metadata.get("hint_quality"),
             task_metadata=episode.task.metadata,
         )
 
@@ -338,17 +342,19 @@ class AdversarialCurriculumPipeline:
             adjusted_scores=[output.metadata.get("adjusted_score") for output in judge_outputs],
             adjusted_rewards=[output.normalized_reward for output in judge_outputs],
             task_quality=[output.metadata.get("task_quality") for output in judge_outputs],
-            use_for_socratic=[output.metadata.get("use_for_socratic") for output in judge_outputs],
+            task_is_valid_for_socratic=[output.metadata.get("task_is_valid_for_socratic") for output in judge_outputs],
+            hint_is_valid_for_socratic=[output.metadata.get("hint_is_valid_for_socratic") for output in judge_outputs],
         )
 
         records: List[EpisodeRecord] = []
         for item, judge_output in zip(pending_batch, judge_outputs):
             task = item["task"]
             weakness_summary = item["weakness_summary"]
-            use_for_socratic = bool(judge_output.metadata.get("use_for_socratic", True))
-            if not use_for_socratic:
+            task_is_valid = bool(judge_output.metadata.get("task_is_valid_for_socratic", True))
+            hint_is_valid = bool(judge_output.metadata.get("hint_is_valid_for_socratic", True))
+            if not task_is_valid:
                 spec = self._task_spec_from_metadata(task)
-                rejection_reason = str(judge_output.metadata.get("red_rejection_reason") or "judge_bad_task")
+                rejection_reason = str(judge_output.metadata.get("task_rejection_reason") or "judge_bad_task")
                 self._record_red_rejection(
                     topic=task.topic,
                     prompt=str(task.metadata.get("red_prompt") or build_red_training_prompt(task.topic, weakness_summary, spec=spec)),
@@ -370,6 +376,14 @@ class AdversarialCurriculumPipeline:
                     observed_failure=task.observed_failure(),
                 )
                 continue
+
+            if not hint_is_valid:
+                self.logger.warning(
+                    "socratic_hint_rejected_by_judge",
+                    topic=task.topic,
+                    reason=judge_output.metadata.get("hint_rejection_reason"),
+                    observed_failure=task.observed_failure(),
+                )
 
             next_episode_id += 1
             episode = EpisodeRecord(
@@ -408,34 +422,95 @@ class AdversarialCurriculumPipeline:
         self._store_hard_examples_for_batch(records)
         return records, next_episode_id
 
+    def _load_red_generation_sessions(self) -> List[Any]:
+        sessions: List[Any] = []
+        gpu_ids = [int(x) for x in self.config.red.hardware.gpu_ids]
+        if not gpu_ids:
+            return [self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)]
+
+        for gpu_id in gpu_ids:
+            try:
+                session = self.model_pool.load_red_generation(
+                    adapter_path=self.current_red_adapter,
+                    gpu_id=gpu_id,
+                )
+                sessions.append(session)
+            except RuntimeError as exc:
+                self.logger.warning(
+                    "red_generation_replica_failed",
+                    gpu_id=gpu_id,
+                    error=str(exc),
+                )
+
+        if sessions:
+            return sessions
+        return [self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)]
+
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
         generated: List[Dict[str, Any]] = []
         max_generation_attempts = max(1, target_count * max(2, self.config.task_execution.max_red_generation_attempts))
         generation_attempt = 0
-        red_session = self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
+        red_sessions = self._load_red_generation_sessions()
         try:
             while len(generated) < target_count and generation_attempt < max_generation_attempts:
-                generation_attempt += 1
-                topic = self.curriculum.sample_topic(self.rng)
-                weakness_summary = self.curriculum.weakness_summary(topic)
-                task = self._generate_task_with_red_session(red_session, topic, weakness_summary)
-                if task is None:
-                    self.logger.warning(
-                        "episode_skipped_red_failure",
-                        iteration=iteration_index,
-                        generation_attempt=generation_attempt,
-                        topic=topic,
-                        weakness_summary=weakness_summary,
-                    )
+                remaining_attempts = max_generation_attempts - generation_attempt
+                wave_size = min(len(red_sessions), remaining_attempts, target_count - len(generated))
+                if wave_size <= 0:
+                    break
+
+                jobs: List[Tuple[Any, str, str]] = []
+                for wave_index in range(wave_size):
+                    topic = self.curriculum.sample_topic(self.rng)
+                    weakness_summary = self.curriculum.weakness_summary(topic)
+                    jobs.append((red_sessions[wave_index % len(red_sessions)], topic, weakness_summary))
+                generation_attempt += len(jobs)
+
+                if len(jobs) == 1:
+                    session, topic, weakness_summary = jobs[0]
+                    task = self._generate_task_with_red_session(session, topic, weakness_summary)
+                    if task is None:
+                        self.logger.warning(
+                            "episode_skipped_red_failure",
+                            iteration=iteration_index,
+                            generation_attempt=generation_attempt,
+                            topic=topic,
+                            weakness_summary=weakness_summary,
+                        )
+                    else:
+                        generated.append({"task": task, "weakness_summary": weakness_summary})
                     continue
-                generated.append(
-                    {
-                        "task": task,
-                        "weakness_summary": weakness_summary,
+
+                with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                    future_map = {
+                        executor.submit(self._generate_task_with_red_session, session, topic, weakness_summary): (topic, weakness_summary)
+                        for session, topic, weakness_summary in jobs
                     }
-                )
+                    for future in as_completed(future_map):
+                        topic, weakness_summary = future_map[future]
+                        task = future.result()
+                        if task is None:
+                            self.logger.warning(
+                                "episode_skipped_red_failure",
+                                iteration=iteration_index,
+                                generation_attempt=generation_attempt,
+                                topic=topic,
+                                weakness_summary=weakness_summary,
+                            )
+                            continue
+                        generated.append(
+                            {
+                                "task": task,
+                                "weakness_summary": weakness_summary,
+                            }
+                        )
+                        if len(generated) >= target_count:
+                            break
         finally:
-            red_session.unload()
+            for session in red_sessions:
+                try:
+                    session.unload()
+                except Exception:
+                    continue
 
         self.logger.event(
             "iteration_red_generation_complete",
@@ -443,6 +518,7 @@ class AdversarialCurriculumPipeline:
             requested_tasks=target_count,
             generated_tasks=len(generated),
             attempts=generation_attempt,
+            replica_count=len(red_sessions),
         )
         return generated
 
