@@ -149,6 +149,7 @@ def build_judge_batch_messages(
         "0-2 if it invents facts, ignores the reproduced error, reveals the fix, or gives code.\n"
         "If the assistant output is malformed, gibberish, mixed-script junk, emoji-contaminated, mojibake, or visibly corrupted, score every tutoring criterion as 0.\n"
         "If execution_status is 'passed', keep that in mind explicitly. If the assistant fails to notice that no failing assertion or runtime error was reproduced and instead invents a bug, score it low.\n"
+        "If observed_failure shows SyntaxError, IndentationError, TabError, or another compile/parsing failure, do not automatically mark the task as low quality. Instead, check whether the assistant notices that the code does not compile. If the assistant ignores that and talks as if this were a later runtime/assert debugging case, score bug_localization, usefulness, and technical_accuracy lower.\n"
         "If the assistant invents identifiers, methods, attributes, or assertions that do not appear in the task/error context, score it low.\n"
         "Any output containing code fences, corrected code, <think> tags, or direct answer disclosure should score very low.\n"
         "Judge the task and the hint separately.\n"

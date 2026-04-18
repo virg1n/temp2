@@ -3,13 +3,11 @@ from __future__ import annotations
 import builtins
 import json
 import keyword
-import math
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .logging_utils import StructuredLogger
-from .modeling import ModelPool, is_oom_error
+from .modeling import ModelPool
 from .prompts import build_judge_batch_messages, build_socratic_messages
 from .schemas import JudgeOutput, PythonTask, SocraticHint
 from .text_quality import detect_corrupted_hint_text
@@ -56,6 +54,26 @@ _GENERIC_HINT_PHRASES = (
     "what happens if",
     "try printing",
 )
+_COMPILE_ERROR_NAMES = {"SyntaxError", "IndentationError", "TabError"}
+_COMPILE_AWARE_HINT_TOKENS = (
+    "syntaxerror",
+    "indentationerror",
+    "taberror",
+    "does not compile",
+    "doesn't compile",
+    "compile",
+    "compiles",
+    "parser",
+    "parsing",
+    "syntax",
+    "indent",
+    "indentation",
+    "unexpected indent",
+    "invalid syntax",
+    "expected an indented block",
+    "line ",
+    "colon",
+)
 _PASSED_EXECUTION_TOKENS = (
     "no failing assertion",
     "no runtime error",
@@ -67,6 +85,26 @@ _PASSED_EXECUTION_TOKENS = (
     "no reproduced error",
     "it passes",
 )
+
+
+def _is_compile_failure(error_name: str, observed_failure: str) -> bool:
+    if error_name in _COMPILE_ERROR_NAMES:
+        return True
+    lowered = str(observed_failure or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "syntaxerror",
+            "indentationerror",
+            "taberror",
+            "invalid syntax",
+            "unexpected indent",
+            "expected an indented block",
+            "unindent does not match",
+            "can't compile",
+            "does not compile",
+        )
+    )
 
 
 def _extract_json(text: str) -> Optional[Any]:
@@ -122,6 +160,7 @@ def _prompt_context(prompt_text: str) -> Dict[str, Any]:
         "error_name": _first_error_name(error_text),
         "execution_status": execution_status,
         "observed_failure": error_text,
+        "is_compile_failure": _is_compile_failure(_first_error_name(error_text), error_text),
     }
 
 
@@ -140,6 +179,7 @@ def _task_context(task: PythonTask) -> Dict[str, Any]:
         "error_name": _first_error_name(error_text),
         "execution_status": str(task.metadata.get("execution_status") or "failed"),
         "observed_failure": error_text,
+        "is_compile_failure": _is_compile_failure(_first_error_name(error_text), error_text),
     }
 
 
@@ -214,12 +254,19 @@ def _local_hint_quality(hint_text: str, context: Dict[str, Any]) -> Dict[str, An
             reasons.append("missed_passed_execution")
             delta -= 3.0
 
+    if bool(context.get("is_compile_failure")):
+        if error_name and error_name.lower() in lowered:
+            delta += 0.25
+        if any(token in lowered for token in _COMPILE_AWARE_HINT_TOKENS):
+            delta += 0.45
+        else:
+            reasons.append("missed_compile_failure")
+            delta -= 2.4
+
     severe = False
     if execution_status == "passed" and "missed_passed_execution" in reasons:
         severe = True
     if "hallucinated_identifiers" in reasons and "unbalanced_backticks" in reasons:
-        severe = True
-    if len(hallucinated) >= 3:
         severe = True
 
     hint_is_valid = not severe
@@ -231,30 +278,6 @@ def _local_hint_quality(hint_text: str, context: Dict[str, Any]) -> Dict[str, An
         "hallucinated_identifiers": hallucinated,
         "mentioned_identifiers": sorted(set(mentioned_identifiers)),
     }
-
-
-def _repair_task_assessment_from_context(
-    assessment: Dict[str, Any],
-    *,
-    context: Dict[str, Any],
-    hint_corruption: Dict[str, Any],
-    hint_quality: Dict[str, Any],
-) -> Dict[str, Any]:
-    task_is_valid = bool(assessment.get("task_is_valid_for_socratic", True))
-    if task_is_valid:
-        return assessment
-
-    reason_text = str(assessment.get("task_rejection_reason") or "").lower()
-    execution_status = str(context.get("execution_status") or "").lower()
-    error_name = str(context.get("error_name") or "")
-    reason_blames_hint = any(token in reason_text for token in ("assistant", "response", "hint", "grammatical", "typographical", "gibberish"))
-    task_looks_real = execution_status in {"failed", "timeout"} and bool(error_name or str(context.get("observed_failure") or "").strip())
-
-    if task_looks_real and (reason_blames_hint or hint_corruption.get("is_corrupted") or hint_quality.get("severe")):
-        assessment["task_is_valid_for_socratic"] = True
-        assessment["task_rejection_reason"] = ""
-        assessment["task_quality"] = max(float(assessment.get("task_quality") or 0.0), 7.0)
-    return assessment
 
 
 class JudgeService:
@@ -364,81 +387,12 @@ class JudgeService:
             raw_items = [0.0] * len(rows)
         return raw_items, raw
 
-    def _judge_gpu_ids(self) -> List[int]:
-        configured = [int(x) for x in (self.model_pool.config.judge.batch_gpu_ids or [])]
-        if configured:
-            return list(dict.fromkeys(configured))
-        base = [int(x) for x in self.model_pool.config.judge.hardware.gpu_ids]
-        return list(dict.fromkeys(base[:1]))
-
     def _query_rows(self, rows: List[Dict[str, str]]) -> Tuple[List[Any], List[str]]:
         if not rows:
             return [], []
-
-        gpu_ids = self._judge_gpu_ids()
-        if len(rows) <= 1 or len(gpu_ids) <= 1:
-            session = self.model_pool.get_judge()
-            items, raw = self._query_judge_session(rows, session=session)
-            return items, [raw] * len(rows)
-
-        primary_gpu = int(self.model_pool.config.judge.hardware.gpu_ids[0]) if self.model_pool.config.judge.hardware.gpu_ids else None
-        chunk_size = max(1, math.ceil(len(rows) / len(gpu_ids)))
-        indexed_chunks: List[Tuple[List[int], List[Dict[str, str]], Any, bool]] = []
-        ephemeral_sessions: List[Any] = []
-        next_index = 0
-
-        try:
-            for gpu_id in gpu_ids:
-                if next_index >= len(rows):
-                    break
-                row_indices = list(range(next_index, min(len(rows), next_index + chunk_size)))
-                row_chunk = [rows[index] for index in row_indices]
-                next_index += len(row_chunk)
-                if primary_gpu is not None and gpu_id == primary_gpu:
-                    session = self.model_pool.get_judge()
-                    should_unload = False
-                else:
-                    try:
-                        session = self.model_pool.load_judge_replica(gpu_id)
-                    except RuntimeError as exc:
-                        if not is_oom_error(exc):
-                            raise
-                        self.logger.warning(
-                            "judge_replica_load_failed",
-                            gpu_id=gpu_id,
-                            error=str(exc),
-                        )
-                        session = self.model_pool.get_judge()
-                    should_unload = session is not None and session is not self.model_pool.get_judge()
-                    if should_unload:
-                        ephemeral_sessions.append(session)
-                indexed_chunks.append((row_indices, row_chunk, session, should_unload))
-
-            if not indexed_chunks:
-                session = self.model_pool.get_judge()
-                items, raw = self._query_judge_session(rows, session=session)
-                return items, [raw] * len(rows)
-
-            outputs: List[Any] = [0.0] * len(rows)
-            raw_texts: List[str] = [""] * len(rows)
-            with ThreadPoolExecutor(max_workers=len(indexed_chunks)) as executor:
-                future_map = {
-                    executor.submit(self._query_judge_session, chunk, session=session): indices
-                    for indices, chunk, session, _ in indexed_chunks
-                }
-                for future in as_completed(future_map):
-                    row_indices = future_map[future]
-                    items, raw = future.result()
-                    for offset, row_index in enumerate(row_indices):
-                        outputs[row_index] = items[offset] if offset < len(items) else 0.0
-                        raw_texts[row_index] = raw
-            return outputs, raw_texts
-        finally:
-            for session in ephemeral_sessions:
-                try:
-                    session.unload()
-                except Exception:
-                    continue
+        session = self.model_pool.get_judge()
+        items, raw = self._query_judge_session(rows, session=session)
+        return items, [raw] * len(rows)
 
     def _score_rows(
         self,
@@ -456,20 +410,6 @@ class JudgeService:
         assessments = [self._assessment(item) for item in raw_items]
         corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
         local_quality = [_local_hint_quality(text, context) for text, context in zip(completions, contexts)]
-        assessments = [
-            _repair_task_assessment_from_context(
-                assessment,
-                context=context,
-                hint_corruption=corruption,
-                hint_quality=quality,
-            )
-            for assessment, context, corruption, quality in zip(
-                assessments,
-                contexts,
-                corruption_flags,
-                local_quality,
-            )
-        ]
 
         model_raw_scores = [self._weighted_score(criteria) for criteria in criteria_list]
         local_scores: List[float] = []

@@ -16,8 +16,8 @@ task_execution:
   probabilistic_repair_probability: 0.5
 
 storage:
-  root_dir: ./runs/17_04
-  keep_last_n_checkpoints: 3
+  root_dir: ./runs/18_04
+  keep_last_n_checkpoints: 2
   hard_buffer_max_size: 2048
 
 curriculum:
@@ -50,13 +50,8 @@ socratic:
   quantization:
   enable_thinking: false
   hardware:
-    gpu_ids: [3]
+    gpu_ids: [1, 2, 3]
     persistent: true
-    per_gpu_memory_gib: 46
-    cpu_offload_gib: 128
-  train_hardware:
-    gpu_ids: [3]
-    persistent: false
     per_gpu_memory_gib: 46
     cpu_offload_gib: 128
   generation:
@@ -100,7 +95,6 @@ judge:
   base_adapter_path:
   quantization: 8bit
   enable_thinking: false
-  batch_gpu_ids: [0, 1, 2]
   reward_weights:
     no_solution_reveal: 0.3
     bug_localization: 0.2
@@ -118,7 +112,7 @@ judge:
   generation:
     batch_size: 1
     max_new_tokens: 860
-    temperature: 0.0
+    temperature: 0.5
     top_p: 1.0
     do_sample: false
     repetition_penalty: 1.0

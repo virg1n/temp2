@@ -393,20 +393,6 @@ class ModelPool:
             )
         return self._judge
 
-    def load_judge_replica(self, gpu_id: int) -> RoleSession:
-        return load_role_session(
-            role_name=f"judge_replica_{gpu_id}",
-            model_name_or_path=self.config.judge.model_name_or_path,
-            tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
-            hardware=single_gpu_hardware(self.config.judge.hardware, gpu_id),
-            generation=self.config.judge.generation,
-            quantization=self.config.judge.quantization,
-            enable_thinking=self.config.judge.enable_thinking,
-            logger=self.logger,
-            adapter_path=self.config.judge.base_adapter_path,
-            trainable=False,
-        )
-
     def get_socratic(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
         if (
@@ -438,12 +424,11 @@ class ModelPool:
 
     def load_socratic_trainable(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
-        hardware = self.config.socratic.train_hardware or self.config.socratic.hardware
         return load_role_session(
             role_name="socratic_train",
             model_name_or_path=source,
             tokenizer_name_or_path=self.config.socratic.tokenizer_name_or_path,
-            hardware=hardware,
+            hardware=self.config.socratic.hardware,
             generation=self.config.socratic.generation,
             quantization=self.config.socratic.quantization,
             enable_thinking=False,
