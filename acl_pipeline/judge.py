@@ -1,13 +1,126 @@
 from __future__ import annotations
 
+import builtins
 import json
-from typing import Any, Dict, List, Optional
+import keyword
+import re
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool
 from .prompts import build_judge_batch_messages, build_socratic_messages
 from .schemas import JudgeOutput, PythonTask, SocraticHint
 from .text_quality import detect_corrupted_hint_text
+
+
+_CODE_BLOCK_RE = re.compile(r"## (?P<section>Task|Code|Error)\n```[^\n]*\n(?P<body>.*?)```", re.DOTALL)
+_TASK_SECTION_RE = re.compile(r"## Task\n(?P<body>.*?)\n\n## Code", re.DOTALL)
+_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_REFERENCE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]{1,32}\]|\.[A-Za-z_][A-Za-z0-9_]*|\([^)\n]{0,32}\))+")
+_DEF_RE = re.compile(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+_GENERIC_HINT_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bwalk through\b",
+        r"\bcheck the logic\b",
+        r"\bthink about\b",
+        r"\blook carefully\b",
+        r"\bstep through\b",
+        r"\btrace the values\b",
+        r"\bwhat do you expect\b",
+        r"\bdoes it match\b",
+        r"\bcompare the expected\b",
+        r"\bwhere does it go wrong\b",
+    )
+]
+_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "before",
+    "between",
+    "branch",
+    "check",
+    "code",
+    "compare",
+    "concrete",
+    "consider",
+    "control",
+    "debug",
+    "during",
+    "each",
+    "edge",
+    "error",
+    "fails",
+    "failure",
+    "first",
+    "flow",
+    "function",
+    "given",
+    "helper",
+    "hint",
+    "index",
+    "input",
+    "line",
+    "logic",
+    "match",
+    "name",
+    "notice",
+    "output",
+    "passed",
+    "point",
+    "question",
+    "return",
+    "right",
+    "should",
+    "state",
+    "step",
+    "student",
+    "tests",
+    "trace",
+    "value",
+    "values",
+    "variable",
+    "variables",
+    "walk",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "why",
+}
+_BUILTIN_NAMES = {name.lower() for name in dir(builtins)}
+_EXTRA_ALLOWED_IDENTIFIERS = {
+    "assert",
+    "assertion",
+    "bug",
+    "debug",
+    "false",
+    "none",
+    "python",
+    "runtime",
+    "true",
+}
+_PASS_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bpasses?\b",
+        r"\bpassed\b",
+        r"\bno failing assertion\b",
+        r"\bno runtime error\b",
+        r"\bno failure\b",
+        r"\breproduce\b",
+        r"\breproduced\b",
+        r"\bassert(?:ion|s)?\b",
+    )
+]
+_MALFORMED_PATTERNS = [
+    re.compile(r"\\\?{2,}"),
+    re.compile(r"[?؟]{3,}"),
+    re.compile(r"`[^`\n]*\{[^}\n]*`"),
+    re.compile(r"`[^`\n]*\[[^\]\n]*`"),
+]
 
 
 def _extract_json(text: str) -> Optional[Any]:
@@ -29,6 +142,184 @@ def _extract_json(text: str) -> Optional[Any]:
             except Exception:
                 continue
     return None
+
+
+def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
+    sections: Dict[str, str] = {}
+    for match in _CODE_BLOCK_RE.finditer(str(prompt_text or "")):
+        sections[match.group("section").lower()] = match.group("body").strip()
+    return sections
+
+
+def _normalize_identifier(token: str) -> str:
+    return str(token or "").strip().lower()
+
+
+def _identifier_set(text: str) -> Set[str]:
+    return {_normalize_identifier(token) for token in _IDENTIFIER_RE.findall(str(text or ""))}
+
+
+def _definition_names(code: str) -> Set[str]:
+    return {_normalize_identifier(token) for token in _DEF_RE.findall(str(code or ""))}
+
+
+def _assert_lines(code: str) -> List[str]:
+    return [line.strip() for line in str(code or "").splitlines() if line.strip().startswith("assert ")]
+
+
+def _error_signal_tokens(error_text: str) -> Set[str]:
+    generic = {
+        "assertionerror",
+        "error",
+        "exception",
+        "false",
+        "file",
+        "last",
+        "line",
+        "most",
+        "recent",
+        "runtimeerror",
+        "traceback",
+        "true",
+    }
+    return {
+        token
+        for token in _identifier_set(error_text)
+        if token and token not in generic and len(token) >= 3
+    }
+
+
+def _is_trackable_identifier(token: str) -> bool:
+    normalized = _normalize_identifier(token)
+    if len(normalized) < 3:
+        return False
+    if keyword.iskeyword(normalized):
+        return False
+    if normalized in _STOPWORDS or normalized in _BUILTIN_NAMES or normalized in _EXTRA_ALLOWED_IDENTIFIERS:
+        return False
+    return True
+
+
+def _root_identifier(reference: str) -> str:
+    match = _IDENTIFIER_RE.match(reference.strip())
+    if not match:
+        return ""
+    return _normalize_identifier(match.group(0))
+
+
+def _build_row(prompt_text: str, completion: str) -> Dict[str, str]:
+    sections = _extract_prompt_sections(prompt_text)
+    task_match = _TASK_SECTION_RE.search(str(prompt_text or ""))
+    error_text = sections.get("error", "")
+    execution_status = "passed" if "No failing assertion or runtime error was reproduced." in error_text else "failed"
+    return {
+        "statement": task_match.group("body").strip() if task_match else sections.get("task", ""),
+        "code": sections.get("code", ""),
+        "observed_failure": error_text,
+        "execution_status": execution_status,
+        "assistant_response": completion[:1800],
+    }
+
+
+def _hint_quality_features(row: Dict[str, str]) -> Dict[str, Any]:
+    code = row.get("code", "")
+    error_text = row.get("observed_failure", "")
+    hint_text = str(row.get("assistant_response") or "")
+    hint_lower = hint_text.lower()
+
+    available_identifiers = _identifier_set(code) | _identifier_set(error_text) | _definition_names(code)
+    assert_token_set = _identifier_set("\n".join(_assert_lines(code)))
+    definition_names = _definition_names(code)
+    error_tokens = _error_signal_tokens(error_text)
+
+    hint_identifiers = {
+        token
+        for token in _identifier_set(hint_text)
+        if _is_trackable_identifier(token)
+    }
+    invented_identifiers = sorted(token for token in hint_identifiers if token not in available_identifiers)
+
+    invented_references: List[str] = []
+    for reference in _REFERENCE_RE.findall(hint_text):
+        root = _root_identifier(reference)
+        if not root or not _is_trackable_identifier(root):
+            continue
+        if root not in available_identifiers:
+            invented_references.append(reference)
+    invented_references = list(dict.fromkeys(invented_references))
+
+    grounding_hits: List[str] = []
+    if definition_names & hint_identifiers:
+        grounding_hits.append("function_or_class")
+    if assert_token_set & hint_identifiers:
+        grounding_hits.append("assertion_token")
+    if error_tokens & hint_identifiers:
+        grounding_hits.append("error_token")
+
+    generic_hits = sum(1 for pattern in _GENERIC_HINT_PATTERNS if pattern.search(hint_text))
+    references_passed_execution = any(pattern.search(hint_text) for pattern in _PASS_PATTERNS)
+
+    malformed_reasons: List[str] = []
+    if hint_text.count("`") % 2 == 1:
+        malformed_reasons.append("unbalanced_backticks")
+    for pattern in _MALFORMED_PATTERNS:
+        if pattern.search(hint_text):
+            malformed_reasons.append(f"malformed:{pattern.pattern}")
+    if any(abs(hint_text.count(left) - hint_text.count(right)) >= 2 for left, right in (("(", ")"), ("[", "]"), ("{", "}"))):
+        malformed_reasons.append("unbalanced_delimiters")
+
+    delta = 0.0
+    reasons: List[str] = []
+    if grounding_hits:
+        delta += min(1.25, 0.45 * len(grounding_hits))
+        reasons.extend(f"grounded:{name}" for name in grounding_hits)
+        if "?" in hint_text:
+            delta += 0.25
+            reasons.append("precise_question")
+    if generic_hits:
+        generic_penalty = 0.35 * generic_hits
+        if not grounding_hits:
+            generic_penalty += 0.55
+        delta -= min(1.25, generic_penalty)
+        reasons.append(f"generic:{generic_hits}")
+    if invented_identifiers:
+        delta -= min(1.5, 0.35 * len(invented_identifiers))
+        reasons.append(f"invented_identifiers:{len(invented_identifiers)}")
+    if invented_references:
+        delta -= min(2.0, 0.8 * len(invented_references))
+        reasons.append(f"invented_references:{len(invented_references)}")
+    if malformed_reasons:
+        delta -= min(2.0, 0.8 * len(malformed_reasons))
+        reasons.extend(malformed_reasons)
+
+    severe_hint_failure = False
+    if malformed_reasons and invented_references:
+        severe_hint_failure = True
+    if len(invented_references) >= 2:
+        severe_hint_failure = True
+    if len(invented_identifiers) >= 4 and not grounding_hits:
+        severe_hint_failure = True
+
+    if row.get("execution_status") == "passed":
+        if references_passed_execution:
+            delta += 0.35
+            reasons.append("noticed_passed_execution")
+        else:
+            delta -= 2.25
+            reasons.append("missed_passed_execution")
+
+    return {
+        "delta": delta,
+        "reasons": reasons,
+        "grounding_hits": grounding_hits,
+        "generic_hits": generic_hits,
+        "invented_identifiers": invented_identifiers,
+        "invented_references": invented_references,
+        "malformed_reasons": malformed_reasons,
+        "references_passed_execution": references_passed_execution,
+        "severe_hint_failure": severe_hint_failure,
+        "execution_status": row.get("execution_status"),
+    }
 
 
 class JudgeService:
@@ -62,27 +353,62 @@ class JudgeService:
             total += float(criteria_scores.get(key, 0.0)) * float(weight)
         return max(0.0, min(10.0, total / total_weight))
 
-    def _task_assessment(self, item: Any) -> Dict[str, Any]:
+    def _task_and_hint_assessment(
+        self,
+        item: Any,
+        *,
+        score: float,
+        severe_hint_failure: bool,
+        corruption_detected: bool,
+    ) -> Dict[str, Any]:
         threshold = float(self.model_pool.config.judge.bad_task_threshold)
         if not isinstance(item, dict):
             return {
                 "task_quality": 5.0,
-                "use_for_socratic": True,
+                "task_is_valid_for_socratic": True,
+                "hint_is_valid_for_socratic": not (severe_hint_failure or corruption_detected),
                 "red_rejection_reason": "",
+                "hint_rejection_reason": "",
             }
+
         try:
             task_quality = max(0.0, min(10.0, float(item.get("task_quality", 5.0))))
         except Exception:
             task_quality = 5.0
-        explicit = item.get("use_for_socratic")
-        if explicit is None:
-            use_for_socratic = task_quality > threshold
+
+        explicit_task_valid = item.get("task_is_valid_for_socratic")
+        if explicit_task_valid is None and "use_for_socratic" in item:
+            explicit_task_valid = item.get("use_for_socratic")
+        if explicit_task_valid is None:
+            task_is_valid = task_quality > threshold
         else:
-            use_for_socratic = bool(explicit)
+            task_is_valid = bool(explicit_task_valid)
+
+        explicit_hint_valid = item.get("hint_is_valid_for_socratic")
+        if explicit_hint_valid is None:
+            hint_is_valid = not (severe_hint_failure or corruption_detected) and score > 1.5
+        else:
+            hint_is_valid = bool(explicit_hint_valid)
+            if severe_hint_failure or corruption_detected:
+                hint_is_valid = False
+
+        red_rejection_reason = str(item.get("red_rejection_reason") or "").strip()
+        if not task_is_valid and not red_rejection_reason:
+            red_rejection_reason = "judge_bad_task"
+
+        hint_rejection_reason = str(item.get("hint_rejection_reason") or "").strip()
+        if not hint_is_valid and not hint_rejection_reason:
+            if corruption_detected or severe_hint_failure:
+                hint_rejection_reason = "corrupted_or_hallucinated_hint"
+            elif score <= 1.5:
+                hint_rejection_reason = "very_low_hint_score"
+
         return {
             "task_quality": task_quality,
-            "use_for_socratic": use_for_socratic,
-            "red_rejection_reason": str(item.get("red_rejection_reason") or "").strip(),
+            "task_is_valid_for_socratic": task_is_valid,
+            "hint_is_valid_for_socratic": hint_is_valid,
+            "red_rejection_reason": red_rejection_reason,
+            "hint_rejection_reason": hint_rejection_reason,
         }
 
     def _apply_batch_spread(self, scores: List[float]) -> List[float]:
@@ -113,14 +439,8 @@ class JudgeService:
         if not prompt_texts:
             return []
 
+        rows = [_build_row(prompt, completion) for prompt, completion in zip(prompt_texts, completions)]
         session = self.model_pool.get_judge()
-        rows = [
-            {
-                "student_prompt": prompt[:1800],
-                "assistant_response": completion[:1800],
-            }
-            for prompt, completion in zip(prompt_texts, completions)
-        ]
         messages = build_judge_batch_messages(rows, self._weights())
         raw = session.generate([messages])[0]
         parsed = _extract_json(raw)
@@ -132,20 +452,36 @@ class JudgeService:
             if isinstance(maybe_items, list):
                 raw_items = list(maybe_items)
         if len(raw_items) != len(rows):
-            raw_items = [0.0] * len(rows)
+            raw_items = [{} for _ in rows]
 
         criteria_list = [self._coerce_criteria_scores(item) for item in raw_items]
-        assessments = [self._task_assessment(item) for item in raw_items]
         corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
-        for index, corruption in enumerate(corruption_flags):
-            if corruption["is_corrupted"]:
-                criteria_list[index] = {key: 0.0 for key in self._weights()}
-        raw_scores = [self._weighted_score(criteria) for criteria in criteria_list]
+        quality_features = [_hint_quality_features(row) for row in rows]
+
+        raw_scores: List[float] = []
+        assessments: List[Dict[str, Any]] = []
+        for index, (criteria, item, corruption, features) in enumerate(zip(criteria_list, raw_items, corruption_flags, quality_features)):
+            zero_out = bool(corruption["is_corrupted"] or features["severe_hint_failure"])
+            if zero_out:
+                criteria = {key: 0.0 for key in self._weights()}
+                criteria_list[index] = criteria
+            base_score = self._weighted_score(criteria)
+            score = 0.0 if zero_out else max(0.0, min(10.0, base_score + float(features["delta"])))
+            assessment = self._task_and_hint_assessment(
+                item,
+                score=score,
+                severe_hint_failure=bool(features["severe_hint_failure"]),
+                corruption_detected=bool(corruption["is_corrupted"]),
+            )
+            raw_scores.append(score)
+            assessments.append(assessment)
+
         adjusted_scores = self._apply_batch_spread(raw_scores) if apply_batch_spread else list(raw_scores)
-        for index, corruption in enumerate(corruption_flags):
-            if corruption["is_corrupted"]:
+        for index, (corruption, features, assessment) in enumerate(zip(corruption_flags, quality_features, assessments)):
+            if corruption["is_corrupted"] or features["severe_hint_failure"]:
                 raw_scores[index] = 0.0
                 adjusted_scores[index] = 0.0
+                assessment["hint_is_valid_for_socratic"] = False
 
         return [
             {
@@ -154,16 +490,21 @@ class JudgeService:
                 "adjusted_score": adjusted_score,
                 "raw_response": raw,
                 "task_quality": assessment["task_quality"],
-                "use_for_socratic": assessment["use_for_socratic"],
+                "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
+                "hint_is_valid_for_socratic": assessment["hint_is_valid_for_socratic"],
+                "use_for_socratic": assessment["task_is_valid_for_socratic"] and assessment["hint_is_valid_for_socratic"],
                 "red_rejection_reason": assessment["red_rejection_reason"],
+                "hint_rejection_reason": assessment["hint_rejection_reason"],
                 "hint_corruption": corruption,
+                "local_tiebreak": features,
             }
-            for criteria, raw_score, adjusted_score, assessment, corruption in zip(
+            for criteria, raw_score, adjusted_score, assessment, corruption, features in zip(
                 criteria_list,
                 raw_scores,
                 adjusted_scores,
                 assessments,
                 corruption_flags,
+                quality_features,
             )
         ]
 
@@ -216,11 +557,15 @@ class JudgeService:
                     "raw_score": raw_score,
                     "adjusted_score": adjusted_score,
                     "task_quality": float(details["task_quality"]),
+                    "task_is_valid_for_socratic": bool(details["task_is_valid_for_socratic"]),
+                    "hint_is_valid_for_socratic": bool(details["hint_is_valid_for_socratic"]),
                     "use_for_socratic": bool(details["use_for_socratic"]),
                     "red_rejection_reason": str(details["red_rejection_reason"]),
+                    "hint_rejection_reason": str(details["hint_rejection_reason"]),
                     "hint_corruption": dict(details["hint_corruption"]),
                     "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
                     "hint_clean_text": hint.text,
+                    "local_tiebreak": dict(details["local_tiebreak"]),
                 },
             )
             self.logger.debug_dump("judge_eval", task=task, judge=judge)

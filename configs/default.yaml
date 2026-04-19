@@ -112,7 +112,7 @@ judge:
   generation:
     batch_size: 1
     max_new_tokens: 860
-    temperature: 0.0
+    temperature: 0.5
     top_p: 1.0
     do_sample: false
     repetition_penalty: 1.0
