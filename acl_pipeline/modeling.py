@@ -434,12 +434,20 @@ class ModelPool:
             gradient_checkpointing=self.config.socratic.grpo.gradient_checkpointing,
         )
 
-    def load_red_generation(self, *, adapter_path: Optional[str] = None) -> RoleSession:
+    def load_red_generation(self, *, adapter_path: Optional[str] = None, gpu_id: Optional[int] = None) -> RoleSession:
+        hardware = self.config.red.hardware
+        if gpu_id is not None:
+            hardware = HardwareAllocation(
+                gpu_ids=[int(gpu_id)],
+                persistent=hardware.persistent,
+                per_gpu_memory_gib=hardware.per_gpu_memory_gib,
+                cpu_offload_gib=hardware.cpu_offload_gib,
+            )
         return load_role_session(
             role_name="red_generation",
             model_name_or_path=self.config.red.model_name_or_path,
             tokenizer_name_or_path=self.config.red.tokenizer_name_or_path,
-            hardware=self.config.red.hardware,
+            hardware=hardware,
             generation=self.config.red.generation,
             quantization=self.config.red.generation_quantization,
             enable_thinking=self.config.red.enable_thinking,

@@ -442,6 +442,13 @@ class AdversarialCurriculumPipeline:
                     gpu_id=gpu_id,
                 )
                 sessions.append(session)
+            except TypeError:
+                self.logger.warning(
+                    "red_generation_replica_unsupported",
+                    gpu_id=gpu_id,
+                    reason="model_pool_load_red_generation_has_no_gpu_id_parameter",
+                )
+                break
             except RuntimeError as exc:
                 self.logger.warning(
                     "red_generation_replica_failed",
