@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import math
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from .config import PipelineConfig
+from .config import GenerationSettings, PipelineConfig
 from .curriculum import CurriculumManager
 from .judge import JudgeService
 from .logging_utils import build_logger
@@ -139,106 +138,307 @@ class AdversarialCurriculumPipeline:
                 reasons.append("already correct code, there are no errors in asserts")
         return reasons
 
-    def _generate_task_with_red_session(self, red_session, topic: str, weakness_summary: str):
+    def _red_effective_batch_size(self, item_count: int) -> int:
+        configured = max(1, int(self.config.red.generation.batch_size))
+        default_target = max(1, min(4, self._iteration_size()))
+        return max(1, min(item_count, max(configured, default_target)))
+
+    def _batched_red_generate(self, red_session, messages_batch: List[List[Dict[str, str]]], *, stage: str) -> List[str]:
+        if not messages_batch:
+            return []
+        generation = GenerationSettings(
+            batch_size=self._red_effective_batch_size(len(messages_batch)),
+            max_new_tokens=int(self.config.red.generation.max_new_tokens),
+            temperature=float(self.config.red.generation.temperature),
+            top_p=float(self.config.red.generation.top_p),
+            do_sample=bool(self.config.red.generation.do_sample),
+            repetition_penalty=float(self.config.red.generation.repetition_penalty),
+        )
+        self.logger.debug_dump(
+            "red_batch_generate",
+            stage=stage,
+            prompt_count=len(messages_batch),
+            effective_batch_size=generation.batch_size,
+            max_new_tokens=generation.max_new_tokens,
+        )
+        return red_session.generate(messages_batch, generation=generation)
+
+    def _new_red_request(self, topic: str, weakness_summary: str) -> Dict[str, Any]:
+        return {
+            "topic": topic,
+            "weakness_summary": weakness_summary,
+            "spec_messages": build_red_messages(topic, weakness_summary),
+            "spec": None,
+            "task_prompt": build_red_training_prompt(topic, weakness_summary),
+            "task_messages": None,
+            "task": None,
+            "last_rejection_reasons": [],
+            "validation_reasons": [],
+            "validation_execution": None,
+        }
+
+    def _generate_red_specs_batch(self, red_session, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         max_attempts = int(self.config.task_execution.max_red_generation_attempts)
-        spec_messages = build_red_messages(topic, weakness_summary)
-        spec: Optional[RedTaskSpec] = None
-        last_rejection_reasons: List[str] = []
-
+        pending = list(requests)
         for attempt in range(1, max_attempts + 1):
-            spec_raw = self.red_generator.generate_raw_response(red_session, spec_messages)
-            spec_messages.append({"role": "assistant", "content": spec_raw})
-            spec, parse_reasons = self.red_generator.parse_spec_response(spec_raw, requested_topic=topic)
-            if spec is not None and self._normalize_topic(spec.topic) == self._normalize_topic(topic):
+            if not pending:
                 break
-            last_rejection_reasons = list(parse_reasons)
-            if spec is not None and self._normalize_topic(spec.topic) != self._normalize_topic(topic):
-                last_rejection_reasons.append("wrong topic")
-            spec = None
-            self._record_red_rejection(
-                topic=topic,
-                prompt=build_red_training_prompt(topic, weakness_summary),
-                rejected_completion=spec_raw,
-                rejection_reason=", ".join(last_rejection_reasons or ["invalid spec"]),
-                metadata={"stage": "spec", "attempt": attempt, "weakness_summary": weakness_summary},
+            raw_batch = self._batched_red_generate(
+                red_session,
+                [item["spec_messages"] for item in pending],
+                stage="spec",
             )
-            self.logger.warning(
-                "red_spec_repair_requested",
-                topic=topic,
-                attempt=attempt,
-                rejection_reasons=last_rejection_reasons or ["invalid spec"],
-            )
-            spec_messages.append(build_red_spec_repair_message(topic, last_rejection_reasons or ["invalid spec"]))
+            next_pending: List[Dict[str, Any]] = []
+            for item, spec_raw in zip(pending, raw_batch):
+                topic = str(item["topic"])
+                weakness_summary = str(item["weakness_summary"])
+                item["spec_messages"].append({"role": "assistant", "content": spec_raw})
+                spec, parse_reasons = self.red_generator.parse_spec_response(spec_raw, requested_topic=topic)
+                rejection_reasons = list(parse_reasons)
+                if spec is not None and self._normalize_topic(spec.topic) != self._normalize_topic(topic):
+                    rejection_reasons.append("wrong topic")
+                    spec = None
+                if spec is not None:
+                    item["spec"] = spec
+                    item["task_prompt"] = build_red_training_prompt(topic, weakness_summary, spec=spec)
+                    item["task_messages"] = list(item["spec_messages"])
+                    item["task_messages"].append(build_red_task_from_spec_message(spec))
+                    continue
 
-        if spec is None:
+                rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
+                item["last_rejection_reasons"] = rejection_reasons or ["invalid spec"]
+                self._record_red_rejection(
+                    topic=topic,
+                    prompt=build_red_training_prompt(topic, weakness_summary),
+                    rejected_completion=spec_raw,
+                    rejection_reason=", ".join(item["last_rejection_reasons"]),
+                    metadata={"stage": "spec", "attempt": attempt, "weakness_summary": weakness_summary},
+                )
+                self.logger.warning(
+                    "red_spec_repair_requested",
+                    topic=topic,
+                    attempt=attempt,
+                    rejection_reasons=item["last_rejection_reasons"],
+                )
+                item["spec_messages"].append(build_red_spec_repair_message(topic, item["last_rejection_reasons"]))
+                next_pending.append(item)
+            pending = next_pending
+
+        for item in pending:
             self.logger.warning(
                 "red_task_generation_failed",
-                topic=topic,
-                weakness_summary=weakness_summary,
-                rejection_reasons=last_rejection_reasons or ["invalid spec"],
+                topic=item["topic"],
+                weakness_summary=item["weakness_summary"],
+                rejection_reasons=item.get("last_rejection_reasons") or ["invalid spec"],
             )
-            return None
+        return [item for item in requests if item.get("spec") is not None]
 
-        task_prompt = build_red_training_prompt(topic, weakness_summary, spec=spec)
-        messages = list(spec_messages)
-        messages.append(build_red_task_from_spec_message(spec))
+    def _generate_red_tasks_batch(self, red_session, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        generated: List[Dict[str, Any]] = []
+        max_attempts = int(self.config.task_execution.max_red_generation_attempts)
+        for attempt in range(1, max_attempts + 1):
+            pending = [item for item in requests if item.get("spec") is not None and item.get("task") is None]
+            if not pending:
+                break
+            raw_batch = self._batched_red_generate(
+                red_session,
+                [item["task_messages"] for item in pending],
+                stage="task",
+            )
+            for item, raw in zip(pending, raw_batch):
+                topic = str(item["topic"])
+                weakness_summary = str(item["weakness_summary"])
+                spec = item.get("spec")
+                task_prompt = str(item["task_prompt"])
+                item["task_messages"].append({"role": "assistant", "content": raw})
+
+                task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic, spec=spec)
+                rejection_reasons = list(parse_reasons)
+
+                if task is not None:
+                    task.metadata["red_prompt"] = task_prompt
+                    task.metadata["weakness_summary"] = weakness_summary
+
+                rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
+                if task is not None and not rejection_reasons:
+                    item["task"] = task
+                    generated.append(item)
+                    continue
+
+                item["last_rejection_reasons"] = rejection_reasons or ["unspecified issue"]
+                self._record_red_rejection(
+                    topic=topic,
+                    prompt=task_prompt,
+                    rejected_completion=raw,
+                    rejection_reason=", ".join(item["last_rejection_reasons"]),
+                    spec=spec,
+                    metadata={
+                        "stage": "task",
+                        "attempt": attempt,
+                        "weakness_summary": weakness_summary,
+                        "execution_status": None,
+                    },
+                )
+                self.logger.warning(
+                    "red_task_repair_requested",
+                    topic=topic,
+                    attempt=attempt,
+                    rejection_reasons=item["last_rejection_reasons"],
+                    execution_status=None,
+                )
+                item["task_messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"], spec=spec))
+
+        for item in requests:
+            if item.get("spec") is not None and item.get("task") is None:
+                self.logger.warning(
+                    "red_task_generation_failed",
+                    topic=item["topic"],
+                    weakness_summary=item["weakness_summary"],
+                    rejection_reasons=item.get("last_rejection_reasons") or ["unspecified issue"],
+                )
+        return generated
+
+    def _validate_generated_requests(self, requests: List[Dict[str, Any]], iteration_index: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        valid: List[Dict[str, Any]] = []
+        invalid: List[Dict[str, Any]] = []
+        for item in requests:
+            task = item.get("task")
+            if task is None:
+                continue
+            execution = None
+            rejection_reasons: List[str] = []
+            if self.config.task_execution.enabled:
+                execution = execute_task(task, self.config.task_execution)
+                self._attach_execution(task, execution)
+            rejection_reasons.extend(
+                self._candidate_rejection_reasons(
+                    requested_topic=str(item["topic"]),
+                    task=task,
+                    execution_result=execution,
+                )
+            )
+            rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
+            item["validation_execution"] = execution
+            item["validation_reasons"] = rejection_reasons
+            if rejection_reasons:
+                invalid.append(item)
+            else:
+                valid.append(item)
+
+        self.logger.event(
+            "red_validation_complete",
+            iteration=iteration_index,
+            candidate_count=len(requests),
+            valid_count=len(valid),
+            invalid_count=len(invalid),
+            invalid_topics=[item["topic"] for item in invalid],
+            invalid_reasons=[item.get("validation_reasons") for item in invalid],
+        )
+        return valid, invalid
+
+    def _repair_generated_requests_without_revalidation(
+        self,
+        red_session,
+        requests: List[Dict[str, Any]],
+        iteration_index: int,
+    ) -> List[Dict[str, Any]]:
+        if not requests:
+            return []
+
+        accepted: List[Dict[str, Any]] = []
+        max_attempts = int(self.config.task_execution.max_red_generation_attempts)
+        pending = list(requests)
+        chunk_size = max(1, min(4, self._red_effective_batch_size(len(pending))))
+
+        for item in pending:
+            spec = item.get("spec")
+            repair_reasons = item.get("validation_reasons") or ["validation requested regeneration"]
+            item["task_messages"].append(build_red_repair_message(str(item["topic"]), repair_reasons, spec=spec))
 
         for attempt in range(1, max_attempts + 1):
-            raw = self.red_generator.generate_raw_response(red_session, messages)
-            task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic, spec=spec)
-            messages.append({"role": "assistant", "content": raw})
-
-            execution = None
-            rejection_reasons = list(parse_reasons)
-
-            if task is not None:
-                task.metadata["red_prompt"] = task_prompt
-                task.metadata["weakness_summary"] = weakness_summary
-                if self.config.task_execution.enabled:
-                    execution = execute_task(task, self.config.task_execution)
-                    self._attach_execution(task, execution)
-                rejection_reasons.extend(
-                    self._candidate_rejection_reasons(
-                        requested_topic=topic,
-                        task=task,
-                        execution_result=execution,
-                    )
+            if not pending:
+                break
+            next_pending: List[Dict[str, Any]] = []
+            for start in range(0, len(pending), chunk_size):
+                chunk = pending[start : start + chunk_size]
+                raw_batch = self._batched_red_generate(
+                    red_session,
+                    [item["task_messages"] for item in chunk],
+                    stage="task_repair_final",
                 )
+                for item, raw in zip(chunk, raw_batch):
+                    topic = str(item["topic"])
+                    spec = item.get("spec")
+                    item["task_messages"].append({"role": "assistant", "content": raw})
+                    repaired_task, parse_reasons = self.red_generator.parse_task_response(
+                        raw,
+                        requested_topic=topic,
+                        spec=spec,
+                    )
+                    if repaired_task is not None and not parse_reasons:
+                        repaired_task.metadata["red_prompt"] = str(item["task_prompt"])
+                        repaired_task.metadata["weakness_summary"] = str(item["weakness_summary"])
+                        repaired_task.metadata["accepted_without_revalidation"] = True
+                        repaired_task.metadata["pre_repair_validation_reasons"] = list(item.get("validation_reasons") or [])
+                        repaired_task.metadata["pre_repair_execution"] = (
+                            item["validation_execution"].to_dict()
+                            if item.get("validation_execution") is not None
+                            else None
+                        )
+                        if "execution" not in repaired_task.metadata and item.get("validation_execution") is not None:
+                            repaired_task.metadata["execution"] = item["validation_execution"].to_dict()
+                            repaired_task.metadata["execution_status"] = item["validation_execution"].status
+                            repaired_task.metadata["observed_failure"] = item["validation_execution"].error_message
+                        item["task"] = repaired_task
+                        accepted.append(item)
+                        self.logger.warning(
+                            "red_task_repaired_without_revalidation",
+                            iteration=iteration_index,
+                            topic=topic,
+                            prior_rejection_reasons=item.get("validation_reasons"),
+                            attempt=attempt,
+                        )
+                        continue
 
-            rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
-            if task is not None and not rejection_reasons:
-                return task
+                    parse_reasons = list(dict.fromkeys(reason for reason in parse_reasons if reason))
+                    item["last_rejection_reasons"] = parse_reasons or ["non-json response"]
+                    self._record_red_rejection(
+                        topic=topic,
+                        prompt=str(item["task_prompt"]),
+                        rejected_completion=raw,
+                        rejection_reason=", ".join(item["last_rejection_reasons"]),
+                        spec=spec,
+                        metadata={
+                            "stage": "task_repair_final",
+                            "attempt": attempt,
+                            "weakness_summary": item["weakness_summary"],
+                        },
+                    )
+                    self.logger.warning(
+                        "red_task_repair_retry_requested",
+                        iteration=iteration_index,
+                        topic=topic,
+                        attempt=attempt,
+                        rejection_reasons=item["last_rejection_reasons"],
+                    )
+                    item["task_messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"], spec=spec))
+                    next_pending.append(item)
+            pending = next_pending
 
-            last_rejection_reasons = rejection_reasons or ["unspecified issue"]
-            self._record_red_rejection(
-                topic=topic,
-                prompt=task_prompt,
-                rejected_completion=raw,
-                rejection_reason=", ".join(last_rejection_reasons),
-                spec=spec,
-                metadata={
-                    "stage": "task",
-                    "attempt": attempt,
-                    "weakness_summary": weakness_summary,
-                    "execution_status": execution.status if execution is not None else None,
-                },
-            )
+        for item in pending:
             self.logger.warning(
-                "red_task_repair_requested",
-                topic=topic,
-                attempt=attempt,
-                rejection_reasons=last_rejection_reasons,
-                execution_status=execution.status if execution is not None else None,
+                "red_task_repair_failed_keep_original",
+                iteration=iteration_index,
+                topic=item["topic"],
+                validation_reasons=item.get("validation_reasons"),
             )
-            messages.append(build_red_repair_message(topic, last_rejection_reasons, spec=spec))
+            original_task = item.get("task")
+            if original_task is not None:
+                original_task.metadata["accepted_without_revalidation"] = False
+                original_task.metadata["repair_failed_after_validation"] = True
+                accepted.append(item)
 
-        self.logger.warning(
-            "red_task_generation_failed",
-            topic=topic,
-            weakness_summary=weakness_summary,
-            rejection_reasons=last_rejection_reasons or ["unspecified issue"],
-        )
-        return None
+        return accepted
 
     def _build_hard_example(self, episode: EpisodeRecord, weakness_summary: str) -> RedTrainingExample:
         spec = self._task_spec_from_metadata(episode.task)
@@ -429,112 +629,73 @@ class AdversarialCurriculumPipeline:
         self._store_hard_examples_for_batch(records)
         return records, next_episode_id
 
-    def _load_red_generation_sessions(self) -> List[Any]:
-        sessions: List[Any] = []
-        gpu_ids = [int(x) for x in self.config.red.hardware.gpu_ids]
-        if not gpu_ids:
-            return [self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)]
-
-        for gpu_id in gpu_ids:
-            try:
-                session = self.model_pool.load_red_generation(
-                    adapter_path=self.current_red_adapter,
-                    gpu_id=gpu_id,
-                )
-                sessions.append(session)
-            except TypeError:
-                self.logger.warning(
-                    "red_generation_replica_unsupported",
-                    gpu_id=gpu_id,
-                    reason="model_pool_load_red_generation_has_no_gpu_id_parameter",
-                )
-                break
-            except RuntimeError as exc:
-                self.logger.warning(
-                    "red_generation_replica_failed",
-                    gpu_id=gpu_id,
-                    error=str(exc),
-                )
-
-        if sessions:
-            return sessions
-        return [self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)]
+    def _load_red_generation_session(self):
+        return self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
 
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
-        generated: List[Dict[str, Any]] = []
+        generated_requests: List[Dict[str, Any]] = []
         max_generation_attempts = max(1, target_count * max(2, self.config.task_execution.max_red_generation_attempts))
         generation_attempt = 0
-        red_sessions = self._load_red_generation_sessions()
+        red_session = self._load_red_generation_session()
         try:
-            while len(generated) < target_count and generation_attempt < max_generation_attempts:
+            while len(generated_requests) < target_count and generation_attempt < max_generation_attempts:
+                remaining_slots = target_count - len(generated_requests)
                 remaining_attempts = max_generation_attempts - generation_attempt
-                wave_size = min(len(red_sessions), remaining_attempts, target_count - len(generated))
+                wave_size = min(remaining_slots, remaining_attempts)
                 if wave_size <= 0:
                     break
-
-                jobs: List[Tuple[Any, str, str]] = []
-                for wave_index in range(wave_size):
+                request_batch: List[Dict[str, Any]] = []
+                for _ in range(wave_size):
                     topic = self.curriculum.sample_topic(self.rng)
                     weakness_summary = self.curriculum.weakness_summary(topic)
-                    jobs.append((red_sessions[wave_index % len(red_sessions)], topic, weakness_summary))
-                generation_attempt += len(jobs)
+                    request_batch.append(self._new_red_request(topic, weakness_summary))
+                generation_attempt += len(request_batch)
 
-                if len(jobs) == 1:
-                    session, topic, weakness_summary = jobs[0]
-                    task = self._generate_task_with_red_session(session, topic, weakness_summary)
-                    if task is None:
-                        self.logger.warning(
-                            "episode_skipped_red_failure",
-                            iteration=iteration_index,
-                            generation_attempt=generation_attempt,
-                            topic=topic,
-                            weakness_summary=weakness_summary,
-                        )
-                    else:
-                        generated.append({"task": task, "weakness_summary": weakness_summary})
-                    continue
+                spec_ready = self._generate_red_specs_batch(red_session, request_batch)
+                generated_requests.extend(self._generate_red_tasks_batch(red_session, spec_ready))
 
-                with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-                    future_map = {
-                        executor.submit(self._generate_task_with_red_session, session, topic, weakness_summary): (topic, weakness_summary)
-                        for session, topic, weakness_summary in jobs
-                    }
-                    for future in as_completed(future_map):
-                        topic, weakness_summary = future_map[future]
-                        task = future.result()
-                        if task is None:
-                            self.logger.warning(
-                                "episode_skipped_red_failure",
-                                iteration=iteration_index,
-                                generation_attempt=generation_attempt,
-                                topic=topic,
-                                weakness_summary=weakness_summary,
-                            )
-                            continue
-                        generated.append(
-                            {
-                                "task": task,
-                                "weakness_summary": weakness_summary,
-                            }
-                        )
-                        if len(generated) >= target_count:
-                            break
+                for item in request_batch:
+                    if item.get("task") is not None:
+                        continue
+                    self.logger.warning(
+                        "episode_skipped_red_failure",
+                        iteration=iteration_index,
+                        generation_attempt=generation_attempt,
+                        topic=item["topic"],
+                        weakness_summary=item["weakness_summary"],
+                    )
+
+            valid_requests, invalid_requests = self._validate_generated_requests(generated_requests, iteration_index)
+            repaired_requests = self._repair_generated_requests_without_revalidation(
+                red_session,
+                invalid_requests,
+                iteration_index,
+            )
         finally:
-            for session in red_sessions:
-                try:
-                    session.unload()
-                except Exception:
-                    continue
+            red_session.unload()
 
+        final_requests = valid_requests + repaired_requests
         self.logger.event(
             "iteration_red_generation_complete",
             iteration=iteration_index,
             requested_tasks=target_count,
-            generated_tasks=len(generated),
+            generated_tasks=len(final_requests),
+            raw_generated_tasks=len(generated_requests),
+            validated_tasks=len(valid_requests),
+            repaired_tasks=len(repaired_requests),
             attempts=generation_attempt,
-            replica_count=len(red_sessions),
+            replica_count=1,
+            shard_gpu_ids=self.config.red.hardware.gpu_ids,
+            effective_batch_size=self._red_effective_batch_size(max(1, target_count)),
         )
-        return generated
+        return [
+            {
+                "task": item["task"],
+                "weakness_summary": item["weakness_summary"],
+            }
+            for item in final_requests
+            if item.get("task") is not None
+        ]
 
     def _generate_socratic_hints_for_iteration(self, items: List[Dict[str, Any]], iteration_index: int) -> List[Dict[str, Any]]:
         if not items:

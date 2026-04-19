@@ -9,15 +9,15 @@ runtime:
 task_execution:
   enabled: true
   python_executable: python
-  timeout_seconds: 12
+  timeout_seconds: 5
   max_red_generation_attempts: 4
   capture_max_chars: 1600
   min_code_lines_for_repair: 15
   probabilistic_repair_probability: 0.5
 
 storage:
-  root_dir: ./runs/17_04
-  keep_last_n_checkpoints: 3
+  root_dir: ./runs/19_04
+  keep_last_n_checkpoints: 2
   hard_buffer_max_size: 2048
 
 curriculum:
