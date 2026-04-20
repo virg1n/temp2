@@ -42,6 +42,21 @@ curriculum:
       weight: 1.0
     - name: NumPy and Linear Algebra
       weight: 1.0
+    - name: Decorators and Closures
+      weight: 1.0
+    - name: Exception Handling and Custom Exceptions
+      weight: 1.0
+    - name: Mutable State and Aliasing
+      weight: 1.0
+    - name: Inheritance, MRO, and Dunder Methods
+      weight: 1.0
+    - name: Lists, Tuples, and Slicing
+      weight: 1.0
+    - name: Loops and Iteration
+      weight: 1.0
+    - name: Arithmetic and Type Conversion
+      weight: 1.0
+
 
 socratic:
   model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model

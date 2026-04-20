@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
 from .logging_utils import StructuredLogger
-from .prompts import build_red_messages, build_red_response_prefix
+from .prompts import build_red_messages
 from .schemas import PythonTask, RedTaskSpec
 
 if TYPE_CHECKING:
     from .modeling import RoleSession
 
 
+def _cleanup_chat_artifacts(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^\s*assistant\b[:\s-]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*<think>.*?</think>\s*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    return cleaned.strip()
+
+
 def _extract_json(text: str) -> Optional[Any]:
-    raw = (text or "").strip()
+    raw = _cleanup_chat_artifacts(text)
     if not raw:
         return None
     try:
@@ -37,12 +45,8 @@ class RedTaskGenerator:
     def __init__(self, logger: StructuredLogger) -> None:
         self.logger = logger
 
-    def response_prefix(self, topic: str) -> str:
-        return build_red_response_prefix(topic)
-
     def generate_raw_response(self, session: "RoleSession", messages: List[Dict[str, str]], *, topic: str) -> str:
-        prefix = self.response_prefix(topic)
-        return session.generate([messages], response_prefixes=[prefix])[0]
+        return session.generate([messages])[0]
 
     def parse_task_response(
         self,

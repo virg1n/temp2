@@ -179,7 +179,6 @@ class AdversarialCurriculumPipeline:
             "weakness_summary": weakness_summary,
             "messages": build_red_messages(topic, weakness_summary),
             "task_prompt": build_red_training_prompt(topic, weakness_summary),
-            "response_prefix": self.red_generator.response_prefix(topic),
             "task": None,
             "last_rejection_reasons": [],
             "validation_reasons": [],
@@ -197,18 +196,17 @@ class AdversarialCurriculumPipeline:
                 red_session,
                 [item["messages"] for item in pending],
                 stage="task",
-                response_prefixes=[str(item["response_prefix"]) for item in pending],
             )
             for item, raw in zip(pending, raw_batch):
                 topic = str(item["topic"])
                 weakness_summary = str(item["weakness_summary"])
                 task_prompt = str(item["task_prompt"])
-                item["messages"].append({"role": "assistant", "content": raw})
 
                 task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic)
                 rejection_reasons = list(parse_reasons)
 
                 if task is not None:
+                    item["messages"].append({"role": "assistant", "content": raw})
                     task.metadata["red_prompt"] = task_prompt
                     task.metadata["weakness_summary"] = weakness_summary
 
@@ -316,11 +314,9 @@ class AdversarialCurriculumPipeline:
                     red_session,
                     [item["messages"] for item in chunk],
                     stage="task_repair_final",
-                    response_prefixes=[str(item["response_prefix"]) for item in chunk],
                 )
                 for item, raw in zip(chunk, raw_batch):
                     topic = str(item["topic"])
-                    item["messages"].append({"role": "assistant", "content": raw})
                     repaired_task, parse_reasons = self.red_generator.parse_task_response(
                         raw,
                         requested_topic=topic,
