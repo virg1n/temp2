@@ -116,7 +116,7 @@ judge:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 860
+    max_new_tokens: 850
     temperature: 0.5
     top_p: 0.7
     do_sample: false

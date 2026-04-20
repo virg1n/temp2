@@ -526,6 +526,7 @@ class ModelPool:
 
     def load_socratic_trainable(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
+        self.release_socratic()
         return load_role_session(
             role_name="socratic_train",
             model_name_or_path=source,
