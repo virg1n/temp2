@@ -58,7 +58,7 @@ socratic:
     batch_size: 1
     max_new_tokens: 480
     temperature: 1.10
-    top_p: 1.0
+    top_p: 0.9
     do_sample: true
     repetition_penalty: 1.05
   lora:
@@ -93,6 +93,11 @@ judge:
   model_name_or_path: Qwen/Qwen3-32B
   tokenizer_name_or_path:
   base_adapter_path:
+  inference_backend: vllm_server
+  vllm_base_url: http://localhost:8000/v1
+  vllm_api_key: EMPTY
+  vllm_timeout_seconds: 120
+  vllm_max_retries: 2
   quantization: 8bit
   enable_thinking: false
   reward_weights:
@@ -113,7 +118,7 @@ judge:
     batch_size: 1
     max_new_tokens: 860
     temperature: 0.5
-    top_p: 1.0
+    top_p: 0.7
     do_sample: false
     repetition_penalty: 1.0
 

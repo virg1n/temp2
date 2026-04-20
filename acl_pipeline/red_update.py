@@ -47,21 +47,40 @@ class RedUpdateResult:
     skipped_reason: Optional[str] = None
 
 
+def _task_output_metadata(task: PythonTask) -> Dict[str, Any]:
+    spec = dict(task.metadata.get("red_spec") or {})
+    spec_metadata = dict(spec.get("metadata") or {})
+    failure_mode = str(
+        spec_metadata.get("failure_mode")
+        or task.metadata.get("failure_mode")
+        or spec.get("intended_bug")
+        or "unspecified bug"
+    ).strip()
+    difficulty = str(spec_metadata.get("difficulty") or task.metadata.get("difficulty") or "").strip().lower()
+    if difficulty not in {"medium", "hard"}:
+        difficulty = "medium"
+    return {
+        "failure_mode": failure_mode,
+        "difficulty": difficulty,
+    }
+
+
+def _task_buggy_solution_for_output(task: PythonTask) -> str:
+    if any(str(item).strip() for item in task.failing_asserts):
+        return task.combined_program()
+    return task.buggy_solution
+
+
 def serialize_task_json(task: PythonTask) -> str:
     spec = dict(task.metadata.get("red_spec") or {})
-    metadata = {
-        key: value
-        for key, value in dict(task.metadata).items()
-        if key in {"failure_mode", "difficulty", "observed_failure", "execution_status"}
-    }
     payload = {
         "topic": task.topic,
         "target_function": spec.get("target_function", ""),
         "intended_bug": spec.get("intended_bug", task.metadata.get("failure_mode", "")),
         "expected_first_failure": spec.get("expected_first_failure", task.observed_failure()),
         "statement": task.statement,
-        "buggy_solution": task.combined_program(),
-        "metadata": metadata,
+        "buggy_solution": _task_buggy_solution_for_output(task),
+        "metadata": _task_output_metadata(task),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -111,74 +130,97 @@ def _build_sft_dataset(
     return Dataset.from_list(rows)
 
 
+def _canonical_prompt(prompt: Optional[str]) -> str:
+    return str(prompt or "").strip()
+
+
+def _canonical_spec(spec: Optional[Dict[str, Any]]) -> str:
+    payload = dict(spec or {})
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True) if payload else ""
+
+
+def _example_spec(example: RedTrainingExample) -> Optional[Dict[str, Any]]:
+    return dict(example.task.metadata.get("red_spec") or {}) or None
+
+
 def _build_dpo_dataset(
-    hard_examples: List[RedTrainingExample],
+    chosen_examples: List[RedTrainingExample],
     rejected_examples: List[RedRejectedExample],
-    recent_episodes: List[EpisodeRecord],
     *,
     limit: int,
 ) -> Dataset:
-    easy_by_topic: Dict[str, EpisodeRecord] = {}
-    global_easy: Optional[EpisodeRecord] = None
+    prompt_index: Dict[str, List[RedTrainingExample]] = {}
+    prompt_spec_index: Dict[tuple[str, str], List[RedTrainingExample]] = {}
 
-    for episode in sorted(recent_episodes, key=lambda item: item.judge.normalized_reward, reverse=True):
-        if global_easy is None:
-            global_easy = episode
-        easy_by_topic.setdefault(episode.topic, episode)
+    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
+        prompt_key = _canonical_prompt(example.prompt or example.task.metadata.get("red_prompt"))
+        if not prompt_key:
+            continue
+        prompt_index.setdefault(prompt_key, []).append(example)
+        spec_key = _canonical_spec(_example_spec(example))
+        if spec_key:
+            prompt_spec_index.setdefault((prompt_key, spec_key), []).append(example)
 
     rows: List[Dict[str, str]] = []
-    for item in sorted(hard_examples, key=lambda entry: entry.reward)[:limit]:
-        easy = easy_by_topic.get(item.topic) or global_easy
-        if easy is None:
-            continue
-        rejected = serialize_task_json(easy.task)
-        if rejected == item.chosen_completion:
+    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
+        rejected = str(example.rejected_completion or "").strip()
+        prompt = _canonical_prompt(example.prompt or example.task.metadata.get("red_prompt"))
+        if not prompt or not rejected or rejected == example.chosen_completion:
             continue
         rows.append(
             {
-                "prompt": item.prompt,
-                "chosen": item.chosen_completion,
+                "prompt": prompt,
+                "chosen": example.chosen_completion,
                 "rejected": rejected,
             }
         )
+        if len(rows) >= limit:
+            return Dataset.from_list(rows)
 
-    remaining = max(0, limit - len(rows))
-    if remaining > 0:
-        for item in rejected_examples[-remaining:]:
-            chosen_episode = easy_by_topic.get(item.topic) or global_easy
-            if chosen_episode is None:
-                continue
-            chosen = serialize_task_json(chosen_episode.task)
-            rejected = str(item.rejected_completion or "").strip()
-            if not rejected or rejected == chosen:
-                continue
-            rows.append(
-                {
-                    "prompt": item.prompt,
-                    "chosen": chosen,
-                    "rejected": rejected,
-                }
-            )
+    for item in rejected_examples:
+        prompt_key = _canonical_prompt(item.prompt)
+        if not prompt_key:
+            continue
+        spec_key = _canonical_spec(item.spec)
+        if spec_key:
+            candidates = prompt_spec_index.get((prompt_key, spec_key), [])
+        else:
+            candidates = prompt_index.get(prompt_key, [])
+        if not candidates:
+            continue
+        chosen = str(candidates[0].chosen_completion or "").strip()
+        rejected = str(item.rejected_completion or "").strip()
+        if not chosen or not rejected or chosen == rejected:
+            continue
+        rows.append(
+            {
+                "prompt": prompt_key,
+                "chosen": chosen,
+                "rejected": rejected,
+            }
+        )
+        if len(rows) >= limit:
+            break
 
     return Dataset.from_list(rows)
 
 
-def _recent_episode_examples(episodes: List[EpisodeRecord], *, limit: int) -> List[RedTrainingExample]:
+def _hard_or_low_reward_episode_examples(episodes: List[EpisodeRecord], *, limit: int) -> List[RedTrainingExample]:
     rows: List[RedTrainingExample] = []
-    for episode in sorted(episodes, key=lambda item: item.judge.normalized_reward, reverse=True)[:limit]:
+    for episode in sorted(episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
         weakness_summary = str(episode.metadata.get("weakness_summary") or "general weakness probing")
         rows.append(
             RedTrainingExample(
-                example_id=f"recent_{episode.episode_id}",
+                example_id=f"low_reward_recent_{episode.episode_id}",
                 topic=episode.topic,
-                prompt=build_red_training_prompt(episode.topic, weakness_summary),
+                prompt=str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary)),
                 chosen_completion=serialize_task_json(episode.task),
                 rejected_completion=None,
                 reward=episode.judge.normalized_reward,
                 task=episode.task,
                 metadata={
                     "episode_id": episode.episode_id,
-                    "source": "recent_episode",
+                    "source": "low_reward_recent_episode",
                 },
             )
         )
@@ -204,7 +246,7 @@ class RedUpdater:
         settings = self.config.red.update
         chosen_examples = list(hard_examples)
         if len(chosen_examples) < settings.min_hard_examples:
-            fallback = _recent_episode_examples(
+            fallback = _hard_or_low_reward_episode_examples(
                 recent_episodes,
                 limit=settings.min_hard_examples - len(chosen_examples),
             )
@@ -279,9 +321,8 @@ class RedUpdater:
 
                 if attempt["dpo_enabled"] and DPOTrainer is not None and DPOConfig is not None:
                     dpo_dataset = _build_dpo_dataset(
-                        hard_examples,
+                        chosen_examples,
                         rejected_examples,
-                        recent_episodes,
                         limit=settings.max_dpo_pairs,
                     )
                     if len(dpo_dataset) > 0:

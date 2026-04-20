@@ -13,8 +13,6 @@ from .modeling import ModelPool
 from .prompts import (
     build_red_messages,
     build_red_repair_message,
-    build_red_spec_repair_message,
-    build_red_task_from_spec_message,
     build_red_training_prompt,
 )
 from .red_generation import RedTaskGenerator
@@ -50,6 +48,7 @@ class AdversarialCurriculumPipeline:
         self.red_updater = RedUpdater(config, self.model_pool, self.storage, self.logger)
         self.socratic_updater = SocraticGrpoUpdater(config, self.model_pool, self.judge, self.storage, self.logger)
         self.rng = random.Random(config.runtime.seed)
+        self._red_adapter_failed_last_iteration = False
 
         pointers = self.storage.load_pointers()
         self.current_socratic_model = str(pointers.get("socratic_model_path") or config.socratic.model_name_or_path)
@@ -143,7 +142,14 @@ class AdversarialCurriculumPipeline:
         default_target = max(1, min(4, self._iteration_size()))
         return max(1, min(item_count, max(configured, default_target)))
 
-    def _batched_red_generate(self, red_session, messages_batch: List[List[Dict[str, str]]], *, stage: str) -> List[str]:
+    def _batched_red_generate(
+        self,
+        red_session,
+        messages_batch: List[List[Dict[str, str]]],
+        *,
+        stage: str,
+        response_prefixes: Optional[List[str]] = None,
+    ) -> List[str]:
         if not messages_batch:
             return []
         generation = GenerationSettings(
@@ -161,98 +167,45 @@ class AdversarialCurriculumPipeline:
             effective_batch_size=generation.batch_size,
             max_new_tokens=generation.max_new_tokens,
         )
-        return red_session.generate(messages_batch, generation=generation)
+        return red_session.generate(
+            messages_batch,
+            generation=generation,
+            response_prefixes=response_prefixes,
+        )
 
     def _new_red_request(self, topic: str, weakness_summary: str) -> Dict[str, Any]:
         return {
             "topic": topic,
             "weakness_summary": weakness_summary,
-            "spec_messages": build_red_messages(topic, weakness_summary),
-            "spec": None,
+            "messages": build_red_messages(topic, weakness_summary),
             "task_prompt": build_red_training_prompt(topic, weakness_summary),
-            "task_messages": None,
+            "response_prefix": self.red_generator.response_prefix(topic),
             "task": None,
             "last_rejection_reasons": [],
             "validation_reasons": [],
             "validation_execution": None,
         }
 
-    def _generate_red_specs_batch(self, red_session, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        max_attempts = int(self.config.task_execution.max_red_generation_attempts)
-        pending = list(requests)
-        for attempt in range(1, max_attempts + 1):
-            if not pending:
-                break
-            raw_batch = self._batched_red_generate(
-                red_session,
-                [item["spec_messages"] for item in pending],
-                stage="spec",
-            )
-            next_pending: List[Dict[str, Any]] = []
-            for item, spec_raw in zip(pending, raw_batch):
-                topic = str(item["topic"])
-                weakness_summary = str(item["weakness_summary"])
-                item["spec_messages"].append({"role": "assistant", "content": spec_raw})
-                spec, parse_reasons = self.red_generator.parse_spec_response(spec_raw, requested_topic=topic)
-                rejection_reasons = list(parse_reasons)
-                if spec is not None and self._normalize_topic(spec.topic) != self._normalize_topic(topic):
-                    rejection_reasons.append("wrong topic")
-                    spec = None
-                if spec is not None:
-                    item["spec"] = spec
-                    item["task_prompt"] = build_red_training_prompt(topic, weakness_summary, spec=spec)
-                    item["task_messages"] = list(item["spec_messages"])
-                    item["task_messages"].append(build_red_task_from_spec_message(spec))
-                    continue
-
-                rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
-                item["last_rejection_reasons"] = rejection_reasons or ["invalid spec"]
-                self._record_red_rejection(
-                    topic=topic,
-                    prompt=build_red_training_prompt(topic, weakness_summary),
-                    rejected_completion=spec_raw,
-                    rejection_reason=", ".join(item["last_rejection_reasons"]),
-                    metadata={"stage": "spec", "attempt": attempt, "weakness_summary": weakness_summary},
-                )
-                self.logger.warning(
-                    "red_spec_repair_requested",
-                    topic=topic,
-                    attempt=attempt,
-                    rejection_reasons=item["last_rejection_reasons"],
-                )
-                item["spec_messages"].append(build_red_spec_repair_message(topic, item["last_rejection_reasons"]))
-                next_pending.append(item)
-            pending = next_pending
-
-        for item in pending:
-            self.logger.warning(
-                "red_task_generation_failed",
-                topic=item["topic"],
-                weakness_summary=item["weakness_summary"],
-                rejection_reasons=item.get("last_rejection_reasons") or ["invalid spec"],
-            )
-        return [item for item in requests if item.get("spec") is not None]
-
     def _generate_red_tasks_batch(self, red_session, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         generated: List[Dict[str, Any]] = []
         max_attempts = int(self.config.task_execution.max_red_generation_attempts)
         for attempt in range(1, max_attempts + 1):
-            pending = [item for item in requests if item.get("spec") is not None and item.get("task") is None]
+            pending = [item for item in requests if item.get("task") is None]
             if not pending:
                 break
             raw_batch = self._batched_red_generate(
                 red_session,
-                [item["task_messages"] for item in pending],
+                [item["messages"] for item in pending],
                 stage="task",
+                response_prefixes=[str(item["response_prefix"]) for item in pending],
             )
             for item, raw in zip(pending, raw_batch):
                 topic = str(item["topic"])
                 weakness_summary = str(item["weakness_summary"])
-                spec = item.get("spec")
                 task_prompt = str(item["task_prompt"])
-                item["task_messages"].append({"role": "assistant", "content": raw})
+                item["messages"].append({"role": "assistant", "content": raw})
 
-                task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic, spec=spec)
+                task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic)
                 rejection_reasons = list(parse_reasons)
 
                 if task is not None:
@@ -271,7 +224,6 @@ class AdversarialCurriculumPipeline:
                     prompt=task_prompt,
                     rejected_completion=raw,
                     rejection_reason=", ".join(item["last_rejection_reasons"]),
-                    spec=spec,
                     metadata={
                         "stage": "task",
                         "attempt": attempt,
@@ -286,10 +238,10 @@ class AdversarialCurriculumPipeline:
                     rejection_reasons=item["last_rejection_reasons"],
                     execution_status=None,
                 )
-                item["task_messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"], spec=spec))
+                item["messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"]))
 
         for item in requests:
-            if item.get("spec") is not None and item.get("task") is None:
+            if item.get("task") is None:
                 self.logger.warning(
                     "red_task_generation_failed",
                     topic=item["topic"],
@@ -351,9 +303,8 @@ class AdversarialCurriculumPipeline:
         chunk_size = max(1, min(4, self._red_effective_batch_size(len(pending))))
 
         for item in pending:
-            spec = item.get("spec")
             repair_reasons = item.get("validation_reasons") or ["validation requested regeneration"]
-            item["task_messages"].append(build_red_repair_message(str(item["topic"]), repair_reasons, spec=spec))
+            item["messages"].append(build_red_repair_message(str(item["topic"]), repair_reasons))
 
         for attempt in range(1, max_attempts + 1):
             if not pending:
@@ -363,17 +314,16 @@ class AdversarialCurriculumPipeline:
                 chunk = pending[start : start + chunk_size]
                 raw_batch = self._batched_red_generate(
                     red_session,
-                    [item["task_messages"] for item in chunk],
+                    [item["messages"] for item in chunk],
                     stage="task_repair_final",
+                    response_prefixes=[str(item["response_prefix"]) for item in chunk],
                 )
                 for item, raw in zip(chunk, raw_batch):
                     topic = str(item["topic"])
-                    spec = item.get("spec")
-                    item["task_messages"].append({"role": "assistant", "content": raw})
+                    item["messages"].append({"role": "assistant", "content": raw})
                     repaired_task, parse_reasons = self.red_generator.parse_task_response(
                         raw,
                         requested_topic=topic,
-                        spec=spec,
                     )
                     if repaired_task is not None and not parse_reasons:
                         repaired_task.metadata["red_prompt"] = str(item["task_prompt"])
@@ -407,7 +357,6 @@ class AdversarialCurriculumPipeline:
                         prompt=str(item["task_prompt"]),
                         rejected_completion=raw,
                         rejection_reason=", ".join(item["last_rejection_reasons"]),
-                        spec=spec,
                         metadata={
                             "stage": "task_repair_final",
                             "attempt": attempt,
@@ -421,7 +370,7 @@ class AdversarialCurriculumPipeline:
                         attempt=attempt,
                         rejection_reasons=item["last_rejection_reasons"],
                     )
-                    item["task_messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"], spec=spec))
+                    item["messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"]))
                     next_pending.append(item)
             pending = next_pending
 
@@ -441,11 +390,7 @@ class AdversarialCurriculumPipeline:
         return accepted
 
     def _build_hard_example(self, episode: EpisodeRecord, weakness_summary: str) -> RedTrainingExample:
-        spec = self._task_spec_from_metadata(episode.task)
-        prompt = (
-            build_red_training_prompt(episode.topic, weakness_summary, spec=spec)
-            + f" Reproduced failure: {episode.task.observed_failure()[:600]}"
-        )
+        prompt = str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary))
         return RedTrainingExample(
             example_id=uuid4().hex[:16],
             topic=episode.topic,
@@ -509,6 +454,27 @@ class AdversarialCurriculumPipeline:
             task_metadata=episode.task.metadata,
         )
 
+    def _using_non_base_red_adapter(self) -> bool:
+        base = self.config.red.base_adapter_path
+        current = self.current_red_adapter
+        if current is None:
+            return False
+        return str(current) != str(base)
+
+    def _handle_red_adapter_failure(self, iteration_index: int, generated_tasks: int) -> None:
+        previous_adapter = self.current_red_adapter
+        self.current_red_adapter = None
+        self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
+        self._red_adapter_failed_last_iteration = True
+        self.logger.warning(
+            "red_adapter_failure_reset",
+            iteration=iteration_index,
+            generated_tasks=generated_tasks,
+            previous_adapter=previous_adapter,
+            fallback_adapter=self.config.red.base_adapter_path,
+            reason="zero_valid_red_tasks",
+        )
+
     def _reset_red_and_curriculum(self, episode_id: int) -> None:
         self.current_red_adapter = self.config.red.base_adapter_path
         self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
@@ -558,7 +524,7 @@ class AdversarialCurriculumPipeline:
                 rejection_reason = str(judge_output.metadata.get("red_rejection_reason") or "judge_bad_task")
                 self._record_red_rejection(
                     topic=task.topic,
-                    prompt=str(task.metadata.get("red_prompt") or build_red_training_prompt(task.topic, weakness_summary, spec=spec)),
+                    prompt=str(task.metadata.get("red_prompt") or build_red_training_prompt(task.topic, weakness_summary)),
                     rejected_completion=serialize_task_json(task),
                     rejection_reason=rejection_reason,
                     spec=spec,
@@ -633,6 +599,7 @@ class AdversarialCurriculumPipeline:
         return self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
 
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
+        self._red_adapter_failed_last_iteration = False
         generated_requests: List[Dict[str, Any]] = []
         max_generation_attempts = max(1, target_count * max(2, self.config.task_execution.max_red_generation_attempts))
         generation_attempt = 0
@@ -651,8 +618,7 @@ class AdversarialCurriculumPipeline:
                     request_batch.append(self._new_red_request(topic, weakness_summary))
                 generation_attempt += len(request_batch)
 
-                spec_ready = self._generate_red_specs_batch(red_session, request_batch)
-                generated_requests.extend(self._generate_red_tasks_batch(red_session, spec_ready))
+                generated_requests.extend(self._generate_red_tasks_batch(red_session, request_batch))
 
                 for item in request_batch:
                     if item.get("task") is not None:
@@ -675,6 +641,8 @@ class AdversarialCurriculumPipeline:
             red_session.unload()
 
         final_requests = valid_requests + repaired_requests
+        if not final_requests and self._using_non_base_red_adapter():
+            self._handle_red_adapter_failure(iteration_index, len(final_requests))
         self.logger.event(
             "iteration_red_generation_complete",
             iteration=iteration_index,
@@ -722,19 +690,29 @@ class AdversarialCurriculumPipeline:
         if step <= 0:
             return
 
-        if accepted_records:
-            recent_episodes = self.storage.load_recent_episodes(self.config.socratic.grpo.max_training_examples)
-            socratic_result = self.socratic_updater.run(
-                episodes=recent_episodes,
+        if not accepted_records:
+            self.logger.event(
+                "iteration_updates_skipped",
+                iteration=iteration_index,
                 step=step,
-                model_source=self.current_socratic_model,
-                adapter_path=self.current_socratic_adapter,
+                reason="zero_accepted_episodes",
+                socratic_adapter=self.current_socratic_adapter,
+                red_adapter=self.current_red_adapter,
             )
-            if socratic_result is not None:
-                self.current_socratic_model = socratic_result.model_source
-                self.current_socratic_adapter = socratic_result.adapter_path
-                self.storage.save_pointer("socratic_model_path", self.current_socratic_model)
-                self.storage.save_pointer("socratic_adapter_path", self.current_socratic_adapter)
+            return
+
+        recent_episodes = self.storage.load_recent_episodes(self.config.socratic.grpo.max_training_examples)
+        socratic_result = self.socratic_updater.run(
+            episodes=recent_episodes,
+            step=step,
+            model_source=self.current_socratic_model,
+            adapter_path=self.current_socratic_adapter,
+        )
+        if socratic_result is not None:
+            self.current_socratic_model = socratic_result.model_source
+            self.current_socratic_adapter = socratic_result.adapter_path
+            self.storage.save_pointer("socratic_model_path", self.current_socratic_model)
+            self.storage.save_pointer("socratic_adapter_path", self.current_socratic_adapter)
 
         hard_examples = self.storage.load_hard_examples(self.config.red.update.max_sft_examples)
         rejected_examples = self.storage.load_red_rejected_examples(self.config.red.update.max_dpo_pairs)
@@ -832,7 +810,10 @@ class AdversarialCurriculumPipeline:
                 if accepted_records:
                     stalled_iterations = 0
                 else:
-                    stalled_iterations += 1
+                    if self._red_adapter_failed_last_iteration:
+                        stalled_iterations = 0
+                    else:
+                        stalled_iterations += 1
                     if stalled_iterations >= 5:
                         self.logger.error(
                             "pipeline_stalled",

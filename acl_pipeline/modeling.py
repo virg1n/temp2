@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -154,18 +155,25 @@ class RoleSession:
         messages_batch: Iterable[List[Dict[str, str]]],
         *,
         generation: Optional[GenerationSettings] = None,
+        response_prefixes: Optional[List[str]] = None,
     ) -> List[str]:
         effective = generation or self.generation
-        prompts = [
-            render_chat_messages(
+        prompts: List[str] = []
+        prefixes = list(response_prefixes or [])
+        messages_list = list(messages_batch)
+        if prefixes and len(prefixes) != len(messages_list):
+            raise ValueError("response_prefixes length must match messages_batch length")
+        for index, messages in enumerate(messages_list):
+            prompt = render_chat_messages(
                 self.tokenizer,
                 list(messages),
                 enable_thinking=self.enable_thinking,
                 add_generation_prompt=True,
             )
-            for messages in messages_batch
-        ]
-        return _generate_texts(
+            if prefixes:
+                prompt += prefixes[index]
+            prompts.append(prompt)
+        outputs = _generate_texts(
             model=self.model,
             tokenizer=self.tokenizer,
             prompts=prompts,
@@ -173,11 +181,86 @@ class RoleSession:
             logger=self.logger,
             role_name=self.role_name,
         )
+        if prefixes:
+            return [prefix + output for prefix, output in zip(prefixes, outputs)]
+        return outputs
 
     def unload(self) -> None:
         del self.model
         del self.tokenizer
         clear_cuda_memory()
+
+
+@dataclass
+class ServerRoleSession:
+    role_name: str
+    model_name_or_path: str
+    generation: GenerationSettings
+    enable_thinking: bool
+    logger: StructuredLogger
+    base_url: str
+    api_key: str
+    timeout_seconds: int
+    max_retries: int
+    _client: Any = None
+
+    def _client_instance(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import OpenAI
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("openai package is required for vLLM server-backed inference.") from exc
+            self._client = OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout_seconds,
+            )
+        return self._client
+
+    def generate(
+        self,
+        messages_batch: Iterable[List[Dict[str, str]]],
+        *,
+        generation: Optional[GenerationSettings] = None,
+        response_prefixes: Optional[List[str]] = None,
+    ) -> List[str]:
+        if response_prefixes:
+            raise RuntimeError("response_prefixes are not supported for server-backed generation.")
+        effective = generation or self.generation
+        client = self._client_instance()
+        outputs: List[str] = []
+        for messages in messages_batch:
+            text = ""
+            last_err: Optional[Exception] = None
+            for attempt in range(max(1, int(self.max_retries) + 1)):
+                try:
+                    response = client.chat.completions.create(
+                        model=self.model_name_or_path,
+                        messages=list(messages),
+                        temperature=float(effective.temperature) if effective.do_sample else 0.0,
+                        top_p=float(effective.top_p),
+                        max_tokens=int(effective.max_new_tokens),
+                        extra_body={"chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}},
+                    )
+                    text = str(response.choices[0].message.content or "").strip()
+                    last_err = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    time.sleep(min(2**attempt, 8))
+            if last_err is not None:
+                self.logger.warning(
+                    "server_generate_failed",
+                    role=self.role_name,
+                    model_name_or_path=self.model_name_or_path,
+                    error=str(last_err),
+                )
+                text = "[]"
+            outputs.append(text)
+        return outputs
+
+    def unload(self) -> None:
+        self._client = None
 
 
 def _generate_texts(
@@ -369,24 +452,47 @@ class ModelPool:
         self.config = config
         self.logger = logger
         self._judge: Optional[RoleSession] = None
+        self._judge_backend = str(config.judge.inference_backend or "transformers").strip().lower()
         self._socratic: Optional[RoleSession] = None
         self._socratic_source: Optional[str] = None
         self._socratic_adapter: Optional[str] = None
 
     def get_judge(self) -> RoleSession:
         if self._judge is None:
-            self._judge = load_role_session(
-                role_name="judge",
-                model_name_or_path=self.config.judge.model_name_or_path,
-                tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
-                hardware=self.config.judge.hardware,
-                generation=self.config.judge.generation,
-                quantization=self.config.judge.quantization,
-                enable_thinking=self.config.judge.enable_thinking,
-                logger=self.logger,
-                adapter_path=self.config.judge.base_adapter_path,
-                trainable=False,
-            )
+            if self._judge_backend == "vllm_server":
+                self._judge = ServerRoleSession(
+                    role_name="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    generation=self.config.judge.generation,
+                    enable_thinking=self.config.judge.enable_thinking,
+                    logger=self.logger,
+                    base_url=self.config.judge.vllm_base_url,
+                    api_key=self.config.judge.vllm_api_key,
+                    timeout_seconds=self.config.judge.vllm_timeout_seconds,
+                    max_retries=self.config.judge.vllm_max_retries,
+                )
+                self.logger.event(
+                    "model_loaded",
+                    role="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    backend=self._judge_backend,
+                    base_url=self.config.judge.vllm_base_url,
+                    persistent=True,
+                    trainable=False,
+                )
+            else:
+                self._judge = load_role_session(
+                    role_name="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
+                    hardware=self.config.judge.hardware,
+                    generation=self.config.judge.generation,
+                    quantization=self.config.judge.quantization,
+                    enable_thinking=self.config.judge.enable_thinking,
+                    logger=self.logger,
+                    adapter_path=self.config.judge.base_adapter_path,
+                    trainable=False,
+                )
         return self._judge
 
     def get_socratic(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
@@ -487,6 +593,7 @@ class ModelPool:
     def debug_summary(self) -> str:
         payload = {
             "judge_loaded": self._judge is not None,
+            "judge_backend": self._judge_backend,
             "socratic_loaded": self._socratic is not None,
             "socratic_source": self._socratic_source,
             "socratic_adapter": self._socratic_adapter,

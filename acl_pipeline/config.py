@@ -131,6 +131,11 @@ class SocraticConfig(RoleConfig):
 
 @dataclass
 class JudgeConfig(RoleConfig):
+    inference_backend: str = "vllm_server"
+    vllm_base_url: str = "http://localhost:8000/v1"
+    vllm_api_key: str = "EMPTY"
+    vllm_timeout_seconds: int = 120
+    vllm_max_retries: int = 2
     reward_weights: Dict[str, float] = field(
         default_factory=lambda: {
             "no_solution_reveal": 0.30,
@@ -305,6 +310,11 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         hardware=base.hardware,
         generation=base.generation,
         lora=base.lora,
+        inference_backend=str(payload.get("inference_backend", "vllm_server")),
+        vllm_base_url=str(payload.get("vllm_base_url", "http://localhost:8000/v1")),
+        vllm_api_key=str(payload.get("vllm_api_key", "EMPTY")),
+        vllm_timeout_seconds=int(payload.get("vllm_timeout_seconds", 120)),
+        vllm_max_retries=int(payload.get("vllm_max_retries", 2)),
         reward_weights={
             key: float(reward_weights.get(key, value))
             for key, value in default_weights.items()

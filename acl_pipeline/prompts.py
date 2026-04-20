@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Dict, Iterable, List, Optional
 
-from .schemas import PythonTask, RedTaskSpec
+from .schemas import PythonTask
 
 
 SOCRATIC_SYSTEM_PROMPT = (
@@ -21,11 +21,13 @@ SOCRATIC_SYSTEM_PROMPT = (
 RED_SYSTEM_PROMPT = (
     "You are Red, an adversarial curriculum generator for Python debugging tasks. "
     "Generate realistic medium-to-hard Python debugging tasks that expose weaknesses in a Socratic tutor. "
-    "Work spec-first: first design a coherent bug spec, then write the full task from that spec. "
-    "Return strict JSON only. "
-    "The final task JSON must contain a full Python program in buggy_solution with any asserts placed inside that program at the end. "
-    "Do not use a separate failing_asserts field unless explicitly repairing an old-format example. "
+    "Return exactly one strict JSON object only. "
+    "The same JSON object must include the spec fields and the task fields together. "
+    "The task JSON must contain a full Python program in buggy_solution with any asserts placed inside that program at the end. "
+    "Do not use a separate failing_asserts field in new outputs. "
     "The code should be realistic, debuggable, and actually broken in a meaningful way. "
+    "Never emit markdown fences, role labels, or <think> tags. "
+    "If the response is prefilled with the beginning of a JSON object, continue that exact JSON object directly. "
     "Do not include explanations outside the JSON."
 )
 
@@ -42,93 +44,62 @@ def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
     ]
 
 
-def build_red_spec_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
+def build_red_training_prompt(
+    topic: str,
+    weakness_summary: Optional[str],
+) -> str:
     focus = weakness_summary or "No prior weakness summary is available yet. Sample broadly within the topic."
-    user_prompt = (
+    return (
         f"Topic: {topic}\n"
         f"Weakness focus: {focus}\n\n"
-        "Step 1 only: produce a debugging-task spec as strict JSON with this schema:\n"
+        "Generate one adversarial Python debugging task and return exactly one strict JSON object with this schema:\n"
         "{\n"
-        '  "topic": "...",\n'
+        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
         '  "target_function": "...",\n'
         '  "intended_bug": "...",\n'
         '  "expected_first_failure": "...",\n'
+        '  "statement": "...",\n'
+        '  "buggy_solution": "full python program without markdown fences; include asserts at the end inside this string",\n'
         '  "metadata": {"failure_mode": "...", "difficulty": "medium|hard"}\n'
         "}\n\n"
         "Requirements:\n"
-        "- Make the spec coherent before writing code.\n"
+        "- Keep topic exact.\n"
+        "- Make the bug spec coherent with the actual code and tests.\n"
         "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
         "- Prefer semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
         "- The expected_first_failure should name the first likely assertion or runtime failure.\n"
         "- The task should be debuggable from the code and reproduced failure alone.\n"
         "- Avoid trivial one-function arithmetic exercises.\n"
+        "- The program should usually be 25-90 non-empty lines.\n"
+        "- At least one assert or runtime path should fail on execution.\n"
+        "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
         "- JSON only."
     )
+
+def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": RED_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": build_red_training_prompt(topic, weakness_summary)},
     ]
 
 
-def build_red_task_from_spec_message(spec: RedTaskSpec) -> Dict[str, str]:
-    spec_payload = json.dumps(spec.to_dict(), ensure_ascii=False, indent=2)
-    return {
-        "role": "user",
-        "content": (
-            "Step 2: write the final task from this approved spec.\n"
-            f"{spec_payload}\n\n"
-            "Return strict JSON with this schema:\n"
-            "{\n"
-            '  "topic": "...",\n'
-            '  "target_function": "...",\n'
-            '  "intended_bug": "...",\n'
-            '  "expected_first_failure": "...",\n'
-            '  "statement": "...",\n'
-            '  "buggy_solution": "full python program without markdown fences; include asserts at the end inside this string",\n'
-            '  "metadata": {"failure_mode": "...", "difficulty": "medium|hard"}\n'
-            "}\n\n"
-            "Requirements:\n"
-            "- The topic must remain unchanged.\n"
-            "- Keep the target_function, intended_bug, and expected_first_failure aligned with the spec.\n"
-            "- The program should usually be 25-90 non-empty lines.\n"
-            "- The program should contain real Python code only, with asserts at the end inside buggy_solution.\n"
-            "- At least one assert or runtime path should fail on execution.\n"
-            "- No markdown fences. JSON only."
-        ),
-    }
-
-
-def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
-    return build_red_spec_messages(topic, weakness_summary)
-
-
-def build_red_spec_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[str, str]:
+def build_red_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[str, str]:
     reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
-    return {
-        "role": "user",
-        "content": (
-            f"Repair the previous spec for topic '{topic}'. "
-            f"Rejection reasons: {reasons}. "
-            "Return a new strict JSON spec only. Keep the topic exact, make the bug coherent, and keep the task non-trivial."
-        ),
-    }
-
-
-def build_red_repair_message(topic: str, rejection_reasons: List[str], *, spec: Optional[RedTaskSpec] = None) -> Dict[str, str]:
-    reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
-    spec_tail = ""
-    if spec is not None:
-        spec_tail = "\nApproved spec to stay aligned with:\n" + json.dumps(spec.to_dict(), ensure_ascii=False)
     return {
         "role": "user",
         "content": (
             f"Repair the previous task for topic '{topic}'. "
             f"Rejection reasons: {reasons}. "
-            "Return a new strict JSON task. Keep the same topic. "
-            "Keep the code realistic, ensure the bug is real, and put any asserts inside buggy_solution at the end of the program."
-            + spec_tail
+            "Return a new strict JSON object with the same schema. "
+            "Keep topic exact. "
+            "Keep the code realistic, ensure the bug is real, and put any asserts inside buggy_solution at the end of the program. "
+            "If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it, and do not add prose."
         ),
     }
+
+
+def build_red_response_prefix(topic: str) -> str:
+    return '{\n  "topic": ' + json.dumps(topic, ensure_ascii=False) + ',\n  "target_function": "'
 
 
 def build_judge_batch_messages(
@@ -179,21 +150,3 @@ def build_judge_batch_messages(
     ]
 
 
-def build_red_training_prompt(
-    topic: str,
-    weakness_summary: Optional[str],
-    *,
-    spec: Optional[RedTaskSpec] = None,
-) -> str:
-    focus = weakness_summary or "general weakness probing"
-    prompt = (
-        f"Generate a Python debugging task for topic '{topic}'. "
-        f"Prioritize this weakness pattern: {focus}. "
-        "Use spec-first reasoning externally: first decide target_function, intended_bug, and expected_first_failure, then return the final task JSON. "
-        "Prefer medium-to-hard tasks with 25-90 lines of buggy code, multiple helpers or stateful logic, "
-        "and include asserts at the end inside buggy_solution rather than a separate failing_asserts field. "
-        "Return strict JSON with topic, target_function, intended_bug, expected_first_failure, statement, buggy_solution, and metadata."
-    )
-    if spec is not None:
-        prompt += " Approved spec: " + json.dumps(spec.to_dict(), ensure_ascii=False)
-    return prompt

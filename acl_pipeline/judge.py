@@ -18,6 +18,9 @@ _TASK_SECTION_RE = re.compile(r"## Task\n(?P<body>.*?)\n\n## Code", re.DOTALL)
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 _REFERENCE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\n]{1,32}\]|\.[A-Za-z_][A-Za-z0-9_]*|\([^)\n]{0,32}\))+")
 _DEF_RE = re.compile(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+_SNAKE_CASE_RE = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b")
+_CAMEL_CASE_RE = re.compile(r"\b(?:[A-Z][a-z0-9]+){2,}\b")
+_BACKTICK_RE = re.compile(r"`([^`\n]{1,64})`")
 _GENERIC_HINT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -35,24 +38,32 @@ _GENERIC_HINT_PATTERNS = [
 ]
 _STOPWORDS = {
     "about",
+    "actual",
     "after",
     "again",
+    "around",
     "before",
+    "because",
     "between",
     "branch",
+    "branches",
     "check",
     "code",
     "compare",
     "concrete",
     "consider",
+    "condition",
+    "conditions",
     "control",
     "debug",
+    "different",
     "during",
     "each",
     "edge",
     "error",
     "fails",
     "failure",
+    "focus",
     "first",
     "flow",
     "function",
@@ -60,24 +71,36 @@ _STOPWORDS = {
     "helper",
     "hint",
     "index",
+    "inspect",
     "input",
     "line",
+    "likely",
     "logic",
     "match",
+    "maybe",
     "name",
     "notice",
     "output",
+    "path",
+    "paths",
     "passed",
     "point",
     "question",
+    "reason",
+    "reproduced",
     "return",
     "right",
+    "running",
+    "same",
+    "seems",
     "should",
+    "specific",
     "state",
     "step",
     "student",
     "tests",
     "trace",
+    "using",
     "value",
     "values",
     "variable",
@@ -86,6 +109,7 @@ _STOPWORDS = {
     "what",
     "when",
     "where",
+    "whether",
     "which",
     "while",
     "why",
@@ -157,6 +181,30 @@ def _normalize_identifier(token: str) -> str:
 
 def _identifier_set(text: str) -> Set[str]:
     return {_normalize_identifier(token) for token in _IDENTIFIER_RE.findall(str(text or ""))}
+
+
+def _code_like_identifier_set(text: str) -> Set[str]:
+    tokens: Set[str] = set()
+    for token in _SNAKE_CASE_RE.findall(str(text or "")):
+        normalized = _normalize_identifier(token)
+        if normalized:
+            tokens.add(normalized)
+    for token in _CAMEL_CASE_RE.findall(str(text or "")):
+        normalized = _normalize_identifier(token)
+        if normalized:
+            tokens.add(normalized)
+    for token in _BACKTICK_RE.findall(str(text or "")):
+        root = _root_identifier(token)
+        if root:
+            tokens.add(root)
+        normalized = _normalize_identifier(token)
+        if normalized and _IDENTIFIER_RE.fullmatch(token) and ("_" in normalized or any(ch.isupper() for ch in token)):
+            tokens.add(normalized)
+    for reference in _REFERENCE_RE.findall(str(text or "")):
+        root = _root_identifier(reference)
+        if root:
+            tokens.add(root)
+    return {token for token in tokens if _is_trackable_identifier(token)}
 
 
 def _definition_names(code: str) -> Set[str]:
@@ -232,11 +280,7 @@ def _hint_quality_features(row: Dict[str, str]) -> Dict[str, Any]:
     definition_names = _definition_names(code)
     error_tokens = _error_signal_tokens(error_text)
 
-    hint_identifiers = {
-        token
-        for token in _identifier_set(hint_text)
-        if _is_trackable_identifier(token)
-    }
+    hint_identifiers = _code_like_identifier_set(hint_text)
     invented_identifiers = sorted(token for token in hint_identifiers if token not in available_identifiers)
 
     invented_references: List[str] = []
@@ -283,7 +327,7 @@ def _hint_quality_features(row: Dict[str, str]) -> Dict[str, Any]:
         delta -= min(1.25, generic_penalty)
         reasons.append(f"generic:{generic_hits}")
     if invented_identifiers:
-        delta -= min(1.5, 0.35 * len(invented_identifiers))
+        delta -= min(1.25, 0.25 * len(invented_identifiers))
         reasons.append(f"invented_identifiers:{len(invented_identifiers)}")
     if invented_references:
         delta -= min(2.0, 0.8 * len(invented_references))
