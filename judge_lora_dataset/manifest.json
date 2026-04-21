@@ -1,0 +1,52 @@
+{
+  "total_records": 700,
+  "source_counts": {
+    "sft_reference": 150,
+    "existing_socratic_archive": 50,
+    "existing_socratic_local": 100,
+    "synthetic": 400
+  },
+  "execution_status_counts": {
+    "assertionerror": 421,
+    "syntax_error": 13,
+    "passed": 128,
+    "valueerror": 32,
+    "attributeerror": 7,
+    "nameerror": 21,
+    "runtime_error": 2,
+    "typeerror": 67,
+    "keyerror": 4,
+    "recursionerror": 1,
+    "zerodivisionerror": 1,
+    "indexerror": 3
+  },
+  "quality_bucket_counts": {
+    "strong": 258,
+    "reveal": 90,
+    "mixed": 73,
+    "bad": 129,
+    "excellent": 103,
+    "passed-aware": 40,
+    "corrupted": 7
+  },
+  "task_valid_counts": {
+    "true": 685,
+    "false": 15
+  },
+  "hint_valid_rate": 0.6586,
+  "mean_reward": 0.6675,
+  "train_count": 630,
+  "val_count": 70,
+  "duplicate_hint_rows": 0,
+  "duplicate_code_rows": 393,
+  "train_val_hint_hash_overlap": 0,
+  "train_val_code_hash_overlap": 0,
+  "notes": [
+    "The workspace only contained 100 direct pipeline-generated Socratic samples in episodes.jsonl.",
+    "To reach 150 existing Socratic samples, the remaining 50 were taken from archived socratic_hints in datset_for_SFT.json.",
+    "The 150 sft_reference rows are disjoint from the 50 archive rows above.",
+    "All labels were regenerated with a stricter offline rubric instead of copying the current judge outputs.",
+    "Train/val split is built from connected components over code_hash and hint_hash, so neither hash overlaps across splits.",
+    "task_is_valid_for_socratic is no longer constant; syntax-invalid and generic runtime-invalid tasks are labeled false."
+  ]
+}

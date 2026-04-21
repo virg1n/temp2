@@ -12,7 +12,7 @@ task_execution:
   timeout_seconds: 5
   max_red_generation_attempts: 4
   capture_max_chars: 1600
-  min_code_lines_for_repair: 15
+  min_code_lines_for_repair: 10
   probabilistic_repair_probability: 0.5
 
 storage:
@@ -56,7 +56,6 @@ curriculum:
       weight: 1.0
     - name: Arithmetic and Type Conversion
       weight: 1.0
-
 
 socratic:
   model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model
@@ -131,7 +130,7 @@ judge:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 850
+    max_new_tokens: 700
     temperature: 0.5
     top_p: 0.7
     do_sample: false
@@ -152,7 +151,7 @@ red:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 1000
+    max_new_tokens: 2048
     temperature: 1.1
     top_p: 0.90
     do_sample: true

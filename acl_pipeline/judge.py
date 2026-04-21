@@ -129,14 +129,14 @@ _EXTRA_ALLOWED_IDENTIFIERS = {
 _PASS_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\bpasses?\b",
-        r"\bpassed\b",
         r"\bno failing assertion\b",
         r"\bno runtime error\b",
-        r"\bno failure\b",
-        r"\breproduce\b",
-        r"\breproduced\b",
-        r"\bassert(?:ion|s)?\b",
+        r"\bno bug (?:was )?reproduced\b",
+        r"\bthe (?:current )?run (?:passes?|passed)\b",
+        r"\ball tests? pass(?:ed)?\b",
+        r"\bprogram (?:exited|runs?) successfully\b",
+        r"\bdoes not reproduce (?:the |a )?bug\b",
+        r"\bnothing is failing\b",
     )
 ]
 _MALFORMED_PATTERNS = [
@@ -145,6 +145,55 @@ _MALFORMED_PATTERNS = [
     re.compile(r"`[^`\n]*\{[^}\n]*`"),
     re.compile(r"`[^`\n]*\[[^\]\n]*`"),
 ]
+_DIRECT_FIX_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bthe fix is\b",
+        r"\bthe bug is\b",
+        r"\bfix (?:it|this) by\b",
+        r"\breplace\b.+\bwith\b",
+        r"\bchange\b.+\bto\b",
+        r"\buse\s+[^.\n]{0,80}\s+instead\b",
+        r"\badd a missing\b",
+        r"\brename\b.+\bto\b",
+        r"\b(?:it|this|that|the (?:answer|result|output|value|code|line|function|return value|expected))\s+should be\b",
+    )
+]
+_CODE_OUTPUT_PATTERNS = [
+    re.compile(r"^\s*(?:def|class|if|elif|else|for|while|try|except|finally|with|return|raise|import|from|assert|print)\b"),
+    re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]"),
+]
+_SYNTAX_OR_INDENT_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bsyntax(?:error)?\b",
+        r"\bindent(?:ation|ed|ing)?\b",
+        r"\btaberror\b",
+        r"\bparse\b",
+        r"\bparser\b",
+        r"\bdelimiter\b",
+        r"\bcolon\b",
+        r"\bparenthes",
+        r"\bbracket\b",
+        r"\bquote\b",
+        r"\btoken\b",
+        r"\binvalid python\b",
+    )
+]
+_NAME_ERROR_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bnameerror\b",
+        r"\bnot defined\b",
+        r"\bundefined (?:name|variable|identifier)\b",
+        r"\bunknown (?:name|variable|identifier)\b",
+        r"\bwrong variable\b",
+        r"\btypo\b",
+        r"\bmisspell",
+        r"\brename\b",
+    )
+]
+_PASSED_EXECUTION_REWARD = 0.5
 
 
 def _extract_json(text: str) -> Optional[Any]:
@@ -173,6 +222,19 @@ def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
     for match in _CODE_BLOCK_RE.finditer(str(prompt_text or "")):
         sections[match.group("section").lower()] = match.group("body").strip()
     return sections
+
+
+def _infer_execution_status(error_text: str) -> str:
+    text = str(error_text or "")
+    if "No failing assertion or runtime error was reproduced." in text:
+        return "passed"
+    if "IndentationError" in text or "TabError" in text:
+        return "indentation_error"
+    if "SyntaxError" in text:
+        return "syntax_error"
+    if "NameError" in text:
+        return "nameerror"
+    return "failed"
 
 
 def _normalize_identifier(token: str) -> str:
@@ -255,11 +317,70 @@ def _root_identifier(reference: str) -> str:
     return _normalize_identifier(match.group(0))
 
 
-def _build_row(prompt_text: str, completion: str) -> Dict[str, str]:
+def _hint_malformed_reasons(hint_text: str) -> List[str]:
+    reasons: List[str] = []
+    if hint_text.count("`") % 2 == 1:
+        reasons.append("unbalanced_backticks")
+    for pattern in _MALFORMED_PATTERNS:
+        if pattern.search(hint_text):
+            reasons.append(f"malformed:{pattern.pattern}")
+    if any(abs(hint_text.count(left) - hint_text.count(right)) >= 2 for left, right in (("(", ")"), ("[", "]"), ("{", "}"))):
+        reasons.append("unbalanced_delimiters")
+    return list(dict.fromkeys(reasons))
+
+
+def _contains_code_output(hint_text: str) -> bool:
+    if "```" in hint_text:
+        return True
+    lines = [line.rstrip() for line in str(hint_text or "").splitlines() if line.strip()]
+    code_like_lines = 0
+    for line in lines:
+        stripped = line.strip()
+        if any(pattern.search(stripped) for pattern in _CODE_OUTPUT_PATTERNS):
+            code_like_lines += 1
+    if len(lines) == 1:
+        stripped = lines[0].strip()
+        return code_like_lines == 1 and "?" not in stripped and bool(re.match(r"^(?:def|class|return|raise|assert|print)\b|^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]", stripped))
+    return code_like_lines >= 2
+
+
+def _contains_direct_fix(hint_text: str) -> bool:
+    text = str(hint_text or "")
+    lowered = text.lower()
+    if "<think" in lowered or "</think>" in lowered:
+        return True
+    return any(pattern.search(text) for pattern in _DIRECT_FIX_PATTERNS)
+
+
+def _intended_bug_signal_text(task: Optional[PythonTask]) -> str:
+    if task is None:
+        return ""
+    spec = dict(task.metadata.get("red_spec") or {})
+    chunks = [
+        str(spec.get("target_function") or ""),
+        str(spec.get("intended_bug") or ""),
+        str(spec.get("expected_first_failure") or ""),
+        str(task.metadata.get("failure_mode") or ""),
+        str((spec.get("metadata") or {}).get("failure_mode") or ""),
+    ]
+    return "\n".join(chunk for chunk in chunks if chunk).lower()
+
+
+def _execution_error_matches_intended_bug(task: Optional[PythonTask], execution_status: str) -> Optional[bool]:
+    if execution_status not in {"syntax_error", "indentation_error", "nameerror"}:
+        return None
+    signal = _intended_bug_signal_text(task)
+    if not signal:
+        return None
+    patterns = _NAME_ERROR_PATTERNS if execution_status == "nameerror" else _SYNTAX_OR_INDENT_PATTERNS
+    return any(pattern.search(signal) for pattern in patterns)
+
+
+def _build_row(prompt_text: str, completion: str) -> Dict[str, Any]:
     sections = _extract_prompt_sections(prompt_text)
     task_match = _TASK_SECTION_RE.search(str(prompt_text or ""))
     error_text = sections.get("error", "")
-    execution_status = "passed" if "No failing assertion or runtime error was reproduced." in error_text else "failed"
+    execution_status = _infer_execution_status(error_text)
     return {
         "statement": task_match.group("body").strip() if task_match else sections.get("task", ""),
         "code": sections.get("code", ""),
@@ -269,7 +390,7 @@ def _build_row(prompt_text: str, completion: str) -> Dict[str, str]:
     }
 
 
-def _hint_quality_features(row: Dict[str, str]) -> Dict[str, Any]:
+def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
     code = row.get("code", "")
     error_text = row.get("observed_failure", "")
     hint_text = str(row.get("assistant_response") or "")
@@ -303,14 +424,7 @@ def _hint_quality_features(row: Dict[str, str]) -> Dict[str, Any]:
     generic_hits = sum(1 for pattern in _GENERIC_HINT_PATTERNS if pattern.search(hint_text))
     references_passed_execution = any(pattern.search(hint_text) for pattern in _PASS_PATTERNS)
 
-    malformed_reasons: List[str] = []
-    if hint_text.count("`") % 2 == 1:
-        malformed_reasons.append("unbalanced_backticks")
-    for pattern in _MALFORMED_PATTERNS:
-        if pattern.search(hint_text):
-            malformed_reasons.append(f"malformed:{pattern.pattern}")
-    if any(abs(hint_text.count(left) - hint_text.count(right)) >= 2 for left, right in (("(", ")"), ("[", "]"), ("{", "}"))):
-        malformed_reasons.append("unbalanced_delimiters")
+    malformed_reasons = _hint_malformed_reasons(hint_text)
 
     delta = 0.0
     reasons: List[str] = []
@@ -397,6 +511,80 @@ class JudgeService:
             total += float(criteria_scores.get(key, 0.0)) * float(weight)
         return max(0.0, min(10.0, total / total_weight))
 
+    def _hard_rule_gate(
+        self,
+        *,
+        row: Dict[str, Any],
+        task: Optional[PythonTask],
+        corruption: Dict[str, Any],
+        features: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        weights = self._weights()
+        zero_criteria = {key: 0.0 for key in weights}
+        hint_text = str(row.get("assistant_response") or "")
+        malformed_reasons = list(dict.fromkeys(list(features.get("malformed_reasons") or []) + list(corruption.get("reasons") or [])))
+        code_output = _contains_code_output(hint_text)
+        direct_fix = _contains_direct_fix(hint_text)
+        pass_aware = bool(features.get("references_passed_execution"))
+        gate = {
+            "skip_llm": False,
+            "forced_criteria": None,
+            "forced_score": None,
+            "task_quality_override": None,
+            "force_task_valid": None,
+            "force_hint_valid": None,
+            "red_rejection_reason": "",
+            "hint_rejection_reason": "",
+            "reasons": [],
+            "contains_code_output": code_output,
+            "contains_direct_fix": direct_fix,
+        }
+
+        related_error = _execution_error_matches_intended_bug(task, str(row.get("execution_status") or ""))
+        if related_error is False:
+            gate["skip_llm"] = True
+            gate["forced_criteria"] = dict(zero_criteria)
+            gate["forced_score"] = 0.0
+            gate["task_quality_override"] = 2.0
+            gate["force_task_valid"] = False
+            gate["red_rejection_reason"] = f"unrelated_{row['execution_status']}"
+            gate["reasons"].append(f"task_invalid:unrelated_{row['execution_status']}")
+
+        if malformed_reasons:
+            gate["skip_llm"] = True
+            gate["forced_criteria"] = dict(zero_criteria)
+            gate["forced_score"] = 0.0
+            gate["force_hint_valid"] = False
+            gate["hint_rejection_reason"] = "malformed_hint_output"
+            gate["reasons"].append("hint_zeroed:malformed_output")
+
+        if direct_fix or code_output:
+            gate["skip_llm"] = True
+            gate["forced_criteria"] = dict(zero_criteria)
+            gate["forced_score"] = 0.0
+            gate["force_hint_valid"] = False
+            gate["hint_rejection_reason"] = "solution_reveal"
+            if code_output:
+                gate["reasons"].append("hint_zeroed:code_output")
+            if direct_fix:
+                gate["reasons"].append("hint_zeroed:direct_fix")
+
+        if row.get("execution_status") == "passed" and not pass_aware and gate["forced_score"] is None:
+            gate["skip_llm"] = True
+            gate["forced_criteria"] = {
+                "no_solution_reveal": 10.0,
+                "bug_localization": 0.0,
+                "usefulness": 0.0,
+                "socratic_style": 1.0 if "?" in hint_text else 0.0,
+                "technical_accuracy": 0.0,
+            }
+            gate["forced_score"] = _PASSED_EXECUTION_REWARD
+            gate["force_hint_valid"] = False
+            gate["hint_rejection_reason"] = "missed_passed_execution"
+            gate["reasons"].append("hint_capped:missed_passed_execution")
+
+        return gate
+
     def _task_and_hint_assessment(
         self,
         item: Any,
@@ -404,16 +592,29 @@ class JudgeService:
         score: float,
         severe_hint_failure: bool,
         corruption_detected: bool,
+        hard_gate: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         threshold = float(self.model_pool.config.judge.bad_task_threshold)
         if not isinstance(item, dict):
-            return {
+            assessment = {
                 "task_quality": 5.0,
                 "task_is_valid_for_socratic": True,
                 "hint_is_valid_for_socratic": not (severe_hint_failure or corruption_detected),
                 "red_rejection_reason": "",
                 "hint_rejection_reason": "",
             }
+            if hard_gate:
+                if hard_gate.get("task_quality_override") is not None:
+                    assessment["task_quality"] = float(hard_gate["task_quality_override"])
+                if hard_gate.get("force_task_valid") is not None:
+                    assessment["task_is_valid_for_socratic"] = bool(hard_gate["force_task_valid"])
+                if hard_gate.get("force_hint_valid") is not None:
+                    assessment["hint_is_valid_for_socratic"] = bool(hard_gate["force_hint_valid"])
+                if hard_gate.get("red_rejection_reason"):
+                    assessment["red_rejection_reason"] = str(hard_gate["red_rejection_reason"])
+                if hard_gate.get("hint_rejection_reason"):
+                    assessment["hint_rejection_reason"] = str(hard_gate["hint_rejection_reason"])
+            return assessment
 
         try:
             task_quality = max(0.0, min(10.0, float(item.get("task_quality", 5.0))))
@@ -447,6 +648,18 @@ class JudgeService:
             elif score <= 1.5:
                 hint_rejection_reason = "very_low_hint_score"
 
+        if hard_gate:
+            if hard_gate.get("task_quality_override") is not None:
+                task_quality = max(0.0, min(10.0, float(hard_gate["task_quality_override"])))
+            if hard_gate.get("force_task_valid") is not None:
+                task_is_valid = bool(hard_gate["force_task_valid"])
+            if hard_gate.get("force_hint_valid") is not None:
+                hint_is_valid = bool(hard_gate["force_hint_valid"])
+            if hard_gate.get("red_rejection_reason"):
+                red_rejection_reason = str(hard_gate["red_rejection_reason"])
+            if hard_gate.get("hint_rejection_reason"):
+                hint_rejection_reason = str(hard_gate["hint_rejection_reason"])
+
         return {
             "task_quality": task_quality,
             "task_is_valid_for_socratic": task_is_valid,
@@ -479,60 +692,104 @@ class JudgeService:
         completions: List[str],
         *,
         apply_batch_spread: bool,
+        tasks: Optional[List[Optional[PythonTask]]] = None,
     ) -> List[Dict[str, Any]]:
         if not prompt_texts:
             return []
 
         rows = [_build_row(prompt, completion) for prompt, completion in zip(prompt_texts, completions)]
-        session = self.model_pool.get_judge()
-        messages = build_judge_batch_messages(rows, self._weights())
-        raw = session.generate([messages])[0]
-        parsed = _extract_json(raw)
-        raw_items: List[Any] = []
-        if isinstance(parsed, list):
-            raw_items = list(parsed)
-        elif isinstance(parsed, dict):
-            maybe_items = parsed.get("items") or parsed.get("scores") or parsed.get("results")
-            if isinstance(maybe_items, list):
-                raw_items = list(maybe_items)
-        if len(raw_items) != len(rows):
-            raw_items = [{} for _ in rows]
-
-        criteria_list = [self._coerce_criteria_scores(item) for item in raw_items]
+        task_items: List[Optional[PythonTask]] = list(tasks or [])
+        if len(task_items) < len(rows):
+            task_items.extend([None] * (len(rows) - len(task_items)))
         corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
         quality_features = [_hint_quality_features(row) for row in rows]
+        hard_gates = [
+            self._hard_rule_gate(
+                row=row,
+                task=task,
+                corruption=corruption,
+                features=features,
+            )
+            for row, task, corruption, features in zip(rows, task_items, corruption_flags, quality_features)
+        ]
+
+        judge_indexes = [index for index, gate in enumerate(hard_gates) if not gate["skip_llm"]]
+        raw_items: List[Any] = [{} for _ in rows]
+        raw_responses: List[str] = ["" for _ in rows]
+        if judge_indexes:
+            judge_rows = [rows[index] for index in judge_indexes]
+            session = self.model_pool.get_judge()
+            messages = build_judge_batch_messages(judge_rows, self._weights())
+            raw = session.generate([messages])[0]
+            parsed = _extract_json(raw)
+            parsed_items: List[Any] = []
+            if isinstance(parsed, list):
+                parsed_items = list(parsed)
+            elif isinstance(parsed, dict):
+                maybe_items = parsed.get("items") or parsed.get("scores") or parsed.get("results")
+                if isinstance(maybe_items, list):
+                    parsed_items = list(maybe_items)
+            if len(parsed_items) != len(judge_rows):
+                parsed_items = [{} for _ in judge_rows]
+            for index, item in zip(judge_indexes, parsed_items):
+                raw_items[index] = item
+                raw_responses[index] = raw
+
+        criteria_list: List[Dict[str, float]] = []
+        for item, gate in zip(raw_items, hard_gates):
+            if gate["forced_criteria"] is not None:
+                criteria_list.append(dict(gate["forced_criteria"]))
+            else:
+                criteria_list.append(self._coerce_criteria_scores(item))
 
         raw_scores: List[float] = []
         assessments: List[Dict[str, Any]] = []
-        for index, (criteria, item, corruption, features) in enumerate(zip(criteria_list, raw_items, corruption_flags, quality_features)):
+        zero_criteria = {key: 0.0 for key in self._weights()}
+        for index, (criteria, item, corruption, features, gate) in enumerate(zip(criteria_list, raw_items, corruption_flags, quality_features, hard_gates)):
             zero_out = bool(corruption["is_corrupted"] or features["severe_hint_failure"])
-            if zero_out:
-                criteria = {key: 0.0 for key in self._weights()}
+            forced_score = gate.get("forced_score")
+            if zero_out and forced_score is None:
+                criteria = dict(zero_criteria)
                 criteria_list[index] = criteria
-            base_score = self._weighted_score(criteria)
-            score = 0.0 if zero_out else max(0.0, min(10.0, base_score + float(features["delta"])))
+            if forced_score is not None:
+                score = max(0.0, min(10.0, float(forced_score)))
+            else:
+                base_score = self._weighted_score(criteria)
+                score = 0.0 if zero_out else max(0.0, min(10.0, base_score + float(features["delta"])))
             assessment = self._task_and_hint_assessment(
                 item,
                 score=score,
                 severe_hint_failure=bool(features["severe_hint_failure"]),
                 corruption_detected=bool(corruption["is_corrupted"]),
+                hard_gate=gate,
             )
+            features["hard_gate"] = {
+                "applied": bool(gate["reasons"]),
+                "reasons": list(gate["reasons"]),
+                "forced_score": gate["forced_score"],
+                "contains_code_output": gate["contains_code_output"],
+                "contains_direct_fix": gate["contains_direct_fix"],
+            }
             raw_scores.append(score)
             assessments.append(assessment)
 
         adjusted_scores = self._apply_batch_spread(raw_scores) if apply_batch_spread else list(raw_scores)
-        for index, (corruption, features, assessment) in enumerate(zip(corruption_flags, quality_features, assessments)):
-            if corruption["is_corrupted"] or features["severe_hint_failure"]:
+        for index, (corruption, features, assessment, gate) in enumerate(zip(corruption_flags, quality_features, assessments, hard_gates)):
+            if corruption["is_corrupted"] or features["severe_hint_failure"] or gate.get("forced_score") == 0.0:
                 raw_scores[index] = 0.0
                 adjusted_scores[index] = 0.0
                 assessment["hint_is_valid_for_socratic"] = False
+            elif gate.get("forced_score") is not None:
+                cap = max(0.0, min(10.0, float(gate["forced_score"])))
+                raw_scores[index] = min(raw_scores[index], cap)
+                adjusted_scores[index] = min(adjusted_scores[index], cap)
 
         return [
             {
                 "criteria_scores": criteria,
                 "raw_score": raw_score,
                 "adjusted_score": adjusted_score,
-                "raw_response": raw,
+                "raw_response": raw_response,
                 "task_quality": assessment["task_quality"],
                 "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
                 "hint_is_valid_for_socratic": assessment["hint_is_valid_for_socratic"],
@@ -542,10 +799,11 @@ class JudgeService:
                 "hint_corruption": corruption,
                 "local_tiebreak": features,
             }
-            for criteria, raw_score, adjusted_score, assessment, corruption, features in zip(
+            for criteria, raw_score, adjusted_score, raw_response, assessment, corruption, features in zip(
                 criteria_list,
                 raw_scores,
                 adjusted_scores,
+                raw_responses,
                 assessments,
                 corruption_flags,
                 quality_features,
@@ -585,6 +843,7 @@ class JudgeService:
             prompt_texts,
             hint_texts,
             apply_batch_spread=apply_batch_spread,
+            tasks=tasks,
         )
         outputs: List[JudgeOutput] = []
         for task, hint, details in zip(tasks, hints, details_list):
