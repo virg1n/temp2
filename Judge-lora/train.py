@@ -8,7 +8,6 @@ Design notes (anti-overfit with only 630 train samples):
   * Loss computed only on the assistant JSON (prompt tokens masked to -100).
   * Small effective batch (32) + cosine LR with warmup + weight decay.
   * Early stopping on val loss with load_best_model_at_end.
-  * DeepSpeed ZeRO-3 is enabled via `train.deepspeed` when configured.
 """
 from __future__ import annotations
 
@@ -47,15 +46,6 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-def resolve_path(config_path: str, maybe_relative_path: str | None) -> str | None:
-    if not maybe_relative_path:
-        return None
-    path = Path(maybe_relative_path)
-    if path.is_absolute():
-        return str(path)
-    return str((Path(config_path).resolve().parent / path).resolve())
-
-
 def build_training_args(tcfg: dict) -> TrainingArguments:
     # Build kwargs and drop any not supported by the installed transformers.
     ta_kwargs = dict(
@@ -87,7 +77,6 @@ def build_training_args(tcfg: dict) -> TrainingArguments:
         group_by_length=tcfg.get("group_by_length", True),
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
-        deepspeed=tcfg.get("deepspeed"),
     )
     if "warmup_steps" in tcfg:
         ta_kwargs["warmup_steps"] = tcfg["warmup_steps"]
@@ -102,7 +91,7 @@ def build_training_args(tcfg: dict) -> TrainingArguments:
     return TrainingArguments(**ta_kwargs)
 
 
-def build_model_and_tokenizer(mcfg: dict, use_deepspeed: bool):
+def build_model_and_tokenizer(mcfg: dict):
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     compute_dtype = dtype_map[mcfg.get("bnb_4bit_compute_dtype", "bfloat16")]
     model_dtype = compute_dtype
@@ -139,12 +128,9 @@ def build_model_and_tokenizer(mcfg: dict, use_deepspeed: bool):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # DeepSpeed handles parameter placement/sharding. Outside of DeepSpeed we
-    # still pin one full quantized replica per rank.
-    device_map = None
-    if not use_deepspeed:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device_map = {"": local_rank}
+    # DDP: each process gets one full quantized replica on its local GPU.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device_map = {"": local_rank}
 
     attn_impl = mcfg.get("attn_implementation", "sdpa")
     model_kwargs = dict(
@@ -153,8 +139,7 @@ def build_model_and_tokenizer(mcfg: dict, use_deepspeed: bool):
         dtype=model_dtype,
         attn_implementation=attn_impl,
     )
-    if device_map is not None:
-        model_kwargs["device_map"] = device_map
+    model_kwargs["device_map"] = device_map
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -186,17 +171,11 @@ def main():
     mcfg = cfg["model"]
     dcfg = cfg["data"]
     lcfg = cfg["lora"]
-    tcfg["deepspeed"] = resolve_path(args.config, tcfg.get("deepspeed"))
 
     set_seed(tcfg.get("seed", 42))
 
-    # Initialize TrainingArguments before model loading so ZeRO-3 is already
-    # registered when `from_pretrained` runs.
-    targs = build_training_args(tcfg)
-    use_deepspeed = bool(getattr(targs, "deepspeed", None))
-
     # ---- Model + tokenizer ----
-    model, tokenizer = build_model_and_tokenizer(mcfg, use_deepspeed=use_deepspeed)
+    model, tokenizer = build_model_and_tokenizer(mcfg)
 
     if mcfg.get("load_in_4bit", False) or mcfg.get("load_in_8bit", False):
         model = prepare_model_for_kbit_training(
@@ -237,6 +216,7 @@ def main():
     )
 
     collator = PromptMaskedCollator(pad_token_id=tokenizer.pad_token_id)
+    targs = build_training_args(tcfg)
 
     callbacks = []
     patience = tcfg.get("early_stopping_patience", 0)
@@ -264,7 +244,7 @@ def main():
     # Save the adapter + tokenizer on rank 0.
     if trainer.is_world_process_zero():
         out = Path(tcfg["output_dir"]) / "final"
-        trainer.save_model(out)
+        trainer.model.save_pretrained(out)
         tokenizer.save_pretrained(out)
         print(f"[ok] Saved LoRA adapter to {out}")
 
