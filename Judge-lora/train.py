@@ -66,7 +66,6 @@ def build_training_args(tcfg: dict) -> TrainingArguments:
         gradient_accumulation_steps=tcfg["gradient_accumulation_steps"],
         learning_rate=tcfg["learning_rate"],
         lr_scheduler_type=tcfg["lr_scheduler_type"],
-        warmup_ratio=tcfg["warmup_ratio"],
         weight_decay=tcfg["weight_decay"],
         max_grad_norm=tcfg["max_grad_norm"],
         bf16=tcfg.get("bf16", True),
@@ -90,6 +89,10 @@ def build_training_args(tcfg: dict) -> TrainingArguments:
         remove_unused_columns=False,
         deepspeed=tcfg.get("deepspeed"),
     )
+    if "warmup_steps" in tcfg:
+        ta_kwargs["warmup_steps"] = tcfg["warmup_steps"]
+    elif "warmup_ratio" in tcfg:
+        ta_kwargs["warmup_ratio"] = tcfg["warmup_ratio"]
     supported = set(inspect.signature(TrainingArguments.__init__).parameters)
     dropped = [k for k in ta_kwargs if k not in supported]
     for k in dropped:

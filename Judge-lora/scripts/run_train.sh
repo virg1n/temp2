@@ -9,12 +9,9 @@ export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CONFIG="${CONFIG:-Judge-lora/configs/qwen3_32b_judge.yaml}"
-NPROC="${NPROC:-4}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-Judge-lora/configs/accelerate_zero3.yaml}"
 
 accelerate launch \
-    --num_processes "${NPROC}" \
-    --num_machines 1 \
-    --mixed_precision bf16 \
-    --dynamo_backend no \
+    --config_file "${ACCELERATE_CONFIG}" \
     Judge-lora/train.py \
     --config "${CONFIG}"
