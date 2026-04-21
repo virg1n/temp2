@@ -569,6 +569,12 @@ class JudgeService:
             if direct_fix:
                 gate["reasons"].append("hint_zeroed:direct_fix")
 
+        if row.get("execution_status") == "passed":
+            gate["task_quality_override"] = 2.0
+            gate["force_task_valid"] = False
+            gate["red_rejection_reason"] = "already_correct_code"
+            gate["reasons"].append("task_invalid:already_correct_code")
+
         if row.get("execution_status") == "passed" and not pass_aware and gate["forced_score"] is None:
             gate["skip_llm"] = True
             gate["forced_criteria"] = {

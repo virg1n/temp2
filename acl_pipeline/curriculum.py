@@ -24,6 +24,11 @@ class CurriculumManager:
         values = [max(1e-6, float(self.weights[name])) for name in topics]
         return rng.choices(topics, weights=values, k=1)[0]
 
+    def uniformize_weights(self) -> CurriculumState:
+        uniform_weight = max(1e-6, float(self.config.post_adaptation_topic_weight))
+        self.weights = {name: uniform_weight for name in self.initial_weights}
+        return self.snapshot()
+
     def weakness_summary(self, topic: str) -> str:
         score = self.running_topic_rewards.get(topic, 0.5)
         return (
@@ -39,7 +44,9 @@ class CurriculumManager:
             key=lambda name: (self.running_topic_rewards.get(name, 0.5), name),
         )
 
-    def apply_iteration_focus_boost(self) -> Tuple[Optional[str], CurriculumState]:
+    def apply_iteration_focus_boost(self, *, enabled: bool = True) -> Tuple[Optional[str], CurriculumState]:
+        if not enabled:
+            return None, self.uniformize_weights()
         weakest = self.weakest_topic()
         if weakest is None:
             return None, self.snapshot()
@@ -51,16 +58,19 @@ class CurriculumManager:
         )
         return weakest, self.snapshot()
 
-    def observe(self, topic: str, reward: float) -> Tuple[bool, CurriculumState]:
+    def observe(self, topic: str, reward: float, *, update_weights: bool = True) -> Tuple[bool, CurriculumState]:
         reward = max(0.0, min(1.0, float(reward)))
         alpha = self.config.reward_ema_alpha
         previous = self.running_topic_rewards.get(topic, 0.5)
         ema = ((1.0 - alpha) * previous) + (alpha * reward)
         self.running_topic_rewards[topic] = ema
 
-        base = self.initial_weights.get(topic, 1.0)
-        weakness = max(0.0, 1.0 - ema)
-        self.weights[topic] = max(1e-3, base * (1.0 + self.config.low_reward_boost * weakness))
+        if update_weights:
+            base = self.initial_weights.get(topic, 1.0)
+            weakness = max(0.0, 1.0 - ema)
+            self.weights[topic] = max(1e-3, base * (1.0 + self.config.low_reward_boost * weakness))
+        else:
+            self.uniformize_weights()
 
         self.recent_topics.append(topic)
         if topic == self.consecutive_topic:
@@ -69,7 +79,7 @@ class CurriculumManager:
             self.consecutive_topic = topic
             self.consecutive_count = 1
 
-        should_reset = self.consecutive_count >= self.config.repeat_topic_reset_threshold
+        should_reset = update_weights and self.consecutive_count >= self.config.repeat_topic_reset_threshold
         if should_reset:
             self.reset()
 

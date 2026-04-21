@@ -154,6 +154,7 @@ class JudgeConfig(RoleConfig):
 class RedConfig(RoleConfig):
     generation_quantization: Optional[str] = "8bit"
     update_quantization: Optional[str] = "4bit"
+    force_base_generation_after_iteration: int = 150
     update: RedUpdateSettings = field(default_factory=RedUpdateSettings)
 
 
@@ -164,6 +165,8 @@ class CurriculumConfig:
     low_reward_boost: float = 1.5
     iteration_weak_topic_boost: float = 0.15
     repeat_topic_reset_threshold: int = 5
+    adaptive_weighting_until_iteration: int = 150
+    post_adaptation_topic_weight: float = 1.0
 
 
 @dataclass
@@ -338,6 +341,7 @@ def _red_role(payload: Dict[str, Any]) -> RedConfig:
         lora=base.lora,
         generation_quantization=payload.get("generation_quantization", "8bit"),
         update_quantization=payload.get("update_quantization", "4bit"),
+        force_base_generation_after_iteration=int(payload.get("force_base_generation_after_iteration", 150)),
         update=_red_update(payload.get("update")),
     )
 
@@ -389,6 +393,8 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         low_reward_boost=float(curriculum_raw.get("low_reward_boost", 1.5)),
         iteration_weak_topic_boost=float(curriculum_raw.get("iteration_weak_topic_boost", 0.15)),
         repeat_topic_reset_threshold=int(curriculum_raw.get("repeat_topic_reset_threshold", 5)),
+        adaptive_weighting_until_iteration=int(curriculum_raw.get("adaptive_weighting_until_iteration", 150)),
+        post_adaptation_topic_weight=float(curriculum_raw.get("post_adaptation_topic_weight", 1.0)),
     )
 
     return PipelineConfig(

@@ -51,12 +51,48 @@ class AdversarialCurriculumPipeline:
         self._red_adapter_failed_last_iteration = False
 
         pointers = self.storage.load_pointers()
+        self.completed_iterations = int(pointers.get("completed_iterations") or 0)
         self.current_socratic_model = str(pointers.get("socratic_model_path") or config.socratic.model_name_or_path)
         self.current_socratic_adapter = pointers.get("socratic_adapter_path") or config.socratic.base_adapter_path
         self.current_red_adapter = pointers.get("red_adapter_path") or config.red.base_adapter_path
+        if self._using_uniform_curriculum(self.completed_iterations + 1):
+            self.storage.save_curriculum_state(self.curriculum.uniformize_weights())
 
     def _iteration_size(self) -> int:
         return max(1, int(self.config.runtime.iteration_size or self.config.red.update.update_every_episodes or 1))
+
+    def _red_base_cutoff_iteration(self) -> int:
+        return max(0, int(self.config.red.force_base_generation_after_iteration))
+
+    def _curriculum_adaptation_cutoff_iteration(self) -> int:
+        return max(0, int(self.config.curriculum.adaptive_weighting_until_iteration))
+
+    def _using_base_red_generation(self, iteration_index: int) -> bool:
+        cutoff = self._red_base_cutoff_iteration()
+        return cutoff > 0 and iteration_index > cutoff
+
+    def _using_uniform_curriculum(self, iteration_index: int) -> bool:
+        cutoff = self._curriculum_adaptation_cutoff_iteration()
+        return cutoff > 0 and iteration_index > cutoff
+
+    def _prepare_iteration_modes(self, iteration_index: int) -> None:
+        if self._using_uniform_curriculum(iteration_index):
+            snapshot = self.curriculum.uniformize_weights()
+            self.storage.save_curriculum_state(snapshot)
+            self.logger.event(
+                "curriculum_uniform_mode",
+                iteration=iteration_index,
+                curriculum_weights=snapshot.weights,
+                running_topic_rewards=snapshot.running_topic_rewards,
+            )
+
+        if self._using_base_red_generation(iteration_index):
+            self.logger.event(
+                "red_base_generation_mode",
+                iteration=iteration_index,
+                adapter_path=None,
+                stored_red_adapter=self.current_red_adapter,
+            )
 
     def _attach_execution(self, task, execution_result) -> None:
         task.metadata["execution"] = execution_result.to_dict()
@@ -488,6 +524,7 @@ class AdversarialCurriculumPipeline:
         self,
         pending_batch: List[Dict[str, Any]],
         next_episode_id: int,
+        iteration_index: int,
     ) -> Tuple[List[EpisodeRecord], int]:
         tasks = [item["task"] for item in pending_batch]
         hints = [item["hint"] for item in pending_batch]
@@ -570,6 +607,7 @@ class AdversarialCurriculumPipeline:
             should_reset, snapshot = self.curriculum.observe(
                 episode.topic,
                 judge_output.normalized_reward,
+                update_weights=not self._using_uniform_curriculum(iteration_index),
             )
             self.storage.save_curriculum_state(snapshot)
             self.logger.event(
@@ -591,15 +629,16 @@ class AdversarialCurriculumPipeline:
         self._store_hard_examples_for_batch(records)
         return records, next_episode_id
 
-    def _load_red_generation_session(self):
-        return self.model_pool.load_red_generation(adapter_path=self.current_red_adapter)
+    def _load_red_generation_session(self, iteration_index: int):
+        adapter_path = None if self._using_base_red_generation(iteration_index) else self.current_red_adapter
+        return self.model_pool.load_red_generation(adapter_path=adapter_path)
 
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
         self._red_adapter_failed_last_iteration = False
         generated_requests: List[Dict[str, Any]] = []
         max_generation_attempts = max(1, target_count * max(2, self.config.task_execution.max_red_generation_attempts))
         generation_attempt = 0
-        red_session = self._load_red_generation_session()
+        red_session = self._load_red_generation_session(iteration_index)
         try:
             while len(generated_requests) < target_count and generation_attempt < max_generation_attempts:
                 remaining_slots = target_count - len(generated_requests)
@@ -651,6 +690,7 @@ class AdversarialCurriculumPipeline:
             replica_count=1,
             shard_gpu_ids=self.config.red.hardware.gpu_ids,
             effective_batch_size=self._red_effective_batch_size(max(1, target_count)),
+            red_generation_adapter=None if self._using_base_red_generation(iteration_index) else self.current_red_adapter,
         )
         return [
             {
@@ -734,7 +774,9 @@ class AdversarialCurriculumPipeline:
         )
 
     def _apply_iteration_curriculum_focus(self, iteration_index: int) -> None:
-        weakest_topic, snapshot = self.curriculum.apply_iteration_focus_boost()
+        weakest_topic, snapshot = self.curriculum.apply_iteration_focus_boost(
+            enabled=not self._using_uniform_curriculum(iteration_index),
+        )
         self.storage.save_curriculum_state(snapshot)
         self.logger.event(
             "curriculum_iteration_focus",
@@ -751,6 +793,7 @@ class AdversarialCurriculumPipeline:
             start_episode=start_episode,
             total_episodes=self.config.runtime.total_episodes,
             iteration_size=self._iteration_size(),
+            completed_iterations=self.completed_iterations,
             socratic_model=self.current_socratic_model,
             socratic_adapter=self.current_socratic_adapter,
             red_adapter=self.current_red_adapter,
@@ -760,7 +803,7 @@ class AdversarialCurriculumPipeline:
         try:
             target_episode = start_episode + self.config.runtime.total_episodes
             next_episode_id = start_episode
-            iteration_index = 0
+            iteration_index = self.completed_iterations
             stalled_iterations = 0
 
             while next_episode_id < target_episode:
@@ -773,6 +816,7 @@ class AdversarialCurriculumPipeline:
                     start_episode=next_episode_id,
                     requested_tasks=requested_tasks,
                 )
+                self._prepare_iteration_modes(iteration_index)
 
                 generated = self._generate_iteration_tasks(requested_tasks, iteration_index)
                 generated = self._generate_socratic_hints_for_iteration(generated, iteration_index)
@@ -782,12 +826,20 @@ class AdversarialCurriculumPipeline:
                 for item in generated:
                     pending_batch.append(item)
                     if len(pending_batch) >= self.config.judge.episode_batch_size:
-                        batch_records, next_episode_id = self._flush_pending_batch(pending_batch, next_episode_id)
+                        batch_records, next_episode_id = self._flush_pending_batch(
+                            pending_batch,
+                            next_episode_id,
+                            iteration_index,
+                        )
                         accepted_records.extend(batch_records)
                         pending_batch = []
 
                 if pending_batch:
-                    batch_records, next_episode_id = self._flush_pending_batch(pending_batch, next_episode_id)
+                    batch_records, next_episode_id = self._flush_pending_batch(
+                        pending_batch,
+                        next_episode_id,
+                        iteration_index,
+                    )
                     accepted_records.extend(batch_records)
 
                 self._run_iteration_updates(accepted_records, iteration_index)
@@ -803,6 +855,8 @@ class AdversarialCurriculumPipeline:
                     accepted_episodes=len(accepted_records),
                     total_episodes=next_episode_id,
                 )
+                self.completed_iterations = iteration_index
+                self.storage.save_pointer("completed_iterations", self.completed_iterations)
                 if accepted_records:
                     stalled_iterations = 0
                 else:
