@@ -75,6 +75,11 @@ class AdversarialCurriculumPipeline:
         cutoff = self._curriculum_adaptation_cutoff_iteration()
         return cutoff > 0 and iteration_index > cutoff
 
+    def _effective_red_generation_adapter(self, iteration_index: int) -> Optional[str]:
+        if self._using_base_red_generation(iteration_index):
+            return None
+        return self.current_red_adapter
+
     def _prepare_iteration_modes(self, iteration_index: int) -> None:
         if self._using_uniform_curriculum(iteration_index):
             snapshot = self.curriculum.uniformize_weights()
@@ -90,7 +95,7 @@ class AdversarialCurriculumPipeline:
             self.logger.event(
                 "red_base_generation_mode",
                 iteration=iteration_index,
-                adapter_path=None,
+                adapter_path=self._effective_red_generation_adapter(iteration_index),
                 stored_red_adapter=self.current_red_adapter,
             )
 
@@ -598,7 +603,8 @@ class AdversarialCurriculumPipeline:
                     "weakness_summary": weakness_summary,
                     "socratic_model": self.current_socratic_model,
                     "socratic_adapter": self.current_socratic_adapter,
-                    "red_adapter": self.current_red_adapter,
+                    "red_adapter": self._effective_red_generation_adapter(iteration_index),
+                    "red_training_adapter": self.current_red_adapter,
                     "task_is_valid_for_socratic": task_is_valid,
                     "hint_is_valid_for_socratic": hint_is_valid,
                 },
@@ -630,8 +636,11 @@ class AdversarialCurriculumPipeline:
         return records, next_episode_id
 
     def _load_red_generation_session(self, iteration_index: int):
-        adapter_path = None if self._using_base_red_generation(iteration_index) else self.current_red_adapter
-        return self.model_pool.load_red_generation(adapter_path=adapter_path)
+        adapter_path = self._effective_red_generation_adapter(iteration_index)
+        return self.model_pool.load_red_generation(
+            adapter_path=adapter_path,
+            allow_base_adapter_fallback=adapter_path is not None,
+        )
 
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
         self._red_adapter_failed_last_iteration = False
@@ -676,7 +685,11 @@ class AdversarialCurriculumPipeline:
             red_session.unload()
 
         final_requests = valid_requests + repaired_requests
-        if not final_requests and self._using_non_base_red_adapter():
+        if (
+            not final_requests
+            and not self._using_base_red_generation(iteration_index)
+            and self._using_non_base_red_adapter()
+        ):
             self._handle_red_adapter_failure(iteration_index, len(final_requests))
         self.logger.event(
             "iteration_red_generation_complete",
@@ -690,7 +703,7 @@ class AdversarialCurriculumPipeline:
             replica_count=1,
             shard_gpu_ids=self.config.red.hardware.gpu_ids,
             effective_batch_size=self._red_effective_batch_size(max(1, target_count)),
-            red_generation_adapter=None if self._using_base_red_generation(iteration_index) else self.current_red_adapter,
+            red_generation_adapter=self._effective_red_generation_adapter(iteration_index),
         )
         return [
             {
@@ -753,16 +766,26 @@ class AdversarialCurriculumPipeline:
         hard_examples = self.storage.load_hard_examples(self.config.red.update.max_sft_examples)
         rejected_examples = self.storage.load_red_rejected_examples(self.config.red.update.max_dpo_pairs)
         recent_for_red = self.storage.load_recent_episodes(max(self.config.red.update.max_sft_examples, 256))
-        red_result = self.red_updater.run(
-            hard_examples=hard_examples,
-            rejected_examples=rejected_examples,
-            recent_episodes=recent_for_red,
-            step=step,
-            adapter_path=self.current_red_adapter,
-        )
-        if red_result.adapter_path:
-            self.current_red_adapter = red_result.adapter_path
-            self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
+        if self._using_base_red_generation(iteration_index):
+            self.logger.event(
+                "red_update_skipped",
+                iteration=iteration_index,
+                step=step,
+                reason="base_red_generation_mode_after_cutoff",
+                red_generation_adapter=self._effective_red_generation_adapter(iteration_index),
+                red_training_adapter=self.current_red_adapter,
+            )
+        else:
+            red_result = self.red_updater.run(
+                hard_examples=hard_examples,
+                rejected_examples=rejected_examples,
+                recent_episodes=recent_for_red,
+                step=step,
+                adapter_path=self.current_red_adapter,
+            )
+            if red_result.adapter_path:
+                self.current_red_adapter = red_result.adapter_path
+                self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
 
         self.logger.event(
             "iteration_updates_complete",
@@ -770,7 +793,8 @@ class AdversarialCurriculumPipeline:
             step=step,
             accepted_records=len(accepted_records),
             socratic_adapter=self.current_socratic_adapter,
-            red_adapter=self.current_red_adapter,
+            red_adapter=self._effective_red_generation_adapter(iteration_index),
+            red_training_adapter=self.current_red_adapter,
         )
 
     def _apply_iteration_curriculum_focus(self, iteration_index: int) -> None:

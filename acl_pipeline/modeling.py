@@ -541,7 +541,13 @@ class ModelPool:
             gradient_checkpointing=self.config.socratic.grpo.gradient_checkpointing,
         )
 
-    def load_red_generation(self, *, adapter_path: Optional[str] = None, gpu_id: Optional[int] = None) -> RoleSession:
+    def load_red_generation(
+        self,
+        *,
+        adapter_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+        allow_base_adapter_fallback: bool = True,
+    ) -> RoleSession:
         hardware = self.config.red.hardware
         if gpu_id is not None:
             hardware = HardwareAllocation(
@@ -550,6 +556,9 @@ class ModelPool:
                 per_gpu_memory_gib=hardware.per_gpu_memory_gib,
                 cpu_offload_gib=hardware.cpu_offload_gib,
             )
+        effective_adapter_path = adapter_path
+        if effective_adapter_path is None and allow_base_adapter_fallback:
+            effective_adapter_path = self.config.red.base_adapter_path
         return load_role_session(
             role_name="red_generation",
             model_name_or_path=self.config.red.model_name_or_path,
@@ -559,7 +568,7 @@ class ModelPool:
             quantization=self.config.red.generation_quantization,
             enable_thinking=self.config.red.enable_thinking,
             logger=self.logger,
-            adapter_path=adapter_path or self.config.red.base_adapter_path,
+            adapter_path=effective_adapter_path,
             trainable=False,
         )
 
