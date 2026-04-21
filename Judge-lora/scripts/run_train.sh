@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch QLoRA training on 4 GPUs. Run from the repo root:
+# Launch LoRA training with DeepSpeed ZeRO-3 on 4 GPUs. Run from the repo root:
 #   bash Judge-lora/scripts/run_train.sh
 set -euo pipefail
 

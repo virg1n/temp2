@@ -5,14 +5,15 @@ Launch on 4x48GB with:
         Judge-lora/train.py --config Judge-lora/configs/qwen3_32b_judge.yaml
 
 Design notes (anti-overfit with only 630 train samples):
-  * QLoRA 4-bit NF4 base + LoRA adapter (r=32, alpha=64, dropout=0.1).
   * Loss computed only on the assistant JSON (prompt tokens masked to -100).
   * Small effective batch (32) + cosine LR with warmup + weight decay.
   * Early stopping on val loss with load_best_model_at_end.
+  * DeepSpeed ZeRO-3 is enabled via `train.deepspeed` when configured.
 """
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -46,17 +47,84 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(fh)
 
 
-def build_model_and_tokenizer(mcfg: dict):
+def resolve_path(config_path: str, maybe_relative_path: str | None) -> str | None:
+    if not maybe_relative_path:
+        return None
+    path = Path(maybe_relative_path)
+    if path.is_absolute():
+        return str(path)
+    return str((Path(config_path).resolve().parent / path).resolve())
+
+
+def build_training_args(tcfg: dict) -> TrainingArguments:
+    # Build kwargs and drop any not supported by the installed transformers.
+    ta_kwargs = dict(
+        output_dir=tcfg["output_dir"],
+        num_train_epochs=tcfg["num_train_epochs"],
+        per_device_train_batch_size=tcfg["per_device_train_batch_size"],
+        per_device_eval_batch_size=tcfg["per_device_eval_batch_size"],
+        gradient_accumulation_steps=tcfg["gradient_accumulation_steps"],
+        learning_rate=tcfg["learning_rate"],
+        lr_scheduler_type=tcfg["lr_scheduler_type"],
+        warmup_ratio=tcfg["warmup_ratio"],
+        weight_decay=tcfg["weight_decay"],
+        max_grad_norm=tcfg["max_grad_norm"],
+        bf16=tcfg.get("bf16", True),
+        gradient_checkpointing=tcfg.get("gradient_checkpointing", True),
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim=tcfg.get("optim", "paged_adamw_8bit"),
+        logging_steps=tcfg["logging_steps"],
+        eval_strategy=tcfg["eval_strategy"],
+        eval_steps=tcfg.get("eval_steps"),
+        save_strategy=tcfg["save_strategy"],
+        save_steps=tcfg.get("save_steps"),
+        save_total_limit=tcfg.get("save_total_limit", 3),
+        load_best_model_at_end=tcfg.get("load_best_model_at_end", True),
+        metric_for_best_model=tcfg.get("metric_for_best_model", "eval_loss"),
+        greater_is_better=tcfg.get("greater_is_better", False),
+        report_to=tcfg.get("report_to", "none"),
+        seed=tcfg.get("seed", 42),
+        dataloader_num_workers=tcfg.get("dataloader_num_workers", 2),
+        group_by_length=tcfg.get("group_by_length", True),
+        ddp_find_unused_parameters=False,
+        remove_unused_columns=False,
+        deepspeed=tcfg.get("deepspeed"),
+    )
+    supported = set(inspect.signature(TrainingArguments.__init__).parameters)
+    dropped = [k for k in ta_kwargs if k not in supported]
+    for k in dropped:
+        ta_kwargs.pop(k)
+    if dropped and int(os.environ.get("RANK", 0)) == 0:
+        print(f"[warn] TrainingArguments does not support: {dropped} (dropped)")
+    return TrainingArguments(**ta_kwargs)
+
+
+def build_model_and_tokenizer(mcfg: dict, use_deepspeed: bool):
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     compute_dtype = dtype_map[mcfg.get("bnb_4bit_compute_dtype", "bfloat16")]
+    model_dtype = compute_dtype
 
     bnb_cfg = None
     if mcfg.get("load_in_4bit", False):
+        quant_storage_dtype = dtype_map[
+            mcfg.get(
+                "bnb_4bit_quant_storage_dtype",
+                mcfg.get("bnb_4bit_compute_dtype", "bfloat16"),
+            )
+        ]
+        model_dtype = quant_storage_dtype
         bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=mcfg.get("bnb_4bit_quant_type", "nf4"),
             bnb_4bit_use_double_quant=mcfg.get("bnb_4bit_use_double_quant", True),
             bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_storage=quant_storage_dtype,
+        )
+    elif mcfg.get("load_in_8bit", False):
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=mcfg.get("llm_int8_threshold", 6.0),
+            llm_int8_has_fp16_weight=False,
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -68,30 +136,35 @@ def build_model_and_tokenizer(mcfg: dict):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # DDP: each process gets one GPU slice of the model.
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device_map = {"": local_rank}
+    # DeepSpeed handles parameter placement/sharding. Outside of DeepSpeed we
+    # still pin one full quantized replica per rank.
+    device_map = None
+    if not use_deepspeed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device_map = {"": local_rank}
 
     attn_impl = mcfg.get("attn_implementation", "sdpa")
+    model_kwargs = dict(
+        quantization_config=bnb_cfg,
+        trust_remote_code=mcfg.get("trust_remote_code", True),
+        dtype=model_dtype,
+        attn_implementation=attn_impl,
+    )
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             mcfg["name_or_path"],
-            quantization_config=bnb_cfg,
-            device_map=device_map,
-            trust_remote_code=mcfg.get("trust_remote_code", True),
-            torch_dtype=compute_dtype,
-            attn_implementation=attn_impl,
+            **model_kwargs,
         )
     except (ImportError, ValueError) as e:
         if attn_impl == "flash_attention_2":
             print(f"[warn] flash_attention_2 unavailable ({e}); falling back to sdpa.")
+            model_kwargs["attn_implementation"] = "sdpa"
             model = AutoModelForCausalLM.from_pretrained(
                 mcfg["name_or_path"],
-                quantization_config=bnb_cfg,
-                device_map=device_map,
-                trust_remote_code=mcfg.get("trust_remote_code", True),
-                torch_dtype=compute_dtype,
-                attn_implementation="sdpa",
+                **model_kwargs,
             )
         else:
             raise
@@ -110,13 +183,19 @@ def main():
     mcfg = cfg["model"]
     dcfg = cfg["data"]
     lcfg = cfg["lora"]
+    tcfg["deepspeed"] = resolve_path(args.config, tcfg.get("deepspeed"))
 
     set_seed(tcfg.get("seed", 42))
 
-    # ---- Model + tokenizer ----
-    model, tokenizer = build_model_and_tokenizer(mcfg)
+    # Initialize TrainingArguments before model loading so ZeRO-3 is already
+    # registered when `from_pretrained` runs.
+    targs = build_training_args(tcfg)
+    use_deepspeed = bool(getattr(targs, "deepspeed", None))
 
-    if mcfg.get("load_in_4bit", False):
+    # ---- Model + tokenizer ----
+    model, tokenizer = build_model_and_tokenizer(mcfg, use_deepspeed=use_deepspeed)
+
+    if mcfg.get("load_in_4bit", False) or mcfg.get("load_in_8bit", False):
         model = prepare_model_for_kbit_training(
             model,
             use_gradient_checkpointing=tcfg.get("gradient_checkpointing", True),
@@ -156,60 +235,33 @@ def main():
 
     collator = PromptMaskedCollator(pad_token_id=tokenizer.pad_token_id)
 
-    # ---- Training args ----
-    targs = TrainingArguments(
-        output_dir=tcfg["output_dir"],
-        num_train_epochs=tcfg["num_train_epochs"],
-        per_device_train_batch_size=tcfg["per_device_train_batch_size"],
-        per_device_eval_batch_size=tcfg["per_device_eval_batch_size"],
-        gradient_accumulation_steps=tcfg["gradient_accumulation_steps"],
-        learning_rate=tcfg["learning_rate"],
-        lr_scheduler_type=tcfg["lr_scheduler_type"],
-        warmup_ratio=tcfg["warmup_ratio"],
-        weight_decay=tcfg["weight_decay"],
-        max_grad_norm=tcfg["max_grad_norm"],
-        bf16=tcfg.get("bf16", True),
-        gradient_checkpointing=tcfg.get("gradient_checkpointing", True),
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim=tcfg.get("optim", "paged_adamw_8bit"),
-        logging_steps=tcfg["logging_steps"],
-        eval_strategy=tcfg["eval_strategy"],
-        eval_steps=tcfg["eval_steps"],
-        save_strategy=tcfg["save_strategy"],
-        save_steps=tcfg["save_steps"],
-        save_total_limit=tcfg.get("save_total_limit", 3),
-        load_best_model_at_end=tcfg.get("load_best_model_at_end", True),
-        metric_for_best_model=tcfg.get("metric_for_best_model", "eval_loss"),
-        greater_is_better=tcfg.get("greater_is_better", False),
-        report_to=tcfg.get("report_to", "none"),
-        seed=tcfg.get("seed", 42),
-        dataloader_num_workers=tcfg.get("dataloader_num_workers", 2),
-        group_by_length=tcfg.get("group_by_length", True),
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False,
-    )
-
     callbacks = []
     patience = tcfg.get("early_stopping_patience", 0)
     if patience and patience > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
 
-    trainer = Trainer(
+    trainer_kwargs = dict(
         model=model,
         args=targs,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
-        tokenizer=tokenizer,
         callbacks=callbacks,
     )
+    # transformers >=4.46 renamed `tokenizer` -> `processing_class`.
+    trainer_sig = set(inspect.signature(Trainer.__init__).parameters)
+    if "processing_class" in trainer_sig:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
 
     trainer.train()
 
     # Save the adapter + tokenizer on rank 0.
     if trainer.is_world_process_zero():
         out = Path(tcfg["output_dir"]) / "final"
-        trainer.model.save_pretrained(out)
+        trainer.save_model(out)
         tokenizer.save_pretrained(out)
         print(f"[ok] Saved LoRA adapter to {out}")
 
