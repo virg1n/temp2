@@ -1,24 +1,22 @@
 {
-  "total_records": 700,
+  "source_sample_count": 700,
+  "runtime_batch_size": 4,
+  "total_batch_records": 175,
+  "train_batch_count": 157,
+  "val_batch_count": 18,
+  "train_item_count": 628,
+  "val_item_count": 72,
   "source_counts": {
     "sft_reference": 150,
     "existing_socratic_archive": 50,
     "existing_socratic_local": 100,
     "synthetic": 400
   },
-  "execution_status_counts": {
-    "assertionerror": 421,
+  "normalized_execution_status_counts": {
+    "failed": 538,
     "syntax_error": 13,
     "passed": 128,
-    "valueerror": 32,
-    "attributeerror": 7,
-    "nameerror": 21,
-    "runtime_error": 2,
-    "typeerror": 67,
-    "keyerror": 4,
-    "recursionerror": 1,
-    "zerodivisionerror": 1,
-    "indexerror": 3
+    "nameerror": 21
   },
   "quality_bucket_counts": {
     "strong": 258,
@@ -30,23 +28,43 @@
     "corrupted": 7
   },
   "task_valid_counts": {
-    "true": 685,
-    "false": 15
+    "true": 557,
+    "false": 143
   },
   "hint_valid_rate": 0.6586,
-  "mean_reward": 0.6675,
-  "train_count": 630,
-  "val_count": 70,
-  "duplicate_hint_rows": 0,
-  "duplicate_code_rows": 393,
-  "train_val_hint_hash_overlap": 0,
+  "passed_tasks_marked_invalid": 128,
   "train_val_code_hash_overlap": 0,
+  "train_val_hint_hash_overlap": 0,
+  "weights_used_in_prompt": {
+    "no_solution_reveal": 0.3,
+    "bug_localization": 0.2,
+    "usefulness": 0.25,
+    "socratic_style": 0.15,
+    "technical_accuracy": 0.1
+  },
+  "moved_train_ids_to_val_for_divisible_batches": [
+    "existing-local-037",
+    "existing-local-091"
+  ],
+  "source_backups": {
+    "full": "judge_lora_dataset/source_samples_700_raw.jsonl",
+    "train": "judge_lora_dataset/source_train_630_raw.jsonl",
+    "val": "judge_lora_dataset/source_val_70_raw.jsonl"
+  },
   "notes": [
-    "The workspace only contained 100 direct pipeline-generated Socratic samples in episodes.jsonl.",
-    "To reach 150 existing Socratic samples, the remaining 50 were taken from archived socratic_hints in datset_for_SFT.json.",
-    "The 150 sft_reference rows are disjoint from the 50 archive rows above.",
-    "All labels were regenerated with a stricter offline rubric instead of copying the current judge outputs.",
-    "Train/val split is built from connected components over code_hash and hint_hash, so neither hash overlaps across splits.",
-    "task_is_valid_for_socratic is no longer constant; syntax-invalid and generic runtime-invalid tasks are labeled false."
-  ]
+    "messages now match acl_pipeline.prompts.build_judge_batch_messages exactly",
+    "training targets are strict JSON arrays of 4 judge objects to match N=4 runtime batches",
+    "execution_status now uses acl_pipeline runtime vocabulary: passed, syntax_error, indentation_error, nameerror, failed",
+    "passed tasks are marked task_is_valid_for_socratic=false with task_quality <= 2.0",
+    "hint validity remains separate from task validity so passed-aware hints can still be labeled as good hints on invalid tasks",
+    "train.jsonl has been augmented with 100 synthetic GPT-authored N=4 batches; full/val files remain unchanged"
+  ],
+  "base_train_batch_count": 157,
+  "base_train_item_count": 628,
+  "synthetic_gpt_train_batch_count_added": 100,
+  "synthetic_gpt_train_item_count_added": 400,
+  "augmented_train_batch_count": 257,
+  "augmented_train_item_count": 1028,
+  "train_pre_augmentation_backup": "judge_lora_dataset/train_before_gpt_synthetic_aug.jsonl",
+  "train_augmentation_file": "judge_lora_dataset/train_synthetic_gpt_100_batches.jsonl"
 }
