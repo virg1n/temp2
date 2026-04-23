@@ -103,7 +103,7 @@ class SocraticDpoSettings:
     max_training_pairs: int = 128
     num_hint_candidates: int = 4
     max_pairs_per_task: int = 2
-    min_score_gap: float = 0.5
+    min_score_gap: float = 0.35
     learning_rate: float = 5e-6
     epochs: int = 1
     per_device_batch_size: int = 1
@@ -290,7 +290,7 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
         max_training_pairs=int(payload.get("max_training_pairs", 128)),
         num_hint_candidates=int(payload.get("num_hint_candidates", 4)),
         max_pairs_per_task=int(payload.get("max_pairs_per_task", 2)),
-        min_score_gap=float(payload.get("min_score_gap", 0.5)),
+        min_score_gap=float(payload.get("min_score_gap", 0.35)),
         learning_rate=float(payload.get("learning_rate", 5e-6)),
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),

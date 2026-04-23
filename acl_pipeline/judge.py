@@ -883,7 +883,7 @@ class JudgeService:
             return [[] for _ in tasks]
 
         prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in flat_tasks]
-        hint_texts = [hint.raw_text or hint.text for hint in flat_hints]
+        hint_texts = [hint.text for hint in flat_hints]
         details_list = self.score_pair_details(
             prompt_texts,
             hint_texts,
@@ -945,7 +945,7 @@ class JudgeService:
         if not tasks:
             return []
         prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in tasks]
-        hint_texts = [hint.raw_text or hint.text for hint in hints]
+        hint_texts = [hint.text for hint in hints]
         details_list = self.score_pair_details(
             prompt_texts,
             hint_texts,

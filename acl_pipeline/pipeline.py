@@ -616,16 +616,8 @@ class AdversarialCurriculumPipeline:
             return 0
 
         task = item["task"]
-        valid_ranked = [
-            candidate
-            for candidate in ranked
-            if bool(candidate["judge"].metadata.get("task_is_valid_for_socratic", True))
-        ]
-        if not valid_ranked:
-            return 0
-
         chosen = None
-        for candidate in valid_ranked:
+        for candidate in ranked:
             if bool(candidate["judge"].metadata.get("hint_is_valid_for_socratic", True)):
                 chosen = candidate
                 break
@@ -645,7 +637,7 @@ class AdversarialCurriculumPipeline:
             chosen_hint = chosen["hint"]
             rejected_hint = rejected["hint"]
             chosen_text = str(chosen_hint.text or "").strip()
-            rejected_text = str(rejected_hint.raw_text or rejected_hint.text or "").strip()
+            rejected_text = str(rejected_hint.text or "").strip()
             if not chosen_text or not rejected_text or chosen_text == rejected_text:
                 continue
 
