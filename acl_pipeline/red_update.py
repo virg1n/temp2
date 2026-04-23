@@ -359,6 +359,8 @@ class RedUpdater:
                     "logging_steps": int(settings.logging_steps),
                     "save_strategy": "no",
                     "report_to": "none",
+                    "optim": "paged_adamw_8bit",
+                    "gradient_checkpointing": True,
                     "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                     "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
                 }
@@ -413,6 +415,7 @@ class RedUpdater:
                             "logging_steps": int(settings.logging_steps),
                             "save_strategy": "no",
                             "report_to": "none",
+                            "optim": "paged_adamw_8bit",
                             "gradient_checkpointing": True,
                             "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                             "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),

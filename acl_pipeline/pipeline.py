@@ -616,18 +616,19 @@ class AdversarialCurriculumPipeline:
             return 0
 
         task = item["task"]
-        chosen = None
-        for candidate in ranked:
-            if bool(candidate["judge"].metadata.get("hint_is_valid_for_socratic", True)):
-                chosen = candidate
-                break
-        if chosen is None:
+        task_valid_ranked = [
+            candidate
+            for candidate in ranked
+            if bool(candidate["judge"].metadata.get("task_is_valid_for_socratic", True))
+        ]
+        if len(task_valid_ranked) < 2:
             return 0
 
         settings = self.config.socratic.dpo
+        chosen = task_valid_ranked[0]
         chosen_score = float(chosen["judge"].metadata.get("adjusted_score") or chosen["judge"].score)
         added = 0
-        for rejected in ranked:
+        for rejected in task_valid_ranked:
             if rejected is chosen:
                 continue
             rejected_score = float(rejected["judge"].metadata.get("adjusted_score") or rejected["judge"].score)

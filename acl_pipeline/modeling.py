@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,10 +49,37 @@ def build_quantization_config(mode: Optional[str]) -> Optional[BitsAndBytesConfi
     raise ValueError(f"Unsupported quantization mode: {mode}")
 
 
+def _visible_cuda_physical_ids() -> List[int]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return []
+    ids: List[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.append(int(item))
+        except ValueError:
+            return []
+    return ids
+
+
+def _local_cuda_ids(gpu_ids: Iterable[int]) -> List[int]:
+    requested = [int(gpu_id) for gpu_id in gpu_ids]
+    visible_physical_ids = _visible_cuda_physical_ids()
+    if not requested or not visible_physical_ids:
+        return requested
+    physical_to_local = {physical_id: index for index, physical_id in enumerate(visible_physical_ids)}
+    if all(gpu_id in physical_to_local for gpu_id in requested):
+        return [physical_to_local[gpu_id] for gpu_id in requested]
+    return requested
+
+
 def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
     if not hardware.gpu_ids:
         return None
-    target_gpu_ids = {int(gpu_id) for gpu_id in hardware.gpu_ids}
+    target_gpu_ids = set(_local_cuda_ids(hardware.gpu_ids))
     max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in target_gpu_ids}
     if torch.cuda.is_available():
         for gpu_id in range(torch.cuda.device_count()):
@@ -64,7 +92,10 @@ def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
 def set_preferred_cuda_device(hardware: HardwareAllocation) -> None:
     if not torch.cuda.is_available() or not hardware.gpu_ids:
         return
-    preferred = int(hardware.gpu_ids[0])
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    if not local_gpu_ids:
+        return
+    preferred = int(local_gpu_ids[0])
     if 0 <= preferred < torch.cuda.device_count():
         torch.cuda.set_device(preferred)
 
@@ -245,6 +276,7 @@ class ServerRoleSession:
         for messages in messages_batch:
             text = ""
             last_err: Optional[Exception] = None
+            max_tokens = max(1, int(effective.max_new_tokens))
             for attempt in range(max(1, int(self.max_retries) + 1)):
                 try:
                     response = client.chat.completions.create(
@@ -252,7 +284,7 @@ class ServerRoleSession:
                         messages=list(messages),
                         temperature=float(effective.temperature) if effective.do_sample else 0.0,
                         top_p=float(effective.top_p),
-                        max_tokens=int(effective.max_new_tokens),
+                        max_tokens=max_tokens,
                         extra_body={"chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}},
                     )
                     text = str(response.choices[0].message.content or "").strip()
@@ -260,6 +292,17 @@ class ServerRoleSession:
                     break
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
+                    message = str(exc).lower()
+                    if "context length" in message and max_tokens > 64:
+                        max_tokens = max(64, max_tokens // 2)
+                        self.logger.warning(
+                            "server_generate_context_retry",
+                            role=self.role_name,
+                            model_name_or_path=self.model_name_or_path,
+                            next_max_tokens=max_tokens,
+                            error=str(exc),
+                        )
+                        continue
                     time.sleep(min(2**attempt, 8))
             if last_err is not None:
                 self.logger.warning(

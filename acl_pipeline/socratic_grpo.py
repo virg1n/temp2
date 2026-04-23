@@ -81,6 +81,7 @@ def _compat_grpo_config(config: PipelineConfig, output_dir: str) -> Any:
         "bf16": bool(args.bf16),
         "fp16": bool(args.fp16),
         "gradient_checkpointing": bool(args.gradient_checkpointing),
+        "optim": "paged_adamw_8bit",
         "max_prompt_length": int(args.max_prompt_length),
         "max_completion_length": int(args.max_completion_length),
         "num_generations": int(args.num_generations),
