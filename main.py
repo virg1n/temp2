@@ -6,6 +6,8 @@ from typing import Iterable, List
 
 from acl_pipeline.config import load_config
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def _parse_cuda_visible_devices(value: str) -> List[int]:
     ids: List[int] = []

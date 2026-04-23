@@ -16,7 +16,7 @@ from transformers import set_seed
 from .config import PipelineConfig
 from .judge import JudgeService
 from .logging_utils import StructuredLogger
-from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error
+from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error, release_trainer_memory
 from .prompts import build_socratic_messages
 from .schemas import EpisodeRecord
 from .storage import SimpleStorage
@@ -205,6 +205,7 @@ class SocraticGrpoUpdater:
                 session.tokenizer.save_pretrained(str(adapter_dir))
                 result = SocraticUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
 
+            release_trainer_memory(trainer)
             self.storage.prune_role_checkpoints("socratic")
             self.logger.event(
                 "socratic_grpo_complete",

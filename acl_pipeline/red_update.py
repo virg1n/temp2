@@ -16,7 +16,14 @@ from datasets import Dataset
 
 from .config import PipelineConfig
 from .logging_utils import StructuredLogger
-from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error, render_chat_messages
+from .modeling import (
+    ModelPool,
+    attach_lora_adapter,
+    clear_cuda_memory,
+    is_oom_error,
+    release_trainer_memory,
+    render_chat_messages,
+)
 from .prompts import RED_SYSTEM_PROMPT, build_red_training_prompt
 from .schemas import EpisodeRecord, PythonTask, RedRejectedExample, RedTrainingExample
 from .storage import SimpleStorage
@@ -381,6 +388,7 @@ class RedUpdater:
                 sft_trainer.train()
                 model = sft_trainer.model
                 session.model = model
+                release_trainer_memory(sft_trainer)
                 del sft_trainer
                 del sft_dataset
                 clear_cuda_memory()
@@ -437,6 +445,7 @@ class RedUpdater:
                         dpo_trainer.train()
                         model = dpo_trainer.model
                         session.model = model
+                        release_trainer_memory(dpo_trainer)
                         del dpo_trainer
                         del dpo_dataset
                         clear_cuda_memory()

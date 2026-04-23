@@ -15,7 +15,14 @@ from transformers import set_seed
 
 from .config import PipelineConfig
 from .logging_utils import StructuredLogger
-from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error, render_chat_messages
+from .modeling import (
+    ModelPool,
+    attach_lora_adapter,
+    clear_cuda_memory,
+    is_oom_error,
+    release_trainer_memory,
+    render_chat_messages,
+)
 from .prompts import build_socratic_messages
 from .schemas import SocraticPreferenceExample
 from .storage import SimpleStorage
@@ -214,6 +221,7 @@ class SocraticDpoUpdater:
                 session.tokenizer.save_pretrained(str(adapter_dir))
                 result = SocraticDpoUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
 
+            release_trainer_memory(trainer)
             self.storage.prune_role_checkpoints("socratic")
             self.logger.event(
                 "socratic_dpo_complete",

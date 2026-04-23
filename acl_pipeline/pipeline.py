@@ -9,7 +9,7 @@ from .config import GenerationSettings, PipelineConfig
 from .curriculum import CurriculumManager
 from .judge import JudgeService
 from .logging_utils import build_logger
-from .modeling import ModelPool
+from .modeling import ModelPool, clear_cuda_memory, is_oom_error
 from .prompts import (
     build_red_messages,
     build_red_repair_message,
@@ -904,10 +904,28 @@ class AdversarialCurriculumPipeline:
 
     def _load_red_generation_session(self, iteration_index: int):
         adapter_path = self._effective_red_generation_adapter(iteration_index)
-        return self.model_pool.load_red_generation(
-            adapter_path=adapter_path,
-            allow_base_adapter_fallback=adapter_path is not None,
-        )
+        try:
+            return self.model_pool.load_red_generation(
+                adapter_path=adapter_path,
+                allow_base_adapter_fallback=adapter_path is not None,
+            )
+        except RuntimeError as exc:
+            if not is_oom_error(exc):
+                raise
+            clear_cuda_memory()
+            self.logger.warning(
+                "red_generation_load_oom",
+                iteration=iteration_index,
+                adapter_path=adapter_path,
+                error=str(exc),
+            )
+            if adapter_path is None:
+                raise
+            self._handle_red_adapter_failure(iteration_index, 0)
+            return self.model_pool.load_red_generation(
+                adapter_path=None,
+                allow_base_adapter_fallback=True,
+            )
 
     def _generate_iteration_tasks(self, target_count: int, iteration_index: int) -> List[Dict[str, Any]]:
         self._red_adapter_failed_last_iteration = False
@@ -1080,6 +1098,7 @@ class AdversarialCurriculumPipeline:
                 self.current_red_adapter = red_result.adapter_path
                 self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
 
+        clear_cuda_memory()
         self.logger.event(
             "iteration_updates_complete",
             iteration=iteration_index,

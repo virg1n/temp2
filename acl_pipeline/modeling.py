@@ -22,6 +22,35 @@ def clear_cuda_memory() -> None:
         torch.cuda.ipc_collect()
 
 
+def release_trainer_memory(trainer: Any) -> None:
+    if trainer is None:
+        clear_cuda_memory()
+        return
+    accelerator = getattr(trainer, "accelerator", None)
+    try:
+        if accelerator is not None and hasattr(accelerator, "free_memory"):
+            accelerator.free_memory()
+        elif accelerator is not None and hasattr(accelerator, "clear"):
+            accelerator.clear()
+    except Exception:
+        pass
+    for attr in (
+        "optimizer",
+        "lr_scheduler",
+        "train_dataset",
+        "eval_dataset",
+        "model_wrapped",
+        "processing_class",
+        "tokenizer",
+    ):
+        if hasattr(trainer, attr):
+            try:
+                setattr(trainer, attr, None)
+            except Exception:
+                pass
+    clear_cuda_memory()
+
+
 def is_oom_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return "out of memory" in message or "cuda error: out of memory" in message
@@ -440,18 +469,19 @@ def load_role_session(
 
     last_exc: Optional[BaseException] = None
     for mode in load_attempts:
+        attempt_model = None
         try:
             local_kwargs = dict(kwargs)
             local_kwargs["quantization_config"] = build_quantization_config(mode)
             if local_kwargs["quantization_config"] is None:
                 local_kwargs.pop("quantization_config", None)
                 local_kwargs["torch_dtype"] = _dtype_for_runtime() if torch.cuda.is_available() else torch.float32
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **local_kwargs)
+            attempt_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **local_kwargs)
             if adapter_path:
                 try:
                     from peft import PeftModel
 
-                    model = PeftModel.from_pretrained(model, adapter_path, is_trainable=trainable)
+                    attempt_model = PeftModel.from_pretrained(attempt_model, adapter_path, is_trainable=trainable)
                 except Exception as exc:  # noqa: BLE001
                     raise RuntimeError(f"Failed to load adapter from {adapter_path}") from exc
 
@@ -459,20 +489,23 @@ def load_role_session(
                 try:
                     from peft import prepare_model_for_kbit_training
 
-                    model = prepare_model_for_kbit_training(
-                        model,
+                    attempt_model = prepare_model_for_kbit_training(
+                        attempt_model,
                         use_gradient_checkpointing=gradient_checkpointing,
                     )
                 except Exception:
                     pass
 
-            if trainable and gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable()
+            if trainable and gradient_checkpointing and hasattr(attempt_model, "gradient_checkpointing_enable"):
+                attempt_model.gradient_checkpointing_enable()
+            model = attempt_model
             break
         except RuntimeError as exc:
             if not is_oom_error(exc):
                 raise
             last_exc = exc
+            if attempt_model is not None:
+                del attempt_model
             clear_cuda_memory()
             logger.warning(
                 "oom_model_load_retry",
@@ -482,6 +515,8 @@ def load_role_session(
             )
 
     if model is None:
+        del tokenizer
+        clear_cuda_memory()
         raise RuntimeError(f"Unable to load {role_name} model after OOM fallbacks: {last_exc}")
 
     logger.event(
