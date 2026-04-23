@@ -51,9 +51,22 @@ def build_quantization_config(mode: Optional[str]) -> Optional[BitsAndBytesConfi
 def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
     if not hardware.gpu_ids:
         return None
-    max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in hardware.gpu_ids}
+    target_gpu_ids = {int(gpu_id) for gpu_id in hardware.gpu_ids}
+    max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in target_gpu_ids}
+    if torch.cuda.is_available():
+        for gpu_id in range(torch.cuda.device_count()):
+            if gpu_id not in target_gpu_ids:
+                max_memory[gpu_id] = "0GiB"
     max_memory["cpu"] = f"{hardware.cpu_offload_gib}GiB"
     return max_memory
+
+
+def set_preferred_cuda_device(hardware: HardwareAllocation) -> None:
+    if not torch.cuda.is_available() or not hardware.gpu_ids:
+        return
+    preferred = int(hardware.gpu_ids[0])
+    if 0 <= preferred < torch.cuda.device_count():
+        torch.cuda.set_device(preferred)
 
 
 def render_chat_messages(
@@ -357,6 +370,7 @@ def load_role_session(
     trainable: bool = False,
     gradient_checkpointing: bool = False,
 ) -> RoleSession:
+    set_preferred_cuda_device(hardware)
     tokenizer = load_tokenizer(model_name_or_path, tokenizer_name_or_path)
     quant_cfg = build_quantization_config(quantization)
     kwargs: Dict[str, Any] = {
@@ -377,7 +391,9 @@ def load_role_session(
     load_attempts = [quantization]
     if quantization and str(quantization).lower() == "8bit":
         load_attempts.append("4bit")
-    load_attempts.append(None)
+    if not trainable or not quantization:
+        load_attempts.append(None)
+    load_attempts = list(dict.fromkeys(load_attempts))
 
     last_exc: Optional[BaseException] = None
     for mode in load_attempts:
@@ -527,6 +543,10 @@ class ModelPool:
     def load_socratic_trainable(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
         self.release_socratic()
+        if str(self.config.socratic.training_method).lower() == "dpo":
+            gradient_checkpointing = self.config.socratic.dpo.gradient_checkpointing
+        else:
+            gradient_checkpointing = self.config.socratic.grpo.gradient_checkpointing
         return load_role_session(
             role_name="socratic_train",
             model_name_or_path=source,
@@ -538,7 +558,7 @@ class ModelPool:
             logger=self.logger,
             adapter_path=adapter_path or self.config.socratic.base_adapter_path,
             trainable=True,
-            gradient_checkpointing=self.config.socratic.grpo.gradient_checkpointing,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
     def load_red_generation(

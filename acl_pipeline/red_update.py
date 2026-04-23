@@ -4,7 +4,7 @@ import inspect
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
@@ -130,17 +130,31 @@ def _build_sft_dataset(
     return Dataset.from_list(rows)
 
 
-def _canonical_prompt(prompt: Optional[str]) -> str:
-    return str(prompt or "").strip()
+def _normalize_topic(topic: str) -> str:
+    return " ".join(str(topic or "").lower().replace("_", " ").split())
 
 
-def _canonical_spec(spec: Optional[Dict[str, Any]]) -> str:
-    payload = dict(spec or {})
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True) if payload else ""
+def _is_already_correct_rejection(reason: Any) -> bool:
+    text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return "already_correct_code" in text or "already_correct" in text
 
 
-def _example_spec(example: RedTrainingExample) -> Optional[Dict[str, Any]]:
-    return dict(example.task.metadata.get("red_spec") or {}) or None
+def _rejected_example_is_already_correct(example: RedRejectedExample) -> bool:
+    if _is_already_correct_rejection(example.rejection_reason):
+        return True
+    metadata = dict(example.metadata or {})
+    if _is_already_correct_rejection(metadata.get("rejection_reason")):
+        return True
+    return str(metadata.get("execution_status") or "").strip().lower() == "passed"
+
+
+def _chosen_example_has_direct_already_correct_rejection(example: RedTrainingExample) -> bool:
+    metadata = dict(example.metadata or {})
+    return (
+        _is_already_correct_rejection(metadata.get("red_dpo_rejection_reason"))
+        or _is_already_correct_rejection(metadata.get("rejection_reason"))
+        or _is_already_correct_rejection(metadata.get("rejected_reason"))
+    )
 
 
 def _build_dpo_dataset(
@@ -148,66 +162,110 @@ def _build_dpo_dataset(
     rejected_examples: List[RedRejectedExample],
     *,
     limit: int,
-) -> Dataset:
-    prompt_index: Dict[str, List[RedTrainingExample]] = {}
-    prompt_spec_index: Dict[tuple[str, str], List[RedTrainingExample]] = {}
-
-    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
-        prompt_key = _canonical_prompt(example.prompt or example.task.metadata.get("red_prompt"))
-        if not prompt_key:
-            continue
-        prompt_index.setdefault(prompt_key, []).append(example)
-        spec_key = _canonical_spec(_example_spec(example))
-        if spec_key:
-            prompt_spec_index.setdefault((prompt_key, spec_key), []).append(example)
-
+) -> Tuple[Dataset, Dict[str, Any]]:
     rows: List[Dict[str, str]] = []
+    limit = max(0, int(limit))
+    if limit <= 0:
+        return Dataset.from_list(rows), {
+            "pairs": 0,
+            "direct_pairs": 0,
+            "topic_pairs": 0,
+            "already_correct_rejections": 0,
+            "topic_matches": {},
+        }
+
+    topic_index: Dict[str, List[RedTrainingExample]] = {}
+    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
+        topic_key = _normalize_topic(example.topic or example.task.topic)
+        if not topic_key:
+            continue
+        topic_index.setdefault(topic_key, []).append(example)
+
+    direct_pairs = 0
     for example in sorted(chosen_examples, key=lambda entry: entry.reward):
         rejected = str(example.rejected_completion or "").strip()
-        prompt = _canonical_prompt(example.prompt or example.task.metadata.get("red_prompt"))
-        if not prompt or not rejected or rejected == example.chosen_completion:
+        prompt = str(example.prompt or example.task.metadata.get("red_prompt") or "").strip()
+        chosen = str(example.chosen_completion or "").strip()
+        if (
+            not prompt
+            or not chosen
+            or not rejected
+            or rejected == chosen
+            or not _chosen_example_has_direct_already_correct_rejection(example)
+        ):
             continue
         rows.append(
             {
                 "prompt": prompt,
-                "chosen": example.chosen_completion,
-                "rejected": rejected,
-            }
-        )
-        if len(rows) >= limit:
-            return Dataset.from_list(rows)
-
-    for item in rejected_examples:
-        prompt_key = _canonical_prompt(item.prompt)
-        if not prompt_key:
-            continue
-        spec_key = _canonical_spec(item.spec)
-        if spec_key:
-            candidates = prompt_spec_index.get((prompt_key, spec_key), [])
-        else:
-            candidates = prompt_index.get(prompt_key, [])
-        if not candidates:
-            continue
-        chosen = str(candidates[0].chosen_completion or "").strip()
-        rejected = str(item.rejected_completion or "").strip()
-        if not chosen or not rejected or chosen == rejected:
-            continue
-        rows.append(
-            {
-                "prompt": prompt_key,
                 "chosen": chosen,
                 "rejected": rejected,
             }
         )
+        direct_pairs += 1
+        if len(rows) >= limit:
+            return Dataset.from_list(rows), {
+                "pairs": len(rows),
+                "direct_pairs": direct_pairs,
+                "topic_pairs": 0,
+                "already_correct_rejections": sum(1 for item in rejected_examples if _rejected_example_is_already_correct(item)),
+                "topic_matches": {},
+            }
+
+    already_correct_rejections = [item for item in rejected_examples if _rejected_example_is_already_correct(item)]
+    topic_offsets: Dict[str, int] = {}
+    topic_matches: Dict[str, int] = {}
+    topic_pairs = 0
+    seen_pairs = {
+        (row["prompt"], row["chosen"], row["rejected"])
+        for row in rows
+    }
+
+    for item in already_correct_rejections:
+        topic_key = _normalize_topic(item.topic)
+        if not topic_key:
+            continue
+        candidates = topic_index.get(topic_key, [])
+        if not candidates:
+            continue
+        offset = topic_offsets.get(topic_key, 0)
+        candidate = candidates[offset % len(candidates)]
+        topic_offsets[topic_key] = offset + 1
+        prompt = str(candidate.prompt or candidate.task.metadata.get("red_prompt") or "").strip()
+        chosen = str(candidate.chosen_completion or "").strip()
+        rejected = str(item.rejected_completion or "").strip()
+        pair_key = (prompt, chosen, rejected)
+        if not prompt or not chosen or not rejected or chosen == rejected or pair_key in seen_pairs:
+            continue
+        rows.append(
+            {
+                "prompt": prompt,
+                "chosen": chosen,
+                "rejected": rejected,
+            }
+        )
+        seen_pairs.add(pair_key)
+        topic_pairs += 1
+        topic_matches[topic_key] = topic_matches.get(topic_key, 0) + 1
         if len(rows) >= limit:
             break
 
-    return Dataset.from_list(rows)
+    return Dataset.from_list(rows), {
+        "pairs": len(rows),
+        "direct_pairs": direct_pairs,
+        "topic_pairs": topic_pairs,
+        "already_correct_rejections": len(already_correct_rejections),
+        "topic_matches": topic_matches,
+    }
 
 
 def _hard_or_low_reward_episode_examples(episodes: List[EpisodeRecord], *, limit: int) -> List[RedTrainingExample]:
     rows: List[RedTrainingExample] = []
-    for episode in sorted(episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
+    valid_episodes = [
+        episode
+        for episode in episodes
+        if episode.metadata.get("task_is_valid_for_socratic") is not False
+    ]
+    for episode in sorted(valid_episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
         weakness_summary = str(episode.metadata.get("weakness_summary") or "general weakness probing")
         rows.append(
             RedTrainingExample(
@@ -263,12 +321,17 @@ class RedUpdater:
 
         attempts = [
             {
-                "max_length": settings.max_length,
-                "per_device_batch_size": settings.per_device_batch_size,
+                "max_length": min(int(settings.max_length), 1536),
+                "per_device_batch_size": max(1, min(int(settings.per_device_batch_size), 1)),
                 "dpo_enabled": settings.dpo_enabled,
             },
             {
-                "max_length": max(512, settings.max_length // 2),
+                "max_length": max(512, min(int(settings.max_length), 1536) // 2),
+                "per_device_batch_size": 1,
+                "dpo_enabled": settings.dpo_enabled,
+            },
+            {
+                "max_length": max(512, min(int(settings.max_length), 1536) // 2),
                 "per_device_batch_size": 1,
                 "dpo_enabled": False,
             },
@@ -318,12 +381,28 @@ class RedUpdater:
                 trainer_kwargs = {key: value for key, value in trainer_kwargs.items() if key in trainer_sig}
                 sft_trainer = SFTTrainer(**trainer_kwargs)
                 sft_trainer.train()
+                model = sft_trainer.model
+                session.model = model
+                del sft_trainer
+                del sft_dataset
+                clear_cuda_memory()
 
+                dpo_pair_count = 0
+                dpo_stats: Dict[str, Any] = {}
                 if attempt["dpo_enabled"] and DPOTrainer is not None and DPOConfig is not None:
-                    dpo_dataset = _build_dpo_dataset(
+                    dpo_dataset, dpo_stats = _build_dpo_dataset(
                         chosen_examples,
                         rejected_examples,
                         limit=settings.max_dpo_pairs,
+                    )
+                    dpo_pair_count = len(dpo_dataset)
+                    self.logger.event(
+                        "red_dpo_dataset_built",
+                        step=step,
+                        attempt=attempt_index,
+                        max_length=attempt["max_length"],
+                        pairs=dpo_pair_count,
+                        stats=dpo_stats,
                     )
                     if len(dpo_dataset) > 0:
                         dpo_cfg_kwargs: Dict[str, Any] = {
@@ -338,6 +417,7 @@ class RedUpdater:
                             "logging_steps": int(settings.logging_steps),
                             "save_strategy": "no",
                             "report_to": "none",
+                            "gradient_checkpointing": True,
                             "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                             "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
                         }
@@ -356,6 +436,11 @@ class RedUpdater:
                         dpo_kwargs = {key: value for key, value in dpo_kwargs.items() if key in dpo_sig}
                         dpo_trainer = DPOTrainer(**dpo_kwargs)
                         dpo_trainer.train()
+                        model = dpo_trainer.model
+                        session.model = model
+                        del dpo_trainer
+                        del dpo_dataset
+                        clear_cuda_memory()
 
                 save_dir = self.storage.checkpoint_dir("red", step) / "adapter"
                 model.save_pretrained(str(save_dir))
@@ -368,8 +453,11 @@ class RedUpdater:
                     hard_examples=len(hard_examples),
                     chosen_examples=len(chosen_examples),
                     rejected_examples=len(rejected_examples),
+                    red_dpo_pairs=dpo_pair_count,
+                    red_dpo_stats=dpo_stats,
                     recent_episodes=len(recent_episodes),
                     attempt=attempt_index,
+                    max_length=attempt["max_length"],
                 )
                 return RedUpdateResult(adapter_path=str(save_dir))
             except RuntimeError as exc:

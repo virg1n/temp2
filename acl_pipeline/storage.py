@@ -5,7 +5,14 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .schemas import CurriculumState, EpisodeRecord, PythonTask, RedRejectedExample, RedTrainingExample
+from .schemas import (
+    CurriculumState,
+    EpisodeRecord,
+    PythonTask,
+    RedRejectedExample,
+    RedTrainingExample,
+    SocraticPreferenceExample,
+)
 
 
 class SimpleStorage:
@@ -23,6 +30,7 @@ class SimpleStorage:
         self.episodes_path = self.root_dir / "episodes.jsonl"
         self.hard_examples_path = self.root_dir / "hard_examples.jsonl"
         self.red_rejections_path = self.root_dir / "red_rejections.jsonl"
+        self.socratic_preferences_path = self.root_dir / "socratic_preferences.jsonl"
         self.pointers_path = self.state_dir / "pointers.json"
         self.curriculum_path = self.state_dir / "curriculum.json"
 
@@ -76,6 +84,24 @@ class SimpleStorage:
         if limit is not None:
             lines = lines[-int(limit) :]
         return [RedRejectedExample(**json.loads(line)) for line in lines]
+
+    def append_socratic_preference(self, example: SocraticPreferenceExample) -> None:
+        rows = self.load_socratic_preferences(limit=self.hard_buffer_max_size - 1)
+        rows.append(example)
+        with self.socratic_preferences_path.open("w", encoding="utf-8") as fh:
+            for row in rows[-self.hard_buffer_max_size :]:
+                fh.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+
+    def load_socratic_preferences(self, limit: Optional[int] = None) -> List[SocraticPreferenceExample]:
+        if not self.socratic_preferences_path.exists():
+            return []
+        lines = self.socratic_preferences_path.read_text(encoding="utf-8").splitlines()
+        if limit is not None:
+            limit_value = max(0, int(limit))
+            if limit_value <= 0:
+                return []
+            lines = lines[-limit_value:]
+        return [SocraticPreferenceExample.from_dict(json.loads(line)) for line in lines]
 
     def save_curriculum_state(self, state: CurriculumState) -> None:
         self.curriculum_path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")

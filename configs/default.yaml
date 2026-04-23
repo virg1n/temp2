@@ -14,6 +14,7 @@ task_execution:
   capture_max_chars: 1600
   min_code_lines_for_repair: 10
   probabilistic_repair_probability: 0.5
+  passed_task_keep_probability: 0.0
 
 storage:
   root_dir: ./runs/19_04
@@ -60,6 +61,9 @@ curriculum:
       weight: 1.0
 
 socratic:
+  # Choose "grpo" for online reward optimization or "dpo" for Judge-ranked
+  # preference learning over multiple sampled hints per task.
+  training_method: grpo
   model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model
   tokenizer_name_or_path:
   base_adapter_path:
@@ -97,6 +101,29 @@ socratic:
     max_prompt_length: 1536
     max_completion_length: 256
     num_generations: 4
+    logging_steps: 10
+    save_steps: 100
+    save_total_limit: 2
+    bf16: true
+    fp16: false
+    gradient_checkpointing: true
+    full_ft: false
+  dpo:
+    update_every_episodes: 4
+    min_preference_pairs_before_update: 8
+    max_training_pairs: 128
+    num_hint_candidates: 4
+    max_pairs_per_task: 2
+    min_score_gap: 0.5
+    learning_rate: 5.0e-6
+    epochs: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 4
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    beta: 0.1
+    max_length: 2048
+    max_prompt_length: 1536
     logging_steps: 10
     save_steps: 100
     save_total_limit: 2
@@ -144,7 +171,7 @@ red:
   base_adapter_path:
   quantization:
   generation_quantization: 8bit
-  update_quantization: 8bit
+  update_quantization: 4bit
   force_base_generation_after_iteration: 150
   enable_thinking: false
   hardware:
@@ -169,13 +196,13 @@ red:
     update_every_episodes: 8
     min_hard_examples: 4
     max_sft_examples: 256
-    max_dpo_pairs: 128
+    max_dpo_pairs: 64
     mining_bottom_fraction: 0.25
     learning_rate: 1.0e-4
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
-    max_length: 2048
+    max_length: 1536
     logging_steps: 10
     dpo_enabled: true
     dpo_beta: 0.1

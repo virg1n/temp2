@@ -137,6 +137,8 @@ _PASS_PATTERNS = [
         r"\bprogram (?:exited|runs?) successfully\b",
         r"\bdoes not reproduce (?:the |a )?bug\b",
         r"\bnothing is failing\b",
+        r"\bno (?:errors?|exceptions?|failures?)\b",
+        r"\bthere (?:is|are) no (?:errors?|exceptions?|failures?|failing assertions?)\b",
     )
 ]
 _MALFORMED_PATTERNS = [
@@ -376,18 +378,28 @@ def _execution_error_matches_intended_bug(task: Optional[PythonTask], execution_
     return any(pattern.search(signal) for pattern in patterns)
 
 
-def _build_row(prompt_text: str, completion: str) -> Dict[str, Any]:
+def _build_row(prompt_text: str, completion: str, task: Optional[PythonTask] = None) -> Dict[str, Any]:
     sections = _extract_prompt_sections(prompt_text)
     task_match = _TASK_SECTION_RE.search(str(prompt_text or ""))
     error_text = sections.get("error", "")
     execution_status = _infer_execution_status(error_text)
-    return {
+    row = {
         "statement": task_match.group("body").strip() if task_match else sections.get("task", ""),
         "code": sections.get("code", ""),
         "observed_failure": error_text,
         "execution_status": execution_status,
         "assistant_response": completion[:1800],
     }
+    if task is not None:
+        spec = dict(task.metadata.get("red_spec") or {})
+        row["red_spec"] = {
+            "topic": spec.get("topic", task.topic),
+            "target_function": spec.get("target_function", ""),
+            "intended_bug": spec.get("intended_bug", ""),
+            "expected_first_failure": spec.get("expected_first_failure", ""),
+            "metadata": dict(spec.get("metadata") or {}),
+        }
+    return row
 
 
 def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -542,9 +554,6 @@ class JudgeService:
 
         related_error = _execution_error_matches_intended_bug(task, str(row.get("execution_status") or ""))
         if related_error is False:
-            gate["skip_llm"] = True
-            gate["forced_criteria"] = dict(zero_criteria)
-            gate["forced_score"] = 0.0
             gate["task_quality_override"] = 2.0
             gate["force_task_valid"] = False
             gate["red_rejection_reason"] = f"unrelated_{row['execution_status']}"
@@ -575,19 +584,8 @@ class JudgeService:
             gate["red_rejection_reason"] = "already_correct_code"
             gate["reasons"].append("task_invalid:already_correct_code")
 
-        if row.get("execution_status") == "passed" and not pass_aware and gate["forced_score"] is None:
-            gate["skip_llm"] = True
-            gate["forced_criteria"] = {
-                "no_solution_reveal": 10.0,
-                "bug_localization": 0.0,
-                "usefulness": 0.0,
-                "socratic_style": 1.0 if "?" in hint_text else 0.0,
-                "technical_accuracy": 0.0,
-            }
-            gate["forced_score"] = _PASSED_EXECUTION_REWARD
-            gate["force_hint_valid"] = False
-            gate["hint_rejection_reason"] = "missed_passed_execution"
-            gate["reasons"].append("hint_capped:missed_passed_execution")
+        if row.get("execution_status") == "passed" and not pass_aware:
+            gate["reasons"].append("hint_review:missed_passed_execution")
 
         return gate
 
@@ -703,10 +701,13 @@ class JudgeService:
         if not prompt_texts:
             return []
 
-        rows = [_build_row(prompt, completion) for prompt, completion in zip(prompt_texts, completions)]
         task_items: List[Optional[PythonTask]] = list(tasks or [])
-        if len(task_items) < len(rows):
-            task_items.extend([None] * (len(rows) - len(task_items)))
+        if len(task_items) < len(prompt_texts):
+            task_items.extend([None] * (len(prompt_texts) - len(task_items)))
+        rows = [
+            _build_row(prompt, completion, task)
+            for prompt, completion, task in zip(prompt_texts, completions, task_items)
+        ]
         corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
         quality_features = [_hint_quality_features(row) for row in rows]
         hard_gates = [
@@ -799,7 +800,7 @@ class JudgeService:
                 "task_quality": assessment["task_quality"],
                 "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
                 "hint_is_valid_for_socratic": assessment["hint_is_valid_for_socratic"],
-                "use_for_socratic": assessment["task_is_valid_for_socratic"] and assessment["hint_is_valid_for_socratic"],
+                "use_for_socratic": assessment["hint_is_valid_for_socratic"],
                 "red_rejection_reason": assessment["red_rejection_reason"],
                 "hint_rejection_reason": assessment["hint_rejection_reason"],
                 "hint_corruption": corruption,
@@ -830,6 +831,106 @@ class JudgeService:
         )
         return [float(item["adjusted_score"]) for item in details]
 
+    def _output_from_details(self, task: PythonTask, hint: SocraticHint, details: Dict[str, Any]) -> JudgeOutput:
+        raw_score = float(details["raw_score"])
+        adjusted_score = float(details["adjusted_score"])
+        return JudgeOutput(
+            task_id=task.task_id,
+            score=raw_score,
+            normalized_reward=adjusted_score / 10.0,
+            raw_text=str(details["raw_response"]),
+            criteria_scores=dict(details["criteria_scores"]),
+            metadata={
+                "topic": task.topic,
+                "raw_score": raw_score,
+                "adjusted_score": adjusted_score,
+                "task_quality": float(details["task_quality"]),
+                "task_is_valid_for_socratic": bool(details["task_is_valid_for_socratic"]),
+                "hint_is_valid_for_socratic": bool(details["hint_is_valid_for_socratic"]),
+                "use_for_socratic": bool(details["use_for_socratic"]),
+                "red_rejection_reason": str(details["red_rejection_reason"]),
+                "hint_rejection_reason": str(details["hint_rejection_reason"]),
+                "hint_corruption": dict(details["hint_corruption"]),
+                "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
+                "hint_clean_text": hint.text,
+                "local_tiebreak": dict(details["local_tiebreak"]),
+            },
+        )
+
+    def rank_hint_candidates(
+        self,
+        tasks: List[PythonTask],
+        hint_groups: List[List[SocraticHint]],
+        *,
+        apply_group_spread: bool = True,
+    ) -> List[List[Dict[str, Any]]]:
+        if len(tasks) != len(hint_groups):
+            raise ValueError("tasks and hint_groups must have the same length")
+        if not tasks:
+            return []
+
+        flat_tasks: List[PythonTask] = []
+        flat_hints: List[SocraticHint] = []
+        group_sizes: List[int] = []
+        for task, hints in zip(tasks, hint_groups):
+            usable_hints = list(hints)
+            group_sizes.append(len(usable_hints))
+            for hint in usable_hints:
+                flat_tasks.append(task)
+                flat_hints.append(hint)
+
+        if not flat_hints:
+            return [[] for _ in tasks]
+
+        prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in flat_tasks]
+        hint_texts = [hint.raw_text or hint.text for hint in flat_hints]
+        details_list = self.score_pair_details(
+            prompt_texts,
+            hint_texts,
+            apply_batch_spread=False,
+            tasks=flat_tasks,
+        )
+
+        ranked_groups: List[List[Dict[str, Any]]] = []
+        offset = 0
+        for task, group_size in zip(tasks, group_sizes):
+            group_hints = flat_hints[offset : offset + group_size]
+            group_details = [dict(item) for item in details_list[offset : offset + group_size]]
+            offset += group_size
+
+            if apply_group_spread and len(group_details) > 1:
+                adjusted_scores = self._apply_batch_spread([float(item["raw_score"]) for item in group_details])
+                for details, adjusted_score in zip(group_details, adjusted_scores):
+                    details["adjusted_score"] = adjusted_score
+
+            ranked: List[Dict[str, Any]] = []
+            for candidate_index, (hint, details) in enumerate(zip(group_hints, group_details)):
+                judge = self._output_from_details(task, hint, details)
+                judge.metadata["candidate_index"] = int(hint.metadata.get("candidate_index", candidate_index))
+                ranked.append(
+                    {
+                        "hint": hint,
+                        "judge": judge,
+                        "candidate_index": int(hint.metadata.get("candidate_index", candidate_index)),
+                    }
+                )
+
+            ranked.sort(
+                key=lambda item: (
+                    bool(item["judge"].metadata.get("task_is_valid_for_socratic", True)),
+                    bool(item["judge"].metadata.get("hint_is_valid_for_socratic", True)),
+                    float(item["judge"].metadata.get("adjusted_score") or 0.0),
+                    float(item["judge"].score),
+                ),
+                reverse=True,
+            )
+            for rank, item in enumerate(ranked):
+                item["rank"] = rank
+                item["judge"].metadata["candidate_rank"] = rank
+            ranked_groups.append(ranked)
+
+        return ranked_groups
+
     def evaluate(self, task: PythonTask, hint_text: str) -> JudgeOutput:
         hint = SocraticHint(task_id=task.task_id, text=hint_text, raw_text=hint_text)
         return self.evaluate_batch([task], [hint], apply_batch_spread=False)[0]
@@ -853,30 +954,7 @@ class JudgeService:
         )
         outputs: List[JudgeOutput] = []
         for task, hint, details in zip(tasks, hints, details_list):
-            raw_score = float(details["raw_score"])
-            adjusted_score = float(details["adjusted_score"])
-            judge = JudgeOutput(
-                task_id=task.task_id,
-                score=raw_score,
-                normalized_reward=adjusted_score / 10.0,
-                raw_text=str(details["raw_response"]),
-                criteria_scores=dict(details["criteria_scores"]),
-                metadata={
-                    "topic": task.topic,
-                    "raw_score": raw_score,
-                    "adjusted_score": adjusted_score,
-                    "task_quality": float(details["task_quality"]),
-                    "task_is_valid_for_socratic": bool(details["task_is_valid_for_socratic"]),
-                    "hint_is_valid_for_socratic": bool(details["hint_is_valid_for_socratic"]),
-                    "use_for_socratic": bool(details["use_for_socratic"]),
-                    "red_rejection_reason": str(details["red_rejection_reason"]),
-                    "hint_rejection_reason": str(details["hint_rejection_reason"]),
-                    "hint_corruption": dict(details["hint_corruption"]),
-                    "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
-                    "hint_clean_text": hint.text,
-                    "local_tiebreak": dict(details["local_tiebreak"]),
-                },
-            )
+            judge = self._output_from_details(task, hint, details)
             self.logger.debug_dump("judge_eval", task=task, judge=judge)
             outputs.append(judge)
         return outputs

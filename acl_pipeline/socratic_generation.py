@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 from .logging_utils import StructuredLogger
 from .prompts import build_socratic_messages
@@ -29,18 +29,33 @@ def sanitize_socratic_text(text: str) -> str:
 
 
 def generate_socratic_hint(session: RoleSession, task: PythonTask, logger: StructuredLogger) -> SocraticHint:
-    raw = session.generate([build_socratic_messages(task)])[0]
-    cleaned = sanitize_socratic_text(raw)
-    corruption = detect_corrupted_hint_text(raw)
-    hint = SocraticHint(
-        task_id=task.task_id,
-        text=cleaned,
-        raw_text=raw,
-        metadata={
-            "topic": task.topic,
-            "is_corrupted": corruption["is_corrupted"],
-            "corruption_reasons": corruption["reasons"],
-        },
-    )
-    logger.debug_dump("socratic_hint", task=task, hint=hint)
-    return hint
+    return generate_socratic_hints(session, task, count=1, logger=logger)[0]
+
+
+def generate_socratic_hints(
+    session: RoleSession,
+    task: PythonTask,
+    *,
+    count: int,
+    logger: StructuredLogger,
+) -> List[SocraticHint]:
+    messages = build_socratic_messages(task)
+    raw_outputs = session.generate([messages for _ in range(max(1, int(count)))])
+    hints: List[SocraticHint] = []
+    for candidate_index, raw in enumerate(raw_outputs):
+        cleaned = sanitize_socratic_text(raw)
+        corruption = detect_corrupted_hint_text(raw)
+        hint = SocraticHint(
+            task_id=task.task_id,
+            text=cleaned,
+            raw_text=raw,
+            metadata={
+                "topic": task.topic,
+                "candidate_index": candidate_index,
+                "is_corrupted": corruption["is_corrupted"],
+                "corruption_reasons": corruption["reasons"],
+            },
+        )
+        logger.debug_dump("socratic_hint", task=task, hint=hint)
+        hints.append(hint)
+    return hints

@@ -26,6 +26,7 @@ class TaskExecutionConfig:
     capture_max_chars: int = 1600
     min_code_lines_for_repair: int = 15
     probabilistic_repair_probability: float = 0.5
+    passed_task_keep_probability: float = 0.0
 
 
 @dataclass
@@ -96,17 +97,43 @@ class SocraticGrpoSettings:
 
 
 @dataclass
+class SocraticDpoSettings:
+    update_every_episodes: int = 8
+    min_preference_pairs_before_update: int = 8
+    max_training_pairs: int = 128
+    num_hint_candidates: int = 4
+    max_pairs_per_task: int = 2
+    min_score_gap: float = 0.5
+    learning_rate: float = 5e-6
+    epochs: int = 1
+    per_device_batch_size: int = 1
+    gradient_accumulation_steps: int = 4
+    warmup_ratio: float = 0.03
+    weight_decay: float = 0.0
+    beta: float = 0.1
+    max_length: int = 2048
+    max_prompt_length: int = 1536
+    logging_steps: int = 10
+    save_steps: int = 100
+    save_total_limit: int = 2
+    bf16: bool = True
+    fp16: bool = False
+    gradient_checkpointing: bool = True
+    full_ft: bool = False
+
+
+@dataclass
 class RedUpdateSettings:
     update_every_episodes: int = 12
     min_hard_examples: int = 8
     max_sft_examples: int = 256
-    max_dpo_pairs: int = 128
+    max_dpo_pairs: int = 64
     mining_bottom_fraction: float = 0.25
     learning_rate: float = 5e-5
     epochs: int = 1
     per_device_batch_size: int = 1
     gradient_accumulation_steps: int = 8
-    max_length: int = 2048
+    max_length: int = 1536
     logging_steps: int = 10
     dpo_enabled: bool = True
     dpo_beta: float = 0.1
@@ -126,7 +153,9 @@ class RoleConfig:
 
 @dataclass
 class SocraticConfig(RoleConfig):
+    training_method: str = "grpo"
     grpo: SocraticGrpoSettings = field(default_factory=SocraticGrpoSettings)
+    dpo: SocraticDpoSettings = field(default_factory=SocraticDpoSettings)
 
 
 @dataclass
@@ -253,19 +282,47 @@ def _socratic_grpo(payload: Optional[Dict[str, Any]]) -> SocraticGrpoSettings:
     )
 
 
+def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
+    payload = dict(payload or {})
+    return SocraticDpoSettings(
+        update_every_episodes=int(payload.get("update_every_episodes", 8)),
+        min_preference_pairs_before_update=int(payload.get("min_preference_pairs_before_update", 8)),
+        max_training_pairs=int(payload.get("max_training_pairs", 128)),
+        num_hint_candidates=int(payload.get("num_hint_candidates", 4)),
+        max_pairs_per_task=int(payload.get("max_pairs_per_task", 2)),
+        min_score_gap=float(payload.get("min_score_gap", 0.5)),
+        learning_rate=float(payload.get("learning_rate", 5e-6)),
+        epochs=int(payload.get("epochs", 1)),
+        per_device_batch_size=int(payload.get("per_device_batch_size", 1)),
+        gradient_accumulation_steps=int(payload.get("gradient_accumulation_steps", 4)),
+        warmup_ratio=float(payload.get("warmup_ratio", 0.03)),
+        weight_decay=float(payload.get("weight_decay", 0.0)),
+        beta=float(payload.get("beta", 0.1)),
+        max_length=int(payload.get("max_length", 2048)),
+        max_prompt_length=int(payload.get("max_prompt_length", 1536)),
+        logging_steps=int(payload.get("logging_steps", 10)),
+        save_steps=int(payload.get("save_steps", 100)),
+        save_total_limit=int(payload.get("save_total_limit", 2)),
+        bf16=bool(payload.get("bf16", True)),
+        fp16=bool(payload.get("fp16", False)),
+        gradient_checkpointing=bool(payload.get("gradient_checkpointing", True)),
+        full_ft=bool(payload.get("full_ft", False)),
+    )
+
+
 def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
     payload = dict(payload or {})
     return RedUpdateSettings(
         update_every_episodes=int(payload.get("update_every_episodes", 12)),
         min_hard_examples=int(payload.get("min_hard_examples", 8)),
         max_sft_examples=int(payload.get("max_sft_examples", 256)),
-        max_dpo_pairs=int(payload.get("max_dpo_pairs", 128)),
+        max_dpo_pairs=int(payload.get("max_dpo_pairs", 64)),
         mining_bottom_fraction=float(payload.get("mining_bottom_fraction", 0.25)),
         learning_rate=float(payload.get("learning_rate", 5e-5)),
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),
         gradient_accumulation_steps=int(payload.get("gradient_accumulation_steps", 8)),
-        max_length=int(payload.get("max_length", 2048)),
+        max_length=int(payload.get("max_length", 1536)),
         logging_steps=int(payload.get("logging_steps", 10)),
         dpo_enabled=bool(payload.get("dpo_enabled", True)),
         dpo_beta=float(payload.get("dpo_beta", 0.1)),
@@ -287,6 +344,9 @@ def _role(payload: Dict[str, Any]) -> RoleConfig:
 
 def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
     base = _role(payload)
+    training_method = str(payload.get("training_method", "grpo")).strip().lower()
+    if training_method not in {"grpo", "dpo"}:
+        raise ValueError("socratic.training_method must be either 'grpo' or 'dpo'")
     return SocraticConfig(
         model_name_or_path=base.model_name_or_path,
         tokenizer_name_or_path=base.tokenizer_name_or_path,
@@ -296,7 +356,9 @@ def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
         hardware=base.hardware,
         generation=base.generation,
         lora=base.lora,
+        training_method=training_method,
         grpo=_socratic_grpo(payload.get("grpo")),
+        dpo=_socratic_dpo(payload.get("dpo")),
     )
 
 
@@ -376,6 +438,7 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
         capture_max_chars=int(task_execution_raw.get("capture_max_chars", 1600)),
         min_code_lines_for_repair=int(task_execution_raw.get("min_code_lines_for_repair", 15)),
         probabilistic_repair_probability=float(task_execution_raw.get("probabilistic_repair_probability", 0.5)),
+        passed_task_keep_probability=float(task_execution_raw.get("passed_task_keep_probability", 0.0)),
     )
 
     storage = StorageConfig(

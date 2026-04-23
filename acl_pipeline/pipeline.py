@@ -17,8 +17,9 @@ from .prompts import (
 )
 from .red_generation import RedTaskGenerator
 from .red_update import RedUpdater, serialize_task_json
-from .schemas import EpisodeRecord, RedRejectedExample, RedTaskSpec, RedTrainingExample
-from .socratic_generation import generate_socratic_hint
+from .schemas import EpisodeRecord, RedRejectedExample, RedTaskSpec, RedTrainingExample, SocraticPreferenceExample
+from .socratic_dpo import SocraticDpoUpdater
+from .socratic_generation import generate_socratic_hint, generate_socratic_hints
 from .socratic_grpo import SocraticGrpoUpdater
 from .storage import SimpleStorage
 from .task_execution import execute_task
@@ -46,9 +47,11 @@ class AdversarialCurriculumPipeline:
         self.judge = JudgeService(self.model_pool, self.logger)
         self.red_generator = RedTaskGenerator(self.logger)
         self.red_updater = RedUpdater(config, self.model_pool, self.storage, self.logger)
-        self.socratic_updater = SocraticGrpoUpdater(config, self.model_pool, self.judge, self.storage, self.logger)
+        self.socratic_grpo_updater = SocraticGrpoUpdater(config, self.model_pool, self.judge, self.storage, self.logger)
+        self.socratic_dpo_updater = SocraticDpoUpdater(config, self.model_pool, self.storage, self.logger)
         self.rng = random.Random(config.runtime.seed)
         self._red_adapter_failed_last_iteration = False
+        self._red_rejections_by_iteration: Dict[int, List[RedRejectedExample]] = {}
 
         pointers = self.storage.load_pointers()
         self.completed_iterations = int(pointers.get("completed_iterations") or 0)
@@ -74,6 +77,12 @@ class AdversarialCurriculumPipeline:
     def _using_uniform_curriculum(self, iteration_index: int) -> bool:
         cutoff = self._curriculum_adaptation_cutoff_iteration()
         return cutoff > 0 and iteration_index > cutoff
+
+    def _socratic_training_method(self) -> str:
+        return str(self.config.socratic.training_method or "grpo").strip().lower()
+
+    def _using_socratic_dpo(self) -> bool:
+        return self._socratic_training_method() == "dpo"
 
     def _effective_red_generation_adapter(self, iteration_index: int) -> Optional[str]:
         if self._using_base_red_generation(iteration_index):
@@ -107,6 +116,10 @@ class AdversarialCurriculumPipeline:
     def _normalize_topic(self, topic: str) -> str:
         return " ".join(str(topic).lower().replace("_", " ").split())
 
+    def _is_already_correct_red_rejection(self, reason: Any) -> bool:
+        text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return "already_correct_code" in text or "already_correct" in text
+
     def _task_spec_from_metadata(self, task) -> Optional[RedTaskSpec]:
         payload = dict(task.metadata.get("red_spec") or {})
         if not payload:
@@ -135,10 +148,14 @@ class AdversarialCurriculumPipeline:
         spec: Optional[RedTaskSpec] = None,
         task_quality: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
+        iteration_index: Optional[int] = None,
+    ) -> Optional[RedRejectedExample]:
         completion = str(rejected_completion or "").strip()
         if not completion:
-            return
+            return None
+        example_metadata = dict(metadata or {})
+        if iteration_index is not None:
+            example_metadata["iteration"] = iteration_index
         example = RedRejectedExample(
             example_id=uuid4().hex[:16],
             topic=topic,
@@ -147,15 +164,18 @@ class AdversarialCurriculumPipeline:
             rejection_reason=rejection_reason,
             task_quality=task_quality,
             spec=spec.to_dict() if spec is not None else None,
-            metadata=dict(metadata or {}),
+            metadata=example_metadata,
         )
         self.storage.append_red_rejected_example(example)
+        if iteration_index is not None:
+            self._red_rejections_by_iteration.setdefault(iteration_index, []).append(example)
         self.logger.warning(
             "red_rejected_example_added",
             topic=topic,
             rejection_reason=rejection_reason,
             task_quality=task_quality,
         )
+        return example
 
     def _candidate_rejection_reasons(
         self,
@@ -174,9 +194,31 @@ class AdversarialCurriculumPipeline:
                 reasons.append("too short")
 
         if execution_result is not None and execution_result.status == "passed":
-            if self.rng.random() < repair_probability:
+            keep_probability = max(0.0, min(1.0, float(self.config.task_execution.passed_task_keep_probability)))
+            if self.rng.random() >= keep_probability:
                 reasons.append("already correct code, there are no errors in asserts")
         return reasons
+
+    def _validate_request_item(self, item: Dict[str, Any]) -> Tuple[Optional[Any], List[str]]:
+        task = item.get("task")
+        execution = None
+        rejection_reasons: List[str] = []
+        if task is None:
+            return execution, rejection_reasons
+        if self.config.task_execution.enabled:
+            execution = execute_task(task, self.config.task_execution)
+            self._attach_execution(task, execution)
+        rejection_reasons.extend(
+            self._candidate_rejection_reasons(
+                requested_topic=str(item["topic"]),
+                task=task,
+                execution_result=execution,
+            )
+        )
+        rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
+        item["validation_execution"] = execution
+        item["validation_reasons"] = rejection_reasons
+        return execution, rejection_reasons
 
     def _red_effective_batch_size(self, item_count: int) -> int:
         configured = max(1, int(self.config.red.generation.batch_size))
@@ -226,7 +268,12 @@ class AdversarialCurriculumPipeline:
             "validation_execution": None,
         }
 
-    def _generate_red_tasks_batch(self, red_session, requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _generate_red_tasks_batch(
+        self,
+        red_session,
+        requests: List[Dict[str, Any]],
+        iteration_index: int,
+    ) -> List[Dict[str, Any]]:
         generated: List[Dict[str, Any]] = []
         max_attempts = int(self.config.task_execution.max_red_generation_attempts)
         for attempt in range(1, max_attempts + 1):
@@ -269,6 +316,7 @@ class AdversarialCurriculumPipeline:
                         "weakness_summary": weakness_summary,
                         "execution_status": None,
                     },
+                    iteration_index=iteration_index,
                 )
                 self.logger.warning(
                     "red_task_repair_requested",
@@ -296,22 +344,29 @@ class AdversarialCurriculumPipeline:
             task = item.get("task")
             if task is None:
                 continue
-            execution = None
-            rejection_reasons: List[str] = []
-            if self.config.task_execution.enabled:
-                execution = execute_task(task, self.config.task_execution)
-                self._attach_execution(task, execution)
-            rejection_reasons.extend(
-                self._candidate_rejection_reasons(
-                    requested_topic=str(item["topic"]),
-                    task=task,
-                    execution_result=execution,
-                )
-            )
-            rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
-            item["validation_execution"] = execution
-            item["validation_reasons"] = rejection_reasons
+            _, rejection_reasons = self._validate_request_item(item)
             if rejection_reasons:
+                if any(self._is_already_correct_red_rejection(reason) for reason in rejection_reasons):
+                    spec = self._task_spec_from_metadata(task)
+                    self._record_red_rejection(
+                        topic=str(item["topic"]),
+                        prompt=str(item.get("task_prompt") or task.metadata.get("red_prompt") or ""),
+                        rejected_completion=serialize_task_json(task),
+                        rejection_reason="already_correct_code",
+                        spec=spec,
+                        metadata={
+                            "stage": "validation",
+                            "weakness_summary": item.get("weakness_summary"),
+                            "validation_reasons": list(rejection_reasons),
+                            "execution_status": (
+                                item["validation_execution"].status
+                                if item.get("validation_execution") is not None
+                                else None
+                            ),
+                            "observed_failure": task.observed_failure(),
+                        },
+                        iteration_index=iteration_index,
+                    )
                 invalid.append(item)
             else:
                 valid.append(item)
@@ -327,7 +382,7 @@ class AdversarialCurriculumPipeline:
         )
         return valid, invalid
 
-    def _repair_generated_requests_without_revalidation(
+    def _repair_generated_requests_with_revalidation(
         self,
         red_session,
         requests: List[Dict[str, Any]],
@@ -365,26 +420,56 @@ class AdversarialCurriculumPipeline:
                     if repaired_task is not None and not parse_reasons:
                         repaired_task.metadata["red_prompt"] = str(item["task_prompt"])
                         repaired_task.metadata["weakness_summary"] = str(item["weakness_summary"])
-                        repaired_task.metadata["accepted_without_revalidation"] = True
                         repaired_task.metadata["pre_repair_validation_reasons"] = list(item.get("validation_reasons") or [])
                         repaired_task.metadata["pre_repair_execution"] = (
                             item["validation_execution"].to_dict()
                             if item.get("validation_execution") is not None
                             else None
                         )
-                        if "execution" not in repaired_task.metadata and item.get("validation_execution") is not None:
-                            repaired_task.metadata["execution"] = item["validation_execution"].to_dict()
-                            repaired_task.metadata["execution_status"] = item["validation_execution"].status
-                            repaired_task.metadata["observed_failure"] = item["validation_execution"].error_message
                         item["task"] = repaired_task
-                        accepted.append(item)
+                        item["messages"].append({"role": "assistant", "content": raw})
+                        _, validation_reasons = self._validate_request_item(item)
+                        if not validation_reasons:
+                            repaired_task.metadata["accepted_after_revalidation"] = True
+                            accepted.append(item)
+                            self.logger.event(
+                                "red_task_repaired_after_revalidation",
+                                iteration=iteration_index,
+                                topic=topic,
+                                prior_rejection_reasons=repaired_task.metadata.get("pre_repair_validation_reasons"),
+                                attempt=attempt,
+                                execution_status=repaired_task.metadata.get("execution_status"),
+                            )
+                            continue
+
+                        spec = self._task_spec_from_metadata(repaired_task)
+                        self._record_red_rejection(
+                            topic=topic,
+                            prompt=str(item["task_prompt"]),
+                            rejected_completion=raw,
+                            rejection_reason=", ".join(validation_reasons),
+                            spec=spec,
+                            metadata={
+                                "stage": "task_repair_final_validation",
+                                "attempt": attempt,
+                                "weakness_summary": item["weakness_summary"],
+                                "execution_status": (
+                                    item["validation_execution"].status
+                                    if item.get("validation_execution") is not None
+                                    else None
+                                ),
+                            },
+                            iteration_index=iteration_index,
+                        )
                         self.logger.warning(
-                            "red_task_repaired_without_revalidation",
+                            "red_task_repair_retry_requested",
                             iteration=iteration_index,
                             topic=topic,
-                            prior_rejection_reasons=item.get("validation_reasons"),
                             attempt=attempt,
+                            rejection_reasons=validation_reasons,
                         )
+                        item["messages"].append(build_red_repair_message(topic, validation_reasons))
+                        next_pending.append(item)
                         continue
 
                     parse_reasons = list(dict.fromkeys(reason for reason in parse_reasons if reason))
@@ -399,6 +484,7 @@ class AdversarialCurriculumPipeline:
                             "attempt": attempt,
                             "weakness_summary": item["weakness_summary"],
                         },
+                        iteration_index=iteration_index,
                     )
                     self.logger.warning(
                         "red_task_repair_retry_requested",
@@ -413,16 +499,11 @@ class AdversarialCurriculumPipeline:
 
         for item in pending:
             self.logger.warning(
-                "red_task_repair_failed_keep_original",
+                "red_task_repair_failed_drop_original",
                 iteration=iteration_index,
                 topic=item["topic"],
                 validation_reasons=item.get("validation_reasons"),
             )
-            original_task = item.get("task")
-            if original_task is not None:
-                original_task.metadata["accepted_without_revalidation"] = False
-                original_task.metadata["repair_failed_after_validation"] = True
-                accepted.append(item)
 
         return accepted
 
@@ -438,27 +519,78 @@ class AdversarialCurriculumPipeline:
             task=episode.task,
             metadata={
                 "episode_id": episode.episode_id,
+                "iteration": episode.metadata.get("iteration"),
                 "socratic_score": episode.judge.score,
                 "weakness_summary": weakness_summary,
                 "observed_failure": episode.task.observed_failure(),
             },
         )
 
-    def _store_hard_examples_for_batch(self, batch_records: List[EpisodeRecord]) -> None:
-        if not batch_records:
+    def _matching_already_correct_rejection(
+        self,
+        *,
+        episode: EpisodeRecord,
+        iteration_index: int,
+    ) -> Optional[RedRejectedExample]:
+        topic_key = self._normalize_topic(episode.topic)
+        for rejected in self._red_rejections_by_iteration.get(iteration_index, []):
+            if self._normalize_topic(rejected.topic) != topic_key:
+                continue
+            if self._is_already_correct_red_rejection(rejected.rejection_reason):
+                return rejected
+            metadata = dict(rejected.metadata or {})
+            if self._is_already_correct_red_rejection(metadata.get("rejection_reason")):
+                return rejected
+            if str(metadata.get("execution_status") or "").strip().lower() == "passed":
+                return rejected
+        return None
+
+    def _attach_red_dpo_rejection(
+        self,
+        example: RedTrainingExample,
+        rejected: Optional[RedRejectedExample],
+    ) -> None:
+        if rejected is None:
+            return
+        rejected_completion = str(rejected.rejected_completion or "").strip()
+        if not rejected_completion or rejected_completion == str(example.chosen_completion or "").strip():
+            return
+        example.rejected_completion = rejected_completion
+        example.metadata.update(
+            {
+                "red_dpo_rejection_id": rejected.example_id,
+                "red_dpo_rejection_reason": rejected.rejection_reason,
+                "red_dpo_rejection_stage": dict(rejected.metadata or {}).get("stage"),
+                "red_dpo_pairing": "same_iteration_topic_already_correct",
+            }
+        )
+
+    def _store_hard_examples_for_batch(self, batch_records: List[EpisodeRecord], iteration_index: int) -> None:
+        valid_records = [
+            episode
+            for episode in batch_records
+            if bool(episode.metadata.get("task_is_valid_for_socratic", True))
+        ]
+        if not valid_records:
             return
         bottom_fraction = float(self.config.red.update.mining_bottom_fraction)
-        keep_count = max(1, math.ceil(len(batch_records) * bottom_fraction))
-        selected = sorted(batch_records, key=lambda episode: episode.judge.normalized_reward)[:keep_count]
+        keep_count = max(1, math.ceil(len(valid_records) * bottom_fraction))
+        selected = sorted(valid_records, key=lambda episode: episode.judge.normalized_reward)[:keep_count]
         self.logger.event(
             "hard_example_batch_selection",
             selected_episode_ids=[episode.episode_id for episode in selected],
             selected_rewards=[episode.judge.normalized_reward for episode in selected],
             batch_episode_ids=[episode.episode_id for episode in batch_records],
+            red_trainable_episode_ids=[episode.episode_id for episode in valid_records],
         )
         for episode in selected:
             weakness_summary = str(episode.metadata.get("weakness_summary") or "")
             example = self._build_hard_example(episode, weakness_summary)
+            matched_rejection = self._matching_already_correct_rejection(
+                episode=episode,
+                iteration_index=iteration_index,
+            )
+            self._attach_red_dpo_rejection(example, matched_rejection)
             self.storage.append_hard_example(example)
             self.logger.event(
                 "hard_example_added",
@@ -466,7 +598,95 @@ class AdversarialCurriculumPipeline:
                 topic=episode.topic,
                 reward=episode.judge.normalized_reward,
                 batch_bottom_fraction=bottom_fraction,
+                red_dpo_rejection_id=example.metadata.get("red_dpo_rejection_id"),
+                red_dpo_pairing=example.metadata.get("red_dpo_pairing"),
             )
+
+    def _store_socratic_preferences_for_ranked_candidates(
+        self,
+        *,
+        item: Dict[str, Any],
+        episode_id: int,
+        iteration_index: int,
+    ) -> int:
+        if not self._using_socratic_dpo():
+            return 0
+        ranked = list(item.get("hint_candidate_rankings") or [])
+        if len(ranked) < 2:
+            return 0
+
+        task = item["task"]
+        valid_ranked = [
+            candidate
+            for candidate in ranked
+            if bool(candidate["judge"].metadata.get("task_is_valid_for_socratic", True))
+        ]
+        if not valid_ranked:
+            return 0
+
+        chosen = None
+        for candidate in valid_ranked:
+            if bool(candidate["judge"].metadata.get("hint_is_valid_for_socratic", True)):
+                chosen = candidate
+                break
+        if chosen is None:
+            return 0
+
+        settings = self.config.socratic.dpo
+        chosen_score = float(chosen["judge"].metadata.get("adjusted_score") or chosen["judge"].score)
+        added = 0
+        for rejected in ranked:
+            if rejected is chosen:
+                continue
+            rejected_score = float(rejected["judge"].metadata.get("adjusted_score") or rejected["judge"].score)
+            if chosen_score - rejected_score < float(settings.min_score_gap):
+                continue
+
+            chosen_hint = chosen["hint"]
+            rejected_hint = rejected["hint"]
+            chosen_text = str(chosen_hint.text or "").strip()
+            rejected_text = str(rejected_hint.raw_text or rejected_hint.text or "").strip()
+            if not chosen_text or not rejected_text or chosen_text == rejected_text:
+                continue
+
+            example = SocraticPreferenceExample(
+                example_id=uuid4().hex[:16],
+                topic=task.topic,
+                task=task,
+                chosen_hint=chosen_text,
+                rejected_hint=rejected_text,
+                chosen_score=chosen_score,
+                rejected_score=rejected_score,
+                chosen_judge=chosen["judge"].to_dict(),
+                rejected_judge=rejected["judge"].to_dict(),
+                metadata={
+                    "episode_id": episode_id,
+                    "iteration": iteration_index,
+                    "task_id": task.task_id,
+                    "weakness_summary": item.get("weakness_summary"),
+                    "chosen_candidate_index": chosen.get("candidate_index"),
+                    "rejected_candidate_index": rejected.get("candidate_index"),
+                    "chosen_rank": chosen.get("rank"),
+                    "rejected_rank": rejected.get("rank"),
+                    "score_gap": chosen_score - rejected_score,
+                },
+            )
+            self.storage.append_socratic_preference(example)
+            added += 1
+            if added >= int(settings.max_pairs_per_task):
+                break
+
+        if added:
+            self.logger.event(
+                "socratic_dpo_preferences_added",
+                episode_id=episode_id,
+                task_id=task.task_id,
+                topic=task.topic,
+                pairs_added=added,
+                candidate_count=len(ranked),
+                chosen_score=chosen_score,
+            )
+        return added
 
     def _log_episode_debug(self, episode: EpisodeRecord, weakness_summary: str) -> None:
         self.logger.debug_dump(
@@ -532,15 +752,55 @@ class AdversarialCurriculumPipeline:
         iteration_index: int,
     ) -> Tuple[List[EpisodeRecord], int]:
         tasks = [item["task"] for item in pending_batch]
-        hints = [item["hint"] for item in pending_batch]
-        judge_outputs = self.judge.evaluate_batch(
-            tasks,
-            hints,
-            apply_batch_spread=True,
-        )
+        if self._using_socratic_dpo():
+            hint_groups = [
+                list(item.get("hint_candidates") or [item["hint"]])
+                for item in pending_batch
+            ]
+            ranked_groups = self.judge.rank_hint_candidates(
+                tasks,
+                hint_groups,
+                apply_group_spread=True,
+            )
+            judge_outputs = []
+            for item, ranked in zip(pending_batch, ranked_groups):
+                item["hint_candidate_rankings"] = ranked
+                if ranked:
+                    item["hint"] = ranked[0]["hint"]
+                    judge_outputs.append(ranked[0]["judge"])
+                else:
+                    judge_outputs.extend(
+                        self.judge.evaluate_batch(
+                            [item["task"]],
+                            [item["hint"]],
+                            apply_batch_spread=False,
+                        )
+                    )
+            self.logger.event(
+                "judge_hint_ranking_complete",
+                candidate_groups=len(pending_batch),
+                candidates_per_task=[len(group) for group in hint_groups],
+                topics=[item["task"].topic for item in pending_batch],
+                ranked_scores=[
+                    [candidate["judge"].metadata.get("adjusted_score") for candidate in item.get("hint_candidate_rankings", [])]
+                    for item in pending_batch
+                ],
+                ranked_valid=[
+                    [candidate["judge"].metadata.get("hint_is_valid_for_socratic") for candidate in item.get("hint_candidate_rankings", [])]
+                    for item in pending_batch
+                ],
+            )
+        else:
+            hints = [item["hint"] for item in pending_batch]
+            judge_outputs = self.judge.evaluate_batch(
+                tasks,
+                hints,
+                apply_batch_spread=True,
+            )
         self.logger.event(
             "judge_batch_complete",
             candidate_count=len(pending_batch),
+            socratic_training_method=self._socratic_training_method(),
             topics=[item["task"].topic for item in pending_batch],
             raw_scores=[output.score for output in judge_outputs],
             adjusted_scores=[output.metadata.get("adjusted_score") for output in judge_outputs],
@@ -572,6 +832,7 @@ class AdversarialCurriculumPipeline:
                         "weakness_summary": weakness_summary,
                         "observed_failure": task.observed_failure(),
                     },
+                    iteration_index=iteration_index,
                 )
                 self.logger.warning(
                     "red_task_rejected_by_judge",
@@ -580,7 +841,6 @@ class AdversarialCurriculumPipeline:
                     rejection_reason=rejection_reason,
                     observed_failure=task.observed_failure(),
                 )
-                continue
 
             if not hint_is_valid:
                 self.logger.warning(
@@ -593,6 +853,12 @@ class AdversarialCurriculumPipeline:
                 )
 
             next_episode_id += 1
+            preference_pairs_added = self._store_socratic_preferences_for_ranked_candidates(
+                item=item,
+                episode_id=next_episode_id,
+                iteration_index=iteration_index,
+            )
+            ranked_candidates = list(item.get("hint_candidate_rankings") or [])
             episode = EpisodeRecord(
                 episode_id=next_episode_id,
                 topic=task.topic,
@@ -605,8 +871,16 @@ class AdversarialCurriculumPipeline:
                     "socratic_adapter": self.current_socratic_adapter,
                     "red_adapter": self._effective_red_generation_adapter(iteration_index),
                     "red_training_adapter": self.current_red_adapter,
+                    "iteration": iteration_index,
                     "task_is_valid_for_socratic": task_is_valid,
                     "hint_is_valid_for_socratic": hint_is_valid,
+                    "socratic_training_method": self._socratic_training_method(),
+                    "socratic_candidate_count": len(item.get("hint_candidates") or [item["hint"]]),
+                    "socratic_candidate_scores": [
+                        candidate["judge"].metadata.get("adjusted_score")
+                        for candidate in ranked_candidates
+                    ],
+                    "socratic_dpo_pairs_added": preference_pairs_added,
                 },
             )
             self.storage.append_episode(episode)
@@ -632,7 +906,7 @@ class AdversarialCurriculumPipeline:
                 self._reset_red_and_curriculum(episode.episode_id)
             records.append(episode)
 
-        self._store_hard_examples_for_batch(records)
+        self._store_hard_examples_for_batch(records, iteration_index)
         return records, next_episode_id
 
     def _load_red_generation_session(self, iteration_index: int):
@@ -662,7 +936,7 @@ class AdversarialCurriculumPipeline:
                     request_batch.append(self._new_red_request(topic, weakness_summary))
                 generation_attempt += len(request_batch)
 
-                generated_requests.extend(self._generate_red_tasks_batch(red_session, request_batch))
+                generated_requests.extend(self._generate_red_tasks_batch(red_session, request_batch, iteration_index))
 
                 for item in request_batch:
                     if item.get("task") is not None:
@@ -676,7 +950,7 @@ class AdversarialCurriculumPipeline:
                     )
 
             valid_requests, invalid_requests = self._validate_generated_requests(generated_requests, iteration_index)
-            repaired_requests = self._repair_generated_requests_without_revalidation(
+            repaired_requests = self._repair_generated_requests_with_revalidation(
                 red_session,
                 invalid_requests,
                 iteration_index,
@@ -723,7 +997,18 @@ class AdversarialCurriculumPipeline:
         )
         try:
             for item in items:
-                item["hint"] = generate_socratic_hint(socratic_session, item["task"], self.logger)
+                if self._using_socratic_dpo():
+                    candidate_count = max(2, int(self.config.socratic.dpo.num_hint_candidates))
+                    candidates = generate_socratic_hints(
+                        socratic_session,
+                        item["task"],
+                        count=candidate_count,
+                        logger=self.logger,
+                    )
+                    item["hint_candidates"] = candidates
+                    item["hint"] = candidates[0]
+                else:
+                    item["hint"] = generate_socratic_hint(socratic_session, item["task"], self.logger)
         finally:
             if not self.config.socratic.hardware.persistent:
                 socratic_session.unload()
@@ -731,6 +1016,8 @@ class AdversarialCurriculumPipeline:
             "iteration_socratic_generation_complete",
             iteration=iteration_index,
             hint_count=len(items),
+            total_candidate_count=sum(len(item.get("hint_candidates") or [item["hint"]]) for item in items),
+            socratic_training_method=self._socratic_training_method(),
         )
         return items
 
@@ -745,26 +1032,39 @@ class AdversarialCurriculumPipeline:
                 iteration=iteration_index,
                 step=step,
                 reason="zero_accepted_episodes",
+                socratic_training_method=self._socratic_training_method(),
                 socratic_adapter=self.current_socratic_adapter,
                 red_adapter=self.current_red_adapter,
             )
             return
 
-        recent_episodes = self.storage.load_recent_episodes(self.config.socratic.grpo.max_training_examples)
-        socratic_result = self.socratic_updater.run(
-            episodes=recent_episodes,
-            step=step,
-            model_source=self.current_socratic_model,
-            adapter_path=self.current_socratic_adapter,
-        )
+        if self._using_socratic_dpo():
+            preferences = self.storage.load_socratic_preferences(self.config.socratic.dpo.max_training_pairs)
+            socratic_result = self.socratic_dpo_updater.run(
+                preferences=preferences,
+                step=step,
+                model_source=self.current_socratic_model,
+                adapter_path=self.current_socratic_adapter,
+            )
+        else:
+            recent_episodes = self.storage.load_recent_episodes(self.config.socratic.grpo.max_training_examples)
+            socratic_result = self.socratic_grpo_updater.run(
+                episodes=recent_episodes,
+                step=step,
+                model_source=self.current_socratic_model,
+                adapter_path=self.current_socratic_adapter,
+            )
         if socratic_result is not None:
             self.current_socratic_model = socratic_result.model_source
             self.current_socratic_adapter = socratic_result.adapter_path
             self.storage.save_pointer("socratic_model_path", self.current_socratic_model)
             self.storage.save_pointer("socratic_adapter_path", self.current_socratic_adapter)
 
+        self.model_pool.release_socratic()
         hard_examples = self.storage.load_hard_examples(self.config.red.update.max_sft_examples)
-        rejected_examples = self.storage.load_red_rejected_examples(self.config.red.update.max_dpo_pairs)
+        rejected_examples = self.storage.load_red_rejected_examples(
+            max(self.config.red.update.max_dpo_pairs * 4, self.config.red.update.max_dpo_pairs)
+        )
         recent_for_red = self.storage.load_recent_episodes(max(self.config.red.update.max_sft_examples, 256))
         if self._using_base_red_generation(iteration_index):
             self.logger.event(
@@ -792,6 +1092,7 @@ class AdversarialCurriculumPipeline:
             iteration=iteration_index,
             step=step,
             accepted_records=len(accepted_records),
+            socratic_training_method=self._socratic_training_method(),
             socratic_adapter=self.current_socratic_adapter,
             red_adapter=self._effective_red_generation_adapter(iteration_index),
             red_training_adapter=self.current_red_adapter,
@@ -820,6 +1121,7 @@ class AdversarialCurriculumPipeline:
             completed_iterations=self.completed_iterations,
             socratic_model=self.current_socratic_model,
             socratic_adapter=self.current_socratic_adapter,
+            socratic_training_method=self._socratic_training_method(),
             red_adapter=self.current_red_adapter,
         )
         self.model_pool.get_judge()
