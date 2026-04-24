@@ -105,6 +105,19 @@ def _local_cuda_ids(gpu_ids: Iterable[int]) -> List[int]:
     return requested
 
 
+def _validate_local_cuda_ids(role_name: str, local_gpu_ids: List[int]) -> None:
+    if not torch.cuda.is_available() or not local_gpu_ids:
+        return
+    device_count = torch.cuda.device_count()
+    invalid = [gpu_id for gpu_id in local_gpu_ids if gpu_id < 0 or gpu_id >= device_count]
+    if invalid:
+        raise RuntimeError(
+            f"{role_name} GPU allocation resolves to local CUDA ids {local_gpu_ids}, "
+            f"but only {device_count} CUDA device(s) are visible "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r})."
+        )
+
+
 def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
     if not hardware.gpu_ids:
         return None
@@ -127,6 +140,28 @@ def set_preferred_cuda_device(hardware: HardwareAllocation) -> None:
     preferred = int(local_gpu_ids[0])
     if 0 <= preferred < torch.cuda.device_count():
         torch.cuda.set_device(preferred)
+
+
+def build_device_map(hardware: HardwareAllocation) -> Any:
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    if not local_gpu_ids:
+        return None
+    if len(local_gpu_ids) == 1:
+        return {"": int(local_gpu_ids[0])}
+    # "auto" tends to fill cuda:0 first; Qwen-32B 8-bit can then OOM during
+    # shard loading or generation even when the model would fit across GPUs.
+    return "balanced_low_0"
+
+
+def summarize_device_map(model: Any) -> Dict[str, int]:
+    device_map = getattr(model, "hf_device_map", None)
+    if not isinstance(device_map, dict):
+        return {}
+    summary: Dict[str, int] = {}
+    for value in device_map.values():
+        key = str(value)
+        summary[key] = summary.get(key, 0) + 1
+    return summary
 
 
 def render_chat_messages(
@@ -259,8 +294,10 @@ class RoleSession:
         return outputs
 
     def unload(self) -> None:
-        del self.model
-        del self.tokenizer
+        if hasattr(self, "model"):
+            self.model = None
+        if hasattr(self, "tokenizer"):
+            self.tokenizer = None
         clear_cuda_memory()
 
 
@@ -442,14 +479,19 @@ def load_role_session(
     trainable: bool = False,
     gradient_checkpointing: bool = False,
 ) -> RoleSession:
+    clear_cuda_memory()
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    _validate_local_cuda_ids(role_name, local_gpu_ids)
     set_preferred_cuda_device(hardware)
     tokenizer = load_tokenizer(model_name_or_path, tokenizer_name_or_path)
     quant_cfg = build_quantization_config(quantization)
+    max_memory = build_max_memory(hardware)
+    device_map = build_device_map(hardware)
     kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "device_map": "auto" if hardware.gpu_ids else None,
-        "max_memory": build_max_memory(hardware),
+        "device_map": device_map,
+        "max_memory": max_memory,
     }
     if quant_cfg is not None:
         kwargs["quantization_config"] = quant_cfg
@@ -463,14 +505,30 @@ def load_role_session(
     load_attempts = [quantization]
     if quantization and str(quantization).lower() == "8bit":
         load_attempts.append("4bit")
-    if not trainable or not quantization:
+    if not quantization:
         load_attempts.append(None)
     load_attempts = list(dict.fromkeys(load_attempts))
 
-    last_exc: Optional[BaseException] = None
+    logger.event(
+        "model_load_start",
+        role=role_name,
+        model_name_or_path=model_name_or_path,
+        adapter_path=adapter_path,
+        quantization=quantization,
+        load_attempts=load_attempts,
+        requested_gpu_ids=hardware.gpu_ids,
+        local_gpu_ids=local_gpu_ids,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        device_map=device_map,
+        max_memory={str(key): value for key, value in (max_memory or {}).items()},
+        trainable=trainable,
+    )
+
+    last_error: Optional[str] = None
     for mode in load_attempts:
         attempt_model = None
         try:
+            clear_cuda_memory()
             local_kwargs = dict(kwargs)
             local_kwargs["quantization_config"] = build_quantization_config(mode)
             if local_kwargs["quantization_config"] is None:
@@ -503,9 +561,10 @@ def load_role_session(
         except RuntimeError as exc:
             if not is_oom_error(exc):
                 raise
-            last_exc = exc
+            last_error = str(exc)
             if attempt_model is not None:
                 del attempt_model
+                attempt_model = None
             clear_cuda_memory()
             logger.warning(
                 "oom_model_load_retry",
@@ -517,7 +576,7 @@ def load_role_session(
     if model is None:
         del tokenizer
         clear_cuda_memory()
-        raise RuntimeError(f"Unable to load {role_name} model after OOM fallbacks: {last_exc}")
+        raise RuntimeError(f"Unable to load {role_name} model after OOM fallbacks: {last_error}")
 
     logger.event(
         "model_loaded",
@@ -526,6 +585,8 @@ def load_role_session(
         adapter_path=adapter_path,
         quantization=quantization,
         gpu_ids=hardware.gpu_ids,
+        local_gpu_ids=local_gpu_ids,
+        device_map_summary=summarize_device_map(model),
         persistent=hardware.persistent,
         trainable=trainable,
     )

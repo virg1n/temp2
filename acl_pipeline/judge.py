@@ -198,6 +198,10 @@ _NAME_ERROR_PATTERNS = [
 _PASSED_EXECUTION_REWARD = 0.5
 
 
+def _hint_text_for_judge(hint: SocraticHint) -> str:
+    return str(getattr(hint, "raw_text", "") or hint.text or "")
+
+
 def _extract_json(text: str) -> Optional[Any]:
     raw = (text or "").strip()
     if not raw:
@@ -883,7 +887,7 @@ class JudgeService:
             return [[] for _ in tasks]
 
         prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in flat_tasks]
-        hint_texts = [hint.text for hint in flat_hints]
+        hint_texts = [_hint_text_for_judge(hint) for hint in flat_hints]
         details_list = self.score_pair_details(
             prompt_texts,
             hint_texts,
@@ -945,7 +949,7 @@ class JudgeService:
         if not tasks:
             return []
         prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in tasks]
-        hint_texts = [hint.text for hint in hints]
+        hint_texts = [_hint_text_for_judge(hint) for hint in hints]
         details_list = self.score_pair_details(
             prompt_texts,
             hint_texts,
