@@ -148,9 +148,9 @@ def build_device_map(hardware: HardwareAllocation) -> Any:
         return None
     if len(local_gpu_ids) == 1:
         return {"": int(local_gpu_ids[0])}
-    # "auto" tends to fill cuda:0 first; Qwen-32B 8-bit can then OOM during
-    # shard loading or generation even when the model would fit across GPUs.
-    return "balanced_low_0"
+    # "auto" tends to fill one GPU before spilling. "balanced_low_0" leaves
+    # extra room on cuda:0 but can overfill cuda:1/2 during Qwen-32B loading.
+    return "balanced"
 
 
 def summarize_device_map(model: Any) -> Dict[str, int]:
@@ -492,11 +492,10 @@ def load_role_session(
         "low_cpu_mem_usage": True,
         "device_map": device_map,
         "max_memory": max_memory,
+        "torch_dtype": _dtype_for_runtime() if torch.cuda.is_available() else torch.float32,
     }
     if quant_cfg is not None:
         kwargs["quantization_config"] = quant_cfg
-    else:
-        kwargs["torch_dtype"] = _dtype_for_runtime() if torch.cuda.is_available() else torch.float32
 
     if gradient_checkpointing:
         kwargs["use_cache"] = False
