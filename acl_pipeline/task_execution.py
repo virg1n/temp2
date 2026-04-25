@@ -16,6 +16,17 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[-max_chars:]
 
 
+def _failure_status(error_message: str) -> str:
+    lowered = str(error_message or "").lower()
+    if "indentationerror" in lowered or "taberror" in lowered:
+        return "indentation_error"
+    if "syntaxerror" in lowered:
+        return "syntax_error"
+    if "nameerror" in lowered:
+        return "nameerror"
+    return "failed"
+
+
 def execute_task(task: PythonTask, config: TaskExecutionConfig) -> TaskExecutionResult:
     program = task.combined_program().rstrip() + "\n"
     start = time.perf_counter()
@@ -47,7 +58,7 @@ def execute_task(task: PythonTask, config: TaskExecutionConfig) -> TaskExecution
                 )
             error_message = stderr or stdout or f"Process failed with return code {proc.returncode}."
             return TaskExecutionResult(
-                status="failed",
+                status=_failure_status(error_message),
                 returncode=int(proc.returncode),
                 error_message=error_message,
                 stdout=stdout,

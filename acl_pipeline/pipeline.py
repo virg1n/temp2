@@ -188,15 +188,22 @@ class AdversarialCurriculumPipeline:
         if self._normalize_topic(task.topic) != self._normalize_topic(requested_topic):
             reasons.append("wrong topic")
 
+        program = task.combined_program()
+        if any(char in program for char in ("\u2028", "\u2029")):
+            reasons.append("invalid unicode line separator in code")
+
         repair_probability = float(self.config.task_execution.probabilistic_repair_probability)
         if task.non_empty_line_count() < int(self.config.task_execution.min_code_lines_for_repair):
             if self.rng.random() < repair_probability:
                 reasons.append("too short")
 
-        if execution_result is not None and execution_result.status == "passed":
-            keep_probability = max(0.0, min(1.0, float(self.config.task_execution.passed_task_keep_probability)))
-            if self.rng.random() >= keep_probability:
-                reasons.append("already correct code, there are no errors in asserts")
+        if execution_result is not None:
+            if execution_result.status in {"syntax_error", "indentation_error"}:
+                reasons.append(f"blocking {execution_result.status}")
+            elif execution_result.status == "passed":
+                keep_probability = max(0.0, min(1.0, float(self.config.task_execution.passed_task_keep_probability)))
+                if self.rng.random() >= keep_probability:
+                    reasons.append("already correct code, there are no errors in asserts")
         return reasons
 
     def _validate_request_item(self, item: Dict[str, Any]) -> Tuple[Optional[Any], List[str]]:

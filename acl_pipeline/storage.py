@@ -15,6 +15,37 @@ from .schemas import (
 )
 
 
+def _jsonl_line(payload: Dict[str, Any]) -> str:
+    # ensure_ascii escapes U+2028/U+2029 and other generated non-ASCII
+    # separators so a JSON object remains one physical LF-delimited record.
+    return json.dumps(payload, ensure_ascii=True) + "\n"
+
+
+def _jsonl_physical_lines(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+
+
+def _load_jsonl_payloads(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    lines = _jsonl_physical_lines(path)
+    if limit is not None:
+        limit_value = max(0, int(limit))
+        if limit_value <= 0:
+            return []
+        lines = lines[-limit_value:]
+
+    payloads: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
 class SimpleStorage:
     def __init__(self, root_dir: str, *, keep_last_n_checkpoints: int = 3, hard_buffer_max_size: int = 2048) -> None:
         self.root_dir = Path(root_dir)
@@ -36,36 +67,24 @@ class SimpleStorage:
 
     def append_episode(self, episode: EpisodeRecord) -> None:
         with self.episodes_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(episode.to_dict(), ensure_ascii=False) + "\n")
+            fh.write(_jsonl_line(episode.to_dict()))
 
     def episode_count(self) -> int:
-        if not self.episodes_path.exists():
-            return 0
-        return len(self.episodes_path.read_text(encoding="utf-8").splitlines())
+        return len(_load_jsonl_payloads(self.episodes_path))
 
     def load_recent_episodes(self, limit: int) -> List[EpisodeRecord]:
-        if not self.episodes_path.exists():
-            return []
-        lines = self.episodes_path.read_text(encoding="utf-8").splitlines()
-        items = [json.loads(line) for line in lines[-max(0, int(limit)) :]]
-        return [EpisodeRecord.from_dict(item) for item in items]
+        return [EpisodeRecord.from_dict(item) for item in _load_jsonl_payloads(self.episodes_path, limit)]
 
     def append_hard_example(self, example: RedTrainingExample) -> None:
         rows = self.load_hard_examples(limit=self.hard_buffer_max_size - 1)
         rows.append(example)
         with self.hard_examples_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
-                fh.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+                fh.write(_jsonl_line(row.to_dict()))
 
     def load_hard_examples(self, limit: Optional[int] = None) -> List[RedTrainingExample]:
-        if not self.hard_examples_path.exists():
-            return []
-        lines = self.hard_examples_path.read_text(encoding="utf-8").splitlines()
-        if limit is not None:
-            lines = lines[-int(limit) :]
         rows: List[RedTrainingExample] = []
-        for line in lines:
-            payload = json.loads(line)
+        for payload in _load_jsonl_payloads(self.hard_examples_path, limit):
             payload["task"] = PythonTask(**payload["task"])
             rows.append(RedTrainingExample(**payload))
         return rows
@@ -75,33 +94,23 @@ class SimpleStorage:
         rows.append(example)
         with self.red_rejections_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
-                fh.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+                fh.write(_jsonl_line(row.to_dict()))
 
     def load_red_rejected_examples(self, limit: Optional[int] = None) -> List[RedRejectedExample]:
-        if not self.red_rejections_path.exists():
-            return []
-        lines = self.red_rejections_path.read_text(encoding="utf-8").splitlines()
-        if limit is not None:
-            lines = lines[-int(limit) :]
-        return [RedRejectedExample(**json.loads(line)) for line in lines]
+        return [RedRejectedExample(**payload) for payload in _load_jsonl_payloads(self.red_rejections_path, limit)]
 
     def append_socratic_preference(self, example: SocraticPreferenceExample) -> None:
         rows = self.load_socratic_preferences(limit=self.hard_buffer_max_size - 1)
         rows.append(example)
         with self.socratic_preferences_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
-                fh.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+                fh.write(_jsonl_line(row.to_dict()))
 
     def load_socratic_preferences(self, limit: Optional[int] = None) -> List[SocraticPreferenceExample]:
-        if not self.socratic_preferences_path.exists():
-            return []
-        lines = self.socratic_preferences_path.read_text(encoding="utf-8").splitlines()
-        if limit is not None:
-            limit_value = max(0, int(limit))
-            if limit_value <= 0:
-                return []
-            lines = lines[-limit_value:]
-        return [SocraticPreferenceExample.from_dict(json.loads(line)) for line in lines]
+        return [
+            SocraticPreferenceExample.from_dict(payload)
+            for payload in _load_jsonl_payloads(self.socratic_preferences_path, limit)
+        ]
 
     def save_curriculum_state(self, state: CurriculumState) -> None:
         self.curriculum_path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
