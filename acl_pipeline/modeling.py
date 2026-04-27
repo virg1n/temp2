@@ -540,7 +540,9 @@ def load_role_session(
 
                     attempt_model = PeftModel.from_pretrained(attempt_model, adapter_path, is_trainable=trainable)
                 except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(f"Failed to load adapter from {adapter_path}") from exc
+                    if is_oom_error(exc):
+                        raise RuntimeError(f"CUDA out of memory while loading adapter from {adapter_path}: {exc}") from exc
+                    raise RuntimeError(f"Failed to load adapter from {adapter_path}: {exc}") from exc
 
             if trainable and local_kwargs.get("quantization_config") is not None:
                 try:

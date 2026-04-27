@@ -160,6 +160,9 @@ class SocraticDpoUpdater:
 
         set_seed(self.config.runtime.seed + int(step))
         session = None
+        trainer = None
+        dataset = None
+        model = None
         try:
             session = self.model_pool.load_socratic_trainable(
                 model_source=model_source,
@@ -222,6 +225,10 @@ class SocraticDpoUpdater:
                 result = SocraticDpoUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
 
             release_trainer_memory(trainer)
+            trainer = None
+            dataset = None
+            model = None
+            clear_cuda_memory()
             self.storage.prune_role_checkpoints("socratic")
             self.logger.event(
                 "socratic_dpo_complete",
@@ -238,7 +245,15 @@ class SocraticDpoUpdater:
             self.logger.warning("socratic_dpo_oom", step=step, error=str(exc))
             return None
         finally:
+            if trainer is not None:
+                try:
+                    release_trainer_memory(trainer)
+                except Exception:
+                    pass
             self.model_pool.release_socratic()
             if session is not None:
                 session.unload()
+            trainer = None
+            dataset = None
+            model = None
             clear_cuda_memory()

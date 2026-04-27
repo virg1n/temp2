@@ -17,7 +17,7 @@ task_execution:
   passed_task_keep_probability: 0.2
 
 storage:
-  root_dir: ./runs/23_04
+  root_dir: ./runs/28_04
   keep_last_n_checkpoints: 2
   hard_buffer_max_size: 2048
 
@@ -172,12 +172,12 @@ red:
   quantization:
   generation_quantization: 8bit
   update_quantization: 4bit
-  force_base_generation_after_iteration: 150
+  force_base_generation_after_iteration: 17
   enable_thinking: false
   hardware:
     gpu_ids: [1, 2, 3]
     persistent: false
-    per_gpu_memory_gib: 40
+    per_gpu_memory_gib: 36
     cpu_offload_gib: 128
   generation:
     batch_size: 1
@@ -188,7 +188,7 @@ red:
     repetition_penalty: 1.02
   lora:
     enabled: true
-    r: 64
+    r: 32
     alpha: 128
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
@@ -198,7 +198,7 @@ red:
     max_sft_examples: 256
     max_dpo_pairs: 64
     mining_bottom_fraction: 0.25
-    learning_rate: 1.0e-4
+    learning_rate: 4.0e-5
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 8

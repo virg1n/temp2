@@ -84,15 +84,6 @@ class RedTaskGenerator:
             reasons.append("missing statement")
         if not solution:
             reasons.append("missing buggy_solution")
-        if not metadata:
-            reasons.append("missing metadata")
-        else:
-            failure_mode = str(metadata.get("failure_mode") or "").strip()
-            difficulty = str(metadata.get("difficulty") or "").strip().lower()
-            if not failure_mode:
-                reasons.append("missing metadata.failure_mode")
-            if difficulty not in {"medium", "hard"}:
-                reasons.append("invalid metadata.difficulty")
         if reasons:
             return None, list(dict.fromkeys(reasons))
 

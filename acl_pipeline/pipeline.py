@@ -623,19 +623,29 @@ class AdversarialCurriculumPipeline:
             return 0
 
         task = item["task"]
-        task_valid_ranked = [
+        def is_socratic_trainable_candidate(candidate: Dict[str, Any]) -> bool:
+            metadata = dict(candidate["judge"].metadata or {})
+            if bool(metadata.get("task_is_valid_for_socratic", True)):
+                return True
+            local_tiebreak = dict(metadata.get("local_tiebreak") or {})
+            return (
+                self._is_already_correct_red_rejection(metadata.get("red_rejection_reason"))
+                or str(local_tiebreak.get("execution_status") or "").strip().lower() == "passed"
+            )
+
+        socratic_trainable_ranked = [
             candidate
             for candidate in ranked
-            if bool(candidate["judge"].metadata.get("task_is_valid_for_socratic", True))
+            if is_socratic_trainable_candidate(candidate)
         ]
-        if len(task_valid_ranked) < 2:
+        if len(socratic_trainable_ranked) < 2:
             return 0
 
         settings = self.config.socratic.dpo
-        chosen = task_valid_ranked[0]
+        chosen = socratic_trainable_ranked[0]
         chosen_score = float(chosen["judge"].metadata.get("adjusted_score") or chosen["judge"].score)
         added = 0
-        for rejected in task_valid_ranked:
+        for rejected in socratic_trainable_ranked:
             if rejected is chosen:
                 continue
             rejected_score = float(rejected["judge"].metadata.get("adjusted_score") or rejected["judge"].score)
@@ -718,7 +728,7 @@ class AdversarialCurriculumPipeline:
             return False
         return str(current) != str(base)
 
-    def _handle_red_adapter_failure(self, iteration_index: int, generated_tasks: int) -> None:
+    def _handle_red_adapter_failure(self, iteration_index: int, generated_tasks: int, *, reason: str = "red_adapter_failure") -> None:
         previous_adapter = self.current_red_adapter
         self.current_red_adapter = None
         self.storage.save_pointer("red_adapter_path", self.current_red_adapter)
@@ -729,7 +739,7 @@ class AdversarialCurriculumPipeline:
             generated_tasks=generated_tasks,
             previous_adapter=previous_adapter,
             fallback_adapter=self.config.red.base_adapter_path,
-            reason="zero_valid_red_tasks",
+            reason=reason,
         )
 
     def _reset_red_and_curriculum(self, episode_id: int) -> None:
@@ -977,17 +987,40 @@ class AdversarialCurriculumPipeline:
             red_session.unload()
 
         final_requests = valid_requests + repaired_requests
+        result_items = [
+            {
+                "task": item["task"],
+                "weakness_summary": item["weakness_summary"],
+            }
+            for item in final_requests
+            if item.get("task") is not None
+        ]
         if (
-            not final_requests
+            len(result_items) < target_count
             and not self._using_base_red_generation(iteration_index)
             and self._using_non_base_red_adapter()
         ):
-            self._handle_red_adapter_failure(iteration_index, len(final_requests))
+            missing = target_count - len(result_items)
+            self._handle_red_adapter_failure(
+                iteration_index,
+                len(result_items),
+                reason="too_few_valid_red_tasks",
+            )
+            fallback_items = self._generate_iteration_tasks(missing, iteration_index)
+            result_items.extend(fallback_items)
+            self.logger.warning(
+                "red_generation_base_fallback_fill",
+                iteration=iteration_index,
+                adapter_generated_tasks=len(final_requests),
+                accepted_before_fallback=len(result_items) - len(fallback_items),
+                fallback_tasks=len(fallback_items),
+                requested_tasks=target_count,
+            )
         self.logger.event(
             "iteration_red_generation_complete",
             iteration=iteration_index,
             requested_tasks=target_count,
-            generated_tasks=len(final_requests),
+            generated_tasks=len(result_items),
             raw_generated_tasks=len(generated_requests),
             validated_tasks=len(valid_requests),
             repaired_tasks=len(repaired_requests),
@@ -997,14 +1030,7 @@ class AdversarialCurriculumPipeline:
             effective_batch_size=self._red_effective_batch_size(max(1, target_count)),
             red_generation_adapter=self._effective_red_generation_adapter(iteration_index),
         )
-        return [
-            {
-                "task": item["task"],
-                "weakness_summary": item["weakness_summary"],
-            }
-            for item in final_requests
-            if item.get("task") is not None
-        ]
+        return result_items
 
     def _generate_socratic_hints_for_iteration(self, items: List[Dict[str, Any]], iteration_index: int) -> List[Dict[str, Any]]:
         if not items:
@@ -1079,6 +1105,7 @@ class AdversarialCurriculumPipeline:
             self.storage.save_pointer("socratic_adapter_path", self.current_socratic_adapter)
 
         self.model_pool.release_socratic()
+        clear_cuda_memory()
         hard_examples = self.storage.load_hard_examples(self.config.red.update.max_sft_examples)
         rejected_examples = self.storage.load_red_rejected_examples(
             max(self.config.red.update.max_dpo_pairs * 4, self.config.red.update.max_dpo_pairs)

@@ -342,8 +342,34 @@ class RedUpdater:
 
         for attempt_index, attempt in enumerate(attempts, start=1):
             session = None
+            sft_trainer = None
+            dpo_trainer = None
+            sft_dataset = None
+            dpo_dataset = None
+            model = None
+            load_adapter_path = adapter_path
             try:
-                session = self.model_pool.load_red_trainable(adapter_path=adapter_path)
+                try:
+                    session = self.model_pool.load_red_trainable(adapter_path=load_adapter_path)
+                except RuntimeError as exc:
+                    message = str(exc).lower()
+                    adapter_load_failed = load_adapter_path is not None and (
+                        is_oom_error(exc) or "failed to load adapter" in message
+                    )
+                    if not adapter_load_failed:
+                        raise
+                    self.logger.warning(
+                        "red_update_adapter_load_fallback",
+                        step=step,
+                        attempt=attempt_index,
+                        failed_adapter_path=load_adapter_path,
+                        fallback_adapter_path=self.config.red.base_adapter_path,
+                        error=str(exc),
+                    )
+                    clear_cuda_memory()
+                    load_adapter_path = None
+                    session = self.model_pool.load_red_trainable(adapter_path=None)
+
                 model = session.model
                 if self.config.red.lora.enabled and not hasattr(model, "peft_config"):
                     model = attach_lora_adapter(model, self.config.red.lora)
@@ -389,8 +415,8 @@ class RedUpdater:
                 model = sft_trainer.model
                 session.model = model
                 release_trainer_memory(sft_trainer)
-                del sft_trainer
-                del sft_dataset
+                sft_trainer = None
+                sft_dataset = None
                 clear_cuda_memory()
 
                 dpo_pair_count = 0
@@ -446,8 +472,8 @@ class RedUpdater:
                         model = dpo_trainer.model
                         session.model = model
                         release_trainer_memory(dpo_trainer)
-                        del dpo_trainer
-                        del dpo_dataset
+                        dpo_trainer = None
+                        dpo_dataset = None
                         clear_cuda_memory()
 
                 save_dir = self.storage.checkpoint_dir("red", step) / "adapter"
@@ -466,12 +492,18 @@ class RedUpdater:
                     recent_episodes=len(recent_episodes),
                     attempt=attempt_index,
                     max_length=attempt["max_length"],
+                    loaded_adapter_path=load_adapter_path,
                 )
                 return RedUpdateResult(adapter_path=str(save_dir))
             except RuntimeError as exc:
                 if not is_oom_error(exc):
                     raise
-                clear_cuda_memory()
+                for trainer in (dpo_trainer, sft_trainer):
+                    if trainer is not None:
+                        try:
+                            release_trainer_memory(trainer)
+                        except Exception:
+                            pass
                 self.logger.warning(
                     "red_update_oom_retry",
                     step=step,
@@ -480,7 +512,16 @@ class RedUpdater:
                 )
             finally:
                 if session is not None:
-                    session.unload()
+                    try:
+                        session.unload()
+                    except Exception:
+                        pass
+                session = None
+                sft_trainer = None
+                dpo_trainer = None
+                sft_dataset = None
+                dpo_dataset = None
+                model = None
                 clear_cuda_memory()
 
         return RedUpdateResult(adapter_path=adapter_path, skipped_reason="oom_after_retries")
