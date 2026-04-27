@@ -326,15 +326,15 @@ class RedUpdater:
             self.logger.event("red_update_skip", reason=reason)
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
-        small_context_length = max(512, min(int(settings.max_length), 768))
+        full_context_length = max(1024, min(int(settings.max_length), 1536))
         attempts = [
             {
-                "max_length": small_context_length,
+                "max_length": full_context_length,
                 "per_device_batch_size": 1,
                 "dpo_enabled": settings.dpo_enabled,
             },
             {
-                "max_length": max(512, min(small_context_length, 512)),
+                "max_length": max(768, full_context_length // 2),
                 "per_device_batch_size": 1,
                 "dpo_enabled": False,
             },
