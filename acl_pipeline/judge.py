@@ -223,6 +223,30 @@ def _extract_json(text: str) -> Optional[Any]:
     return None
 
 
+def _judge_items_from_parsed(parsed: Any, expected_count: int) -> List[Any]:
+    if isinstance(parsed, list):
+        return list(parsed)
+    if isinstance(parsed, dict):
+        maybe_items = parsed.get("items") or parsed.get("scores") or parsed.get("results")
+        if isinstance(maybe_items, list):
+            return list(maybe_items)
+        if expected_count == 1 and any(
+            key in parsed
+            for key in (
+                "no_solution_reveal",
+                "bug_localization",
+                "usefulness",
+                "socratic_style",
+                "technical_accuracy",
+                "task_quality",
+                "task_is_valid_for_socratic",
+                "hint_is_valid_for_socratic",
+            )
+        ):
+            return [parsed]
+    return []
+
+
 def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
     sections: Dict[str, str] = {}
     for match in _CODE_BLOCK_RE.finditer(str(prompt_text or "")):
@@ -731,17 +755,43 @@ class JudgeService:
             judge_rows = [rows[index] for index in judge_indexes]
             session = self.model_pool.get_judge()
             messages = build_judge_batch_messages(judge_rows, self._weights())
-            raw = session.generate([messages])[0]
-            parsed = _extract_json(raw)
+            max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
+            raw = ""
             parsed_items: List[Any] = []
-            if isinstance(parsed, list):
-                parsed_items = list(parsed)
-            elif isinstance(parsed, dict):
-                maybe_items = parsed.get("items") or parsed.get("scores") or parsed.get("results")
-                if isinstance(maybe_items, list):
-                    parsed_items = list(maybe_items)
+            last_parsed_type = "None"
+            for attempt in range(1, max_attempts + 1):
+                raw = session.generate([messages])[0]
+                parsed = _extract_json(raw)
+                last_parsed_type = type(parsed).__name__ if parsed is not None else "None"
+                parsed_items = _judge_items_from_parsed(parsed, expected_count=len(judge_rows))
+                if len(parsed_items) == len(judge_rows):
+                    break
+                self.logger.warning(
+                    "judge_malformed_response_retry",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    expected_items=len(judge_rows),
+                    parsed_items=len(parsed_items),
+                    parsed_type=last_parsed_type,
+                    raw_chars=len(raw),
+                    raw_preview=str(raw or "")[:500],
+                )
+
             if len(parsed_items) != len(judge_rows):
-                parsed_items = [{} for _ in judge_rows]
+                self.logger.error(
+                    "judge_malformed_response_error",
+                    expected_items=len(judge_rows),
+                    parsed_items=len(parsed_items),
+                    parsed_type=last_parsed_type,
+                    raw_chars=len(raw),
+                    raw_preview=str(raw or "")[:500],
+                )
+                raise RuntimeError(
+                    "Judge returned malformed or truncated JSON after "
+                    f"{max_attempts} attempt(s): expected {len(judge_rows)} item(s), "
+                    f"parsed {len(parsed_items)}. Increase judge.generation.max_new_tokens "
+                    "or reduce judge.episode_batch_size / socratic.dpo.num_hint_candidates."
+                )
             for index, item in zip(judge_indexes, parsed_items):
                 raw_items[index] = item
                 raw_responses[index] = raw

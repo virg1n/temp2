@@ -150,7 +150,7 @@ judge:
     socratic_style: 0.15
     technical_accuracy: 0.1
   batch_spread_strength: 0.15
-  episode_batch_size: 4
+  episode_batch_size: 1
   bad_task_threshold: 3.0
   hardware:
     gpu_ids: [0]
@@ -159,7 +159,7 @@ judge:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 700
+    max_new_tokens: 2400
     temperature: 0.5
     top_p: 0.7
     do_sample: false
