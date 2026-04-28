@@ -224,6 +224,7 @@ class SocraticDpoUpdater:
                 session.tokenizer.save_pretrained(str(adapter_dir))
                 result = SocraticDpoUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
 
+            preference_pairs_used = len(dataset)
             release_trainer_memory(trainer)
             trainer = None
             dataset = None
@@ -235,7 +236,7 @@ class SocraticDpoUpdater:
                 step=step,
                 model_source=result.model_source,
                 adapter_path=result.adapter_path,
-                preference_pairs_used=len(dataset),
+                preference_pairs_used=preference_pairs_used,
             )
             return result
         except RuntimeError as exc:
