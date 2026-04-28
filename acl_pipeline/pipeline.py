@@ -13,6 +13,7 @@ from .modeling import ModelPool, clear_cuda_memory, is_oom_error
 from .prompts import (
     build_red_messages,
     build_red_repair_message,
+    build_red_response_prefix,
     build_red_training_prompt,
 )
 from .red_generation import RedTaskGenerator
@@ -119,6 +120,21 @@ class AdversarialCurriculumPipeline:
     def _is_already_correct_red_rejection(self, reason: Any) -> bool:
         text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
         return "already_correct_code" in text or "already_correct" in text
+
+    def _is_trainable_red_dpo_rejection(self, reason: Any) -> bool:
+        text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if self._is_already_correct_red_rejection(text):
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "non_json_response",
+                "blocking_syntax_error",
+                "blocking_indentation_error",
+                "blocking_nameerror",
+                "unrelated_nameerror",
+            )
+        )
 
     def _task_spec_from_metadata(self, task) -> Optional[RedTaskSpec]:
         payload = dict(task.metadata.get("red_spec") or {})
@@ -291,6 +307,7 @@ class AdversarialCurriculumPipeline:
                 red_session,
                 [item["messages"] for item in pending],
                 stage="task",
+                response_prefixes=[build_red_response_prefix(str(item["topic"])) for item in pending],
             )
             for item, raw in zip(pending, raw_batch):
                 topic = str(item["topic"])
@@ -417,6 +434,7 @@ class AdversarialCurriculumPipeline:
                     red_session,
                     [item["messages"] for item in chunk],
                     stage="task_repair_final",
+                    response_prefixes=[build_red_response_prefix(str(item["topic"])) for item in chunk],
                 )
                 for item, raw in zip(chunk, raw_batch):
                     topic = str(item["topic"])
@@ -533,7 +551,7 @@ class AdversarialCurriculumPipeline:
             },
         )
 
-    def _matching_already_correct_rejection(
+    def _matching_trainable_red_rejection(
         self,
         *,
         episode: EpisodeRecord,
@@ -543,11 +561,16 @@ class AdversarialCurriculumPipeline:
         for rejected in self._red_rejections_by_iteration.get(iteration_index, []):
             if self._normalize_topic(rejected.topic) != topic_key:
                 continue
-            if self._is_already_correct_red_rejection(rejected.rejection_reason):
+            if self._is_trainable_red_dpo_rejection(rejected.rejection_reason):
                 return rejected
             metadata = dict(rejected.metadata or {})
-            if self._is_already_correct_red_rejection(metadata.get("rejection_reason")):
+            if self._is_trainable_red_dpo_rejection(metadata.get("rejection_reason")):
                 return rejected
+            if self._is_trainable_red_dpo_rejection(metadata.get("red_rejection_reason")):
+                return rejected
+            for reason in metadata.get("validation_reasons") or []:
+                if self._is_trainable_red_dpo_rejection(reason):
+                    return rejected
             if str(metadata.get("execution_status") or "").strip().lower() == "passed":
                 return rejected
         return None
@@ -568,7 +591,7 @@ class AdversarialCurriculumPipeline:
                 "red_dpo_rejection_id": rejected.example_id,
                 "red_dpo_rejection_reason": rejected.rejection_reason,
                 "red_dpo_rejection_stage": dict(rejected.metadata or {}).get("stage"),
-                "red_dpo_pairing": "same_iteration_topic_already_correct",
+                "red_dpo_pairing": "same_iteration_topic_trainable_rejection",
             }
         )
 
@@ -593,7 +616,7 @@ class AdversarialCurriculumPipeline:
         for episode in selected:
             weakness_summary = str(episode.metadata.get("weakness_summary") or "")
             example = self._build_hard_example(episode, weakness_summary)
-            matched_rejection = self._matching_already_correct_rejection(
+            matched_rejection = self._matching_trainable_red_rejection(
                 episode=episode,
                 iteration_index=iteration_index,
             )

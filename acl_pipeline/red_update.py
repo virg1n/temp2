@@ -146,6 +146,22 @@ def _is_already_correct_rejection(reason: Any) -> bool:
     return "already_correct_code" in text or "already_correct" in text
 
 
+def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
+    text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if _is_already_correct_rejection(text):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "non_json_response",
+            "blocking_syntax_error",
+            "blocking_indentation_error",
+            "blocking_nameerror",
+            "unrelated_nameerror",
+        )
+    )
+
+
 def _rejected_example_is_already_correct(example: RedRejectedExample) -> bool:
     if _is_already_correct_rejection(example.rejection_reason):
         return True
@@ -155,12 +171,26 @@ def _rejected_example_is_already_correct(example: RedRejectedExample) -> bool:
     return str(metadata.get("execution_status") or "").strip().lower() == "passed"
 
 
-def _chosen_example_has_direct_already_correct_rejection(example: RedTrainingExample) -> bool:
+def _rejected_example_is_trainable_for_red_dpo(example: RedRejectedExample) -> bool:
+    if _is_trainable_red_dpo_rejection_reason(example.rejection_reason):
+        return True
+    metadata = dict(example.metadata or {})
+    if _is_trainable_red_dpo_rejection_reason(metadata.get("rejection_reason")):
+        return True
+    if _is_trainable_red_dpo_rejection_reason(metadata.get("red_rejection_reason")):
+        return True
+    for reason in metadata.get("validation_reasons") or []:
+        if _is_trainable_red_dpo_rejection_reason(reason):
+            return True
+    return _rejected_example_is_already_correct(example)
+
+
+def _chosen_example_has_direct_trainable_rejection(example: RedTrainingExample) -> bool:
     metadata = dict(example.metadata or {})
     return (
-        _is_already_correct_rejection(metadata.get("red_dpo_rejection_reason"))
-        or _is_already_correct_rejection(metadata.get("rejection_reason"))
-        or _is_already_correct_rejection(metadata.get("rejected_reason"))
+        _is_trainable_red_dpo_rejection_reason(metadata.get("red_dpo_rejection_reason"))
+        or _is_trainable_red_dpo_rejection_reason(metadata.get("rejection_reason"))
+        or _is_trainable_red_dpo_rejection_reason(metadata.get("rejected_reason"))
     )
 
 
@@ -178,6 +208,7 @@ def _build_dpo_dataset(
             "direct_pairs": 0,
             "topic_pairs": 0,
             "already_correct_rejections": 0,
+            "trainable_rejections": 0,
             "topic_matches": {},
         }
 
@@ -198,7 +229,7 @@ def _build_dpo_dataset(
             or not chosen
             or not rejected
             or rejected == chosen
-            or not _chosen_example_has_direct_already_correct_rejection(example)
+            or not _chosen_example_has_direct_trainable_rejection(example)
         ):
             continue
         rows.append(
@@ -215,10 +246,12 @@ def _build_dpo_dataset(
                 "direct_pairs": direct_pairs,
                 "topic_pairs": 0,
                 "already_correct_rejections": sum(1 for item in rejected_examples if _rejected_example_is_already_correct(item)),
+                "trainable_rejections": sum(1 for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)),
                 "topic_matches": {},
             }
 
     already_correct_rejections = [item for item in rejected_examples if _rejected_example_is_already_correct(item)]
+    trainable_rejections = [item for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)]
     topic_offsets: Dict[str, int] = {}
     topic_matches: Dict[str, int] = {}
     topic_pairs = 0
@@ -227,7 +260,7 @@ def _build_dpo_dataset(
         for row in rows
     }
 
-    for item in already_correct_rejections:
+    for item in trainable_rejections:
         topic_key = _normalize_topic(item.topic)
         if not topic_key:
             continue
@@ -261,6 +294,7 @@ def _build_dpo_dataset(
         "direct_pairs": direct_pairs,
         "topic_pairs": topic_pairs,
         "already_correct_rejections": len(already_correct_rejections),
+        "trainable_rejections": len(trainable_rejections),
         "topic_matches": topic_matches,
     }
 

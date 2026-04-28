@@ -177,7 +177,7 @@ red:
   hardware:
     gpu_ids: [1, 2, 3]
     persistent: false
-    per_gpu_memory_gib: 36
+    per_gpu_memory_gib: 30
     cpu_offload_gib: 128
   generation:
     batch_size: 1
