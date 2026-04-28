@@ -17,7 +17,7 @@ task_execution:
   passed_task_keep_probability: 0.2
 
 storage:
-  root_dir: ./runs/28_04
+  root_dir: ./runs/29_04
   keep_last_n_checkpoints: 2
   hard_buffer_max_size: 2048
 
