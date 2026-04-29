@@ -198,7 +198,7 @@ red:
     max_sft_examples: 256
     max_dpo_pairs: 64
     mining_bottom_fraction: 0.25
-    hard_reward_max: 0.85
+    hard_reward_max: 0.80
     learning_rate: 4.0e-5
     epochs: 1
     per_device_batch_size: 1
