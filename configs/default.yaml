@@ -67,11 +67,11 @@ socratic:
   model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model
   tokenizer_name_or_path:
   base_adapter_path:
-  quantization:
+  quantization: 8bit
   enable_thinking: false
   hardware:
-    gpu_ids: [1, 2, 3]
-    persistent: true
+    gpu_ids: [1]
+    persistent: false
     per_gpu_memory_gib: 40
     cpu_offload_gib: 128
   generation:
@@ -175,9 +175,9 @@ red:
   force_base_generation_after_iteration: 17
   enable_thinking: false
   hardware:
-    gpu_ids: [1, 2, 3]
+    gpu_ids: [2, 3]
     persistent: false
-    per_gpu_memory_gib: 30
+    per_gpu_memory_gib: 40
     cpu_offload_gib: 128
   generation:
     batch_size: 1

@@ -114,7 +114,7 @@ def _compat_dpo_config(config: PipelineConfig, output_dir: str) -> Any:
         "bf16": bool(args.bf16),
         "fp16": bool(args.fp16),
         "gradient_checkpointing": bool(args.gradient_checkpointing),
-        "optim": "paged_adamw_8bit",
+        "optim": "adamw_torch",
         "max_length": int(args.max_length),
         "max_prompt_length": int(args.max_prompt_length),
         "beta": float(args.beta),

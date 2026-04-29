@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import argparse
 import os
+
+# Must be set before any torch import. Reduces caching-allocator fragmentation
+# so large allocations after many alloc/free cycles don't OOM despite headroom.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
 from typing import Iterable, List
 
 from acl_pipeline.config import load_config
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def _parse_cuda_visible_devices(value: str) -> List[int]:

@@ -42,12 +42,24 @@ def release_trainer_memory(trainer: Any) -> None:
         "model_wrapped",
         "processing_class",
         "tokenizer",
+        "ref_model",
+        "deepspeed",
+        "_trainer_state",
     ):
         if hasattr(trainer, attr):
             try:
+                obj = getattr(trainer, attr)
+                if obj is not None:
+                    try:
+                        del obj
+                    except Exception:
+                        pass
                 setattr(trainer, attr, None)
             except Exception:
                 pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     clear_cuda_memory()
 
 
@@ -142,14 +154,16 @@ def set_preferred_cuda_device(hardware: HardwareAllocation) -> None:
         torch.cuda.set_device(preferred)
 
 
-def build_device_map(hardware: HardwareAllocation) -> Any:
+def build_device_map(hardware: HardwareAllocation, *, leave_room_on_zero: bool = False) -> Any:
     local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
     if not local_gpu_ids:
         return None
     if len(local_gpu_ids) == 1:
         return {"": int(local_gpu_ids[0])}
-    # "auto" tends to fill one GPU before spilling. "balanced_low_0" leaves
-    # extra room on cuda:0 but can overfill cuda:1/2 during Qwen-32B loading.
+    # For trainable roles, leave headroom on cuda:0 for activation/grad spikes
+    # and to avoid contention with residue from previous training phases.
+    if leave_room_on_zero:
+        return "balanced_low_0"
     return "balanced"
 
 
@@ -294,10 +308,30 @@ class RoleSession:
         return outputs
 
     def unload(self) -> None:
-        if hasattr(self, "model"):
+        model = getattr(self, "model", None)
+        if model is not None:
+            # Drop PEFT/HF cross-references that keep the base model alive.
+            for attr in ("base_model", "model"):
+                inner = getattr(model, attr, None)
+                if inner is not None and inner is not model:
+                    try:
+                        setattr(model, attr, None)
+                    except Exception:
+                        pass
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            try:
+                del model
+            except Exception:
+                pass
             self.model = None
         if hasattr(self, "tokenizer"):
             self.tokenizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         clear_cuda_memory()
 
 
@@ -486,7 +520,7 @@ def load_role_session(
     tokenizer = load_tokenizer(model_name_or_path, tokenizer_name_or_path)
     quant_cfg = build_quantization_config(quantization)
     max_memory = build_max_memory(hardware)
-    device_map = build_device_map(hardware)
+    device_map = build_device_map(hardware, leave_room_on_zero=trainable)
     kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
@@ -501,12 +535,11 @@ def load_role_session(
         kwargs["use_cache"] = False
 
     model = None
+    # Use exactly the requested quantization. The previous behavior tried
+    # 8bit -> 4bit in the same process, but a partially-loaded bnb model
+    # leaves shards resident, so the retry actually has *less* free memory.
+    # Each role should declare its quantization explicitly and fail cleanly.
     load_attempts = [quantization]
-    if quantization and str(quantization).lower() == "8bit":
-        load_attempts.append("4bit")
-    if not quantization:
-        load_attempts.append(None)
-    load_attempts = list(dict.fromkeys(load_attempts))
 
     logger.event(
         "model_load_start",
@@ -564,8 +597,18 @@ def load_role_session(
                 raise
             last_error = str(exc)
             if attempt_model is not None:
-                del attempt_model
+                try:
+                    attempt_model.to("cpu")
+                except Exception:
+                    pass
+                try:
+                    del attempt_model
+                except Exception:
+                    pass
                 attempt_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             clear_cuda_memory()
             logger.warning(
                 "oom_model_load_retry",
