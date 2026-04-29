@@ -114,7 +114,7 @@ socratic:
     max_training_pairs: 128
     num_hint_candidates: 4
     max_pairs_per_task: 2
-    min_score_gap: 0.35
+    min_score_gap: 0.10
     learning_rate: 5.0e-5
     epochs: 1
     per_device_batch_size: 1

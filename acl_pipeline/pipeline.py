@@ -85,6 +85,11 @@ class AdversarialCurriculumPipeline:
     def _using_socratic_dpo(self) -> bool:
         return self._socratic_training_method() == "dpo"
 
+    def _socratic_preference_text(self, hint) -> str:
+        # Keep DPO aligned with Judge: the ranked score is based on raw_text,
+        # so the preference pair should train on that same model output.
+        return str(getattr(hint, "raw_text", "") or hint.text or "").strip()
+
     def _effective_red_generation_adapter(self, iteration_index: int) -> Optional[str]:
         if self._using_base_red_generation(iteration_index):
             return None
@@ -688,8 +693,8 @@ class AdversarialCurriculumPipeline:
 
             chosen_hint = chosen["hint"]
             rejected_hint = rejected["hint"]
-            chosen_text = str(chosen_hint.text or "").strip()
-            rejected_text = str(rejected_hint.text or "").strip()
+            chosen_text = self._socratic_preference_text(chosen_hint)
+            rejected_text = self._socratic_preference_text(rejected_hint)
             if not chosen_text or not rejected_text or chosen_text == rejected_text:
                 continue
 
@@ -713,6 +718,9 @@ class AdversarialCurriculumPipeline:
                     "chosen_rank": chosen.get("rank"),
                     "rejected_rank": rejected.get("rank"),
                     "score_gap": chosen_score - rejected_score,
+                    "preference_text_source": "raw_text",
+                    "chosen_clean_hint": chosen_hint.text,
+                    "rejected_clean_hint": rejected_hint.text,
                 },
             )
             self.storage.append_socratic_preference(example)

@@ -199,6 +199,8 @@ _PASSED_EXECUTION_REWARD = 0.5
 
 
 def _hint_text_for_judge(hint: SocraticHint) -> str:
+    # Score the model's original output, not the sanitized hint, so verbosity,
+    # code fences, direct fixes, and <think> leakage affect the reward.
     return str(getattr(hint, "raw_text", "") or hint.text or "")
 
 
@@ -816,7 +818,14 @@ class JudgeService:
                 score = max(0.0, min(10.0, float(forced_score)))
             else:
                 base_score = self._weighted_score(criteria)
-                score = 0.0 if zero_out else max(0.0, min(10.0, base_score + float(features["delta"])))
+                if zero_out:
+                    score = 0.0
+                else:
+                    delta = float(features["delta"])
+                    if delta > 0:
+                        headroom = max(0.0, 10.0 - base_score)
+                        delta = delta * (headroom / 10.0)
+                    score = max(0.0, min(10.0, base_score + delta))
             assessment = self._task_and_hint_assessment(
                 item,
                 score=score,
@@ -888,6 +897,7 @@ class JudgeService:
     def _output_from_details(self, task: PythonTask, hint: SocraticHint, details: Dict[str, Any]) -> JudgeOutput:
         raw_score = float(details["raw_score"])
         adjusted_score = float(details["adjusted_score"])
+        scored_text_source = "raw_text" if str(getattr(hint, "raw_text", "") or "").strip() else "text"
         return JudgeOutput(
             task_id=task.task_id,
             score=raw_score,
@@ -907,6 +917,7 @@ class JudgeService:
                 "hint_corruption": dict(details["hint_corruption"]),
                 "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
                 "hint_clean_text": hint.text,
+                "hint_scored_text_source": scored_text_source,
                 "local_tiebreak": dict(details["local_tiebreak"]),
             },
         )
