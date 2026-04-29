@@ -26,6 +26,10 @@ def detect_corrupted_hint_text(text: str) -> Dict[str, Any]:
         reasons.append("latin_cyrillic_mix")
     if _LATIN_RE.search(raw) and _ARABIC_RE.search(raw):
         reasons.append("latin_arabic_mix")
+    if raw.count("`") % 2 == 1:
+        reasons.append("unbalanced_backticks")
+    if re.search(r"(\\\?{2,}|[?؟]{3,}|!{3,})", raw):
+        reasons.append("punctuation_noise")
 
     for token in ("вЂ", "â€™", "â€œ", "â€", "Ã", "�"):
         if token in raw:

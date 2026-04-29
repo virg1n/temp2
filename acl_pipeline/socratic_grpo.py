@@ -16,7 +16,7 @@ from transformers import set_seed
 from .config import PipelineConfig
 from .judge import JudgeService
 from .logging_utils import StructuredLogger
-from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error
+from .modeling import ModelPool, attach_lora_adapter, clear_cuda_memory, is_oom_error, release_trainer_memory
 from .prompts import build_socratic_messages
 from .schemas import EpisodeRecord
 from .storage import SimpleStorage
@@ -27,8 +27,9 @@ except Exception:  # noqa: BLE001
     try:
         from trl.trainer.grpo_config import GRPOConfig
         from trl.trainer.grpo_trainer import GRPOTrainer
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("TRL with GRPO support is required for Socratic updates.") from exc
+    except Exception:  # noqa: BLE001
+        GRPOConfig = None
+        GRPOTrainer = None
 
 
 @dataclass
@@ -80,6 +81,7 @@ def _compat_grpo_config(config: PipelineConfig, output_dir: str) -> Any:
         "bf16": bool(args.bf16),
         "fp16": bool(args.fp16),
         "gradient_checkpointing": bool(args.gradient_checkpointing),
+        "optim": "adamw_torch",
         "max_prompt_length": int(args.max_prompt_length),
         "max_completion_length": int(args.max_completion_length),
         "num_generations": int(args.num_generations),
@@ -136,6 +138,9 @@ class SocraticGrpoUpdater:
         model_source: str,
         adapter_path: Optional[str],
     ) -> Optional[SocraticUpdateResult]:
+        if GRPOConfig is None or GRPOTrainer is None:
+            raise RuntimeError("TRL with GRPO support is required when socratic.training_method is 'grpo'.")
+
         if len(episodes) < self.config.socratic.grpo.min_episodes_before_update:
             self.logger.event(
                 "socratic_grpo_skip",
@@ -200,6 +205,7 @@ class SocraticGrpoUpdater:
                 session.tokenizer.save_pretrained(str(adapter_dir))
                 result = SocraticUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
 
+            release_trainer_memory(trainer)
             self.storage.prune_role_checkpoints("socratic")
             self.logger.event(
                 "socratic_grpo_complete",

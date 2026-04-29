@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gc
 import json
-from dataclasses import dataclass, replace
+import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -18,6 +20,48 @@ def clear_cuda_memory() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+
+def release_trainer_memory(trainer: Any) -> None:
+    if trainer is None:
+        clear_cuda_memory()
+        return
+    accelerator = getattr(trainer, "accelerator", None)
+    try:
+        if accelerator is not None and hasattr(accelerator, "free_memory"):
+            accelerator.free_memory()
+        elif accelerator is not None and hasattr(accelerator, "clear"):
+            accelerator.clear()
+    except Exception:
+        pass
+    for attr in (
+        "optimizer",
+        "lr_scheduler",
+        "train_dataset",
+        "eval_dataset",
+        "model_wrapped",
+        "model",
+        "processing_class",
+        "tokenizer",
+        "ref_model",
+        "deepspeed",
+        "_trainer_state",
+    ):
+        if hasattr(trainer, attr):
+            try:
+                obj = getattr(trainer, attr)
+                if obj is not None:
+                    try:
+                        del obj
+                    except Exception:
+                        pass
+                setattr(trainer, attr, None)
+            except Exception:
+                pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    clear_cuda_memory()
 
 
 def is_oom_error(exc: BaseException) -> bool:
@@ -47,16 +91,92 @@ def build_quantization_config(mode: Optional[str]) -> Optional[BitsAndBytesConfi
     raise ValueError(f"Unsupported quantization mode: {mode}")
 
 
+def _visible_cuda_physical_ids() -> List[int]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return []
+    ids: List[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.append(int(item))
+        except ValueError:
+            return []
+    return ids
+
+
+def _local_cuda_ids(gpu_ids: Iterable[int]) -> List[int]:
+    requested = [int(gpu_id) for gpu_id in gpu_ids]
+    visible_physical_ids = _visible_cuda_physical_ids()
+    if not requested or not visible_physical_ids:
+        return requested
+    physical_to_local = {physical_id: index for index, physical_id in enumerate(visible_physical_ids)}
+    if all(gpu_id in physical_to_local for gpu_id in requested):
+        return [physical_to_local[gpu_id] for gpu_id in requested]
+    return requested
+
+
+def _validate_local_cuda_ids(role_name: str, local_gpu_ids: List[int]) -> None:
+    if not torch.cuda.is_available() or not local_gpu_ids:
+        return
+    device_count = torch.cuda.device_count()
+    invalid = [gpu_id for gpu_id in local_gpu_ids if gpu_id < 0 or gpu_id >= device_count]
+    if invalid:
+        raise RuntimeError(
+            f"{role_name} GPU allocation resolves to local CUDA ids {local_gpu_ids}, "
+            f"but only {device_count} CUDA device(s) are visible "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r})."
+        )
+
+
 def build_max_memory(hardware: HardwareAllocation) -> Optional[Dict[Any, str]]:
     if not hardware.gpu_ids:
         return None
-    max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in hardware.gpu_ids}
+    target_gpu_ids = set(_local_cuda_ids(hardware.gpu_ids))
+    max_memory: Dict[Any, str] = {gpu_id: f"{hardware.per_gpu_memory_gib}GiB" for gpu_id in target_gpu_ids}
+    if torch.cuda.is_available():
+        for gpu_id in range(torch.cuda.device_count()):
+            if gpu_id not in target_gpu_ids:
+                max_memory[gpu_id] = "0GiB"
     max_memory["cpu"] = f"{hardware.cpu_offload_gib}GiB"
     return max_memory
 
 
-def single_gpu_hardware(hardware: HardwareAllocation, gpu_id: int) -> HardwareAllocation:
-    return replace(hardware, gpu_ids=[int(gpu_id)])
+def set_preferred_cuda_device(hardware: HardwareAllocation) -> None:
+    if not torch.cuda.is_available() or not hardware.gpu_ids:
+        return
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    if not local_gpu_ids:
+        return
+    preferred = int(local_gpu_ids[0])
+    if 0 <= preferred < torch.cuda.device_count():
+        torch.cuda.set_device(preferred)
+
+
+def build_device_map(hardware: HardwareAllocation, *, leave_room_on_zero: bool = False) -> Any:
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    if not local_gpu_ids:
+        return None
+    if len(local_gpu_ids) == 1:
+        return {"": int(local_gpu_ids[0])}
+    # For trainable roles, leave headroom on cuda:0 for activation/grad spikes
+    # and to avoid contention with residue from previous training phases.
+    if leave_room_on_zero:
+        return "balanced_low_0"
+    return "balanced"
+
+
+def summarize_device_map(model: Any) -> Dict[str, int]:
+    device_map = getattr(model, "hf_device_map", None)
+    if not isinstance(device_map, dict):
+        return {}
+    summary: Dict[str, int] = {}
+    for value in device_map.values():
+        key = str(value)
+        summary[key] = summary.get(key, 0) + 1
+    return summary
 
 
 def render_chat_messages(
@@ -158,18 +278,25 @@ class RoleSession:
         messages_batch: Iterable[List[Dict[str, str]]],
         *,
         generation: Optional[GenerationSettings] = None,
+        response_prefixes: Optional[List[str]] = None,
     ) -> List[str]:
         effective = generation or self.generation
-        prompts = [
-            render_chat_messages(
+        prompts: List[str] = []
+        prefixes = list(response_prefixes or [])
+        messages_list = list(messages_batch)
+        if prefixes and len(prefixes) != len(messages_list):
+            raise ValueError("response_prefixes length must match messages_batch length")
+        for index, messages in enumerate(messages_list):
+            prompt = render_chat_messages(
                 self.tokenizer,
                 list(messages),
                 enable_thinking=self.enable_thinking,
                 add_generation_prompt=True,
             )
-            for messages in messages_batch
-        ]
-        return _generate_texts(
+            if prefixes:
+                prompt += prefixes[index]
+            prompts.append(prompt)
+        outputs = _generate_texts(
             model=self.model,
             tokenizer=self.tokenizer,
             prompts=prompts,
@@ -177,11 +304,120 @@ class RoleSession:
             logger=self.logger,
             role_name=self.role_name,
         )
+        if prefixes:
+            return [prefix + output for prefix, output in zip(prefixes, outputs)]
+        return outputs
 
     def unload(self) -> None:
-        del self.model
-        del self.tokenizer
+        model = getattr(self, "model", None)
+        if model is not None:
+            # Drop PEFT/HF cross-references that keep the base model alive.
+            for attr in ("base_model", "model"):
+                inner = getattr(model, attr, None)
+                if inner is not None and inner is not model:
+                    try:
+                        setattr(model, attr, None)
+                    except Exception:
+                        pass
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            try:
+                del model
+            except Exception:
+                pass
+            self.model = None
+        if hasattr(self, "tokenizer"):
+            self.tokenizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         clear_cuda_memory()
+
+
+@dataclass
+class ServerRoleSession:
+    role_name: str
+    model_name_or_path: str
+    generation: GenerationSettings
+    enable_thinking: bool
+    logger: StructuredLogger
+    base_url: str
+    api_key: str
+    timeout_seconds: int
+    max_retries: int
+    _client: Any = None
+
+    def _client_instance(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import OpenAI
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("openai package is required for vLLM server-backed inference.") from exc
+            self._client = OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout_seconds,
+            )
+        return self._client
+
+    def generate(
+        self,
+        messages_batch: Iterable[List[Dict[str, str]]],
+        *,
+        generation: Optional[GenerationSettings] = None,
+        response_prefixes: Optional[List[str]] = None,
+    ) -> List[str]:
+        if response_prefixes:
+            raise RuntimeError("response_prefixes are not supported for server-backed generation.")
+        effective = generation or self.generation
+        client = self._client_instance()
+        outputs: List[str] = []
+        for messages in messages_batch:
+            text = ""
+            last_err: Optional[Exception] = None
+            max_tokens = max(1, int(effective.max_new_tokens))
+            for attempt in range(max(1, int(self.max_retries) + 1)):
+                try:
+                    response = client.chat.completions.create(
+                        model=self.model_name_or_path,
+                        messages=list(messages),
+                        temperature=float(effective.temperature) if effective.do_sample else 0.0,
+                        top_p=float(effective.top_p),
+                        max_tokens=max_tokens,
+                        extra_body={"chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}},
+                    )
+                    text = str(response.choices[0].message.content or "").strip()
+                    last_err = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    message = str(exc).lower()
+                    if "context length" in message and max_tokens > 64:
+                        max_tokens = max(64, max_tokens // 2)
+                        self.logger.warning(
+                            "server_generate_context_retry",
+                            role=self.role_name,
+                            model_name_or_path=self.model_name_or_path,
+                            next_max_tokens=max_tokens,
+                            error=str(exc),
+                        )
+                        continue
+                    time.sleep(min(2**attempt, 8))
+            if last_err is not None:
+                self.logger.warning(
+                    "server_generate_failed",
+                    role=self.role_name,
+                    model_name_or_path=self.model_name_or_path,
+                    error=str(last_err),
+                )
+                text = "[]"
+            outputs.append(text)
+        return outputs
+
+    def unload(self) -> None:
+        self._client = None
 
 
 def _generate_texts(
@@ -225,10 +461,12 @@ def _generate_texts(
                 gen_kwargs["top_p"] = float(generation.top_p)
             result = model.generate(**gen_kwargs)
 
-            attention_mask = encoded["attention_mask"]
+            # Tokenizer uses left padding, so all rows are right-aligned at the
+            # same input width. Slicing by attention_mask.sum() leaks the prompt
+            # tail into shorter rows; use the padded input width instead.
+            prompt_width = int(encoded["input_ids"].shape[1])
             for row_index in range(result.size(0)):
-                prompt_len = int(attention_mask[row_index].sum().item())
-                new_tokens = result[row_index, prompt_len:]
+                new_tokens = result[row_index, prompt_width:]
                 outputs.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
             start += len(chunk)
         except RuntimeError as exc:
@@ -278,63 +516,102 @@ def load_role_session(
     trainable: bool = False,
     gradient_checkpointing: bool = False,
 ) -> RoleSession:
+    clear_cuda_memory()
+    local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
+    _validate_local_cuda_ids(role_name, local_gpu_ids)
+    set_preferred_cuda_device(hardware)
     tokenizer = load_tokenizer(model_name_or_path, tokenizer_name_or_path)
     quant_cfg = build_quantization_config(quantization)
+    max_memory = build_max_memory(hardware)
+    device_map = build_device_map(hardware, leave_room_on_zero=trainable)
     kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "low_cpu_mem_usage": True,
-        "device_map": "auto" if hardware.gpu_ids else None,
-        "max_memory": build_max_memory(hardware),
+        "device_map": device_map,
+        "max_memory": max_memory,
+        "torch_dtype": _dtype_for_runtime() if torch.cuda.is_available() else torch.float32,
     }
     if quant_cfg is not None:
         kwargs["quantization_config"] = quant_cfg
-    else:
-        kwargs["torch_dtype"] = _dtype_for_runtime() if torch.cuda.is_available() else torch.float32
 
     if gradient_checkpointing:
         kwargs["use_cache"] = False
 
     model = None
+    # Use exactly the requested quantization. The previous behavior tried
+    # 8bit -> 4bit in the same process, but a partially-loaded bnb model
+    # leaves shards resident, so the retry actually has *less* free memory.
+    # Each role should declare its quantization explicitly and fail cleanly.
     load_attempts = [quantization]
-    if quantization and str(quantization).lower() == "8bit":
-        load_attempts.append("4bit")
-    load_attempts.append(None)
 
-    last_exc: Optional[BaseException] = None
+    logger.event(
+        "model_load_start",
+        role=role_name,
+        model_name_or_path=model_name_or_path,
+        adapter_path=adapter_path,
+        quantization=quantization,
+        load_attempts=load_attempts,
+        requested_gpu_ids=hardware.gpu_ids,
+        local_gpu_ids=local_gpu_ids,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        device_map=device_map,
+        max_memory={str(key): value for key, value in (max_memory or {}).items()},
+        trainable=trainable,
+    )
+
+    last_error: Optional[str] = None
     for mode in load_attempts:
+        attempt_model = None
         try:
+            clear_cuda_memory()
             local_kwargs = dict(kwargs)
             local_kwargs["quantization_config"] = build_quantization_config(mode)
             if local_kwargs["quantization_config"] is None:
                 local_kwargs.pop("quantization_config", None)
                 local_kwargs["torch_dtype"] = _dtype_for_runtime() if torch.cuda.is_available() else torch.float32
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **local_kwargs)
+            attempt_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **local_kwargs)
             if adapter_path:
                 try:
                     from peft import PeftModel
 
-                    model = PeftModel.from_pretrained(model, adapter_path, is_trainable=trainable)
+                    attempt_model = PeftModel.from_pretrained(attempt_model, adapter_path, is_trainable=trainable)
                 except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(f"Failed to load adapter from {adapter_path}") from exc
+                    if is_oom_error(exc):
+                        raise RuntimeError(f"CUDA out of memory while loading adapter from {adapter_path}: {exc}") from exc
+                    raise RuntimeError(f"Failed to load adapter from {adapter_path}: {exc}") from exc
 
             if trainable and local_kwargs.get("quantization_config") is not None:
                 try:
                     from peft import prepare_model_for_kbit_training
 
-                    model = prepare_model_for_kbit_training(
-                        model,
+                    attempt_model = prepare_model_for_kbit_training(
+                        attempt_model,
                         use_gradient_checkpointing=gradient_checkpointing,
                     )
                 except Exception:
                     pass
 
-            if trainable and gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable()
+            if trainable and gradient_checkpointing and hasattr(attempt_model, "gradient_checkpointing_enable"):
+                attempt_model.gradient_checkpointing_enable()
+            model = attempt_model
             break
         except RuntimeError as exc:
             if not is_oom_error(exc):
                 raise
-            last_exc = exc
+            last_error = str(exc)
+            if attempt_model is not None:
+                try:
+                    attempt_model.to("cpu")
+                except Exception:
+                    pass
+                try:
+                    del attempt_model
+                except Exception:
+                    pass
+                attempt_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             clear_cuda_memory()
             logger.warning(
                 "oom_model_load_retry",
@@ -344,7 +621,9 @@ def load_role_session(
             )
 
     if model is None:
-        raise RuntimeError(f"Unable to load {role_name} model after OOM fallbacks: {last_exc}")
+        del tokenizer
+        clear_cuda_memory()
+        raise RuntimeError(f"Unable to load {role_name} model after OOM fallbacks: {last_error}")
 
     logger.event(
         "model_loaded",
@@ -353,6 +632,8 @@ def load_role_session(
         adapter_path=adapter_path,
         quantization=quantization,
         gpu_ids=hardware.gpu_ids,
+        local_gpu_ids=local_gpu_ids,
+        device_map_summary=summarize_device_map(model),
         persistent=hardware.persistent,
         trainable=trainable,
     )
@@ -373,24 +654,47 @@ class ModelPool:
         self.config = config
         self.logger = logger
         self._judge: Optional[RoleSession] = None
+        self._judge_backend = str(config.judge.inference_backend or "transformers").strip().lower()
         self._socratic: Optional[RoleSession] = None
         self._socratic_source: Optional[str] = None
         self._socratic_adapter: Optional[str] = None
 
     def get_judge(self) -> RoleSession:
         if self._judge is None:
-            self._judge = load_role_session(
-                role_name="judge",
-                model_name_or_path=self.config.judge.model_name_or_path,
-                tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
-                hardware=self.config.judge.hardware,
-                generation=self.config.judge.generation,
-                quantization=self.config.judge.quantization,
-                enable_thinking=self.config.judge.enable_thinking,
-                logger=self.logger,
-                adapter_path=self.config.judge.base_adapter_path,
-                trainable=False,
-            )
+            if self._judge_backend == "vllm_server":
+                self._judge = ServerRoleSession(
+                    role_name="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    generation=self.config.judge.generation,
+                    enable_thinking=self.config.judge.enable_thinking,
+                    logger=self.logger,
+                    base_url=self.config.judge.vllm_base_url,
+                    api_key=self.config.judge.vllm_api_key,
+                    timeout_seconds=self.config.judge.vllm_timeout_seconds,
+                    max_retries=self.config.judge.vllm_max_retries,
+                )
+                self.logger.event(
+                    "model_loaded",
+                    role="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    backend=self._judge_backend,
+                    base_url=self.config.judge.vllm_base_url,
+                    persistent=True,
+                    trainable=False,
+                )
+            else:
+                self._judge = load_role_session(
+                    role_name="judge",
+                    model_name_or_path=self.config.judge.model_name_or_path,
+                    tokenizer_name_or_path=self.config.judge.tokenizer_name_or_path,
+                    hardware=self.config.judge.hardware,
+                    generation=self.config.judge.generation,
+                    quantization=self.config.judge.quantization,
+                    enable_thinking=self.config.judge.enable_thinking,
+                    logger=self.logger,
+                    adapter_path=self.config.judge.base_adapter_path,
+                    trainable=False,
+                )
         return self._judge
 
     def get_socratic(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
@@ -424,6 +728,11 @@ class ModelPool:
 
     def load_socratic_trainable(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
         source = model_source or self.config.socratic.model_name_or_path
+        self.release_socratic()
+        if str(self.config.socratic.training_method).lower() == "dpo":
+            gradient_checkpointing = self.config.socratic.dpo.gradient_checkpointing
+        else:
+            gradient_checkpointing = self.config.socratic.grpo.gradient_checkpointing
         return load_role_session(
             role_name="socratic_train",
             model_name_or_path=source,
@@ -435,13 +744,29 @@ class ModelPool:
             logger=self.logger,
             adapter_path=adapter_path or self.config.socratic.base_adapter_path,
             trainable=True,
-            gradient_checkpointing=self.config.socratic.grpo.gradient_checkpointing,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
-    def load_red_generation(self, *, adapter_path: Optional[str] = None, gpu_id: Optional[int] = None) -> RoleSession:
-        hardware = self.config.red.hardware if gpu_id is None else single_gpu_hardware(self.config.red.hardware, gpu_id)
+    def load_red_generation(
+        self,
+        *,
+        adapter_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+        allow_base_adapter_fallback: bool = True,
+    ) -> RoleSession:
+        hardware = self.config.red.hardware
+        if gpu_id is not None:
+            hardware = HardwareAllocation(
+                gpu_ids=[int(gpu_id)],
+                persistent=hardware.persistent,
+                per_gpu_memory_gib=hardware.per_gpu_memory_gib,
+                cpu_offload_gib=hardware.cpu_offload_gib,
+            )
+        effective_adapter_path = adapter_path
+        if effective_adapter_path is None and allow_base_adapter_fallback:
+            effective_adapter_path = self.config.red.base_adapter_path
         return load_role_session(
-            role_name="red_generation" if gpu_id is None else f"red_generation_{gpu_id}",
+            role_name="red_generation",
             model_name_or_path=self.config.red.model_name_or_path,
             tokenizer_name_or_path=self.config.red.tokenizer_name_or_path,
             hardware=hardware,
@@ -449,7 +774,7 @@ class ModelPool:
             quantization=self.config.red.generation_quantization,
             enable_thinking=self.config.red.enable_thinking,
             logger=self.logger,
-            adapter_path=adapter_path or self.config.red.base_adapter_path,
+            adapter_path=effective_adapter_path,
             trainable=False,
         )
 
@@ -484,6 +809,7 @@ class ModelPool:
     def debug_summary(self) -> str:
         payload = {
             "judge_loaded": self._judge is not None,
+            "judge_backend": self._judge_backend,
             "socratic_loaded": self._socratic is not None,
             "socratic_source": self._socratic_source,
             "socratic_adapter": self._socratic_adapter,

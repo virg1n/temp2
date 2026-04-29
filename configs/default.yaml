@@ -1,6 +1,6 @@
 runtime:
   seed: 42
-  total_episodes: 100
+  total_episodes: 400
   debug_all: false
   iteration_size: 8
   checkpoint_every_episodes: 10
@@ -9,14 +9,15 @@ runtime:
 task_execution:
   enabled: true
   python_executable: python
-  timeout_seconds: 12
+  timeout_seconds: 5
   max_red_generation_attempts: 4
   capture_max_chars: 1600
-  min_code_lines_for_repair: 15
+  min_code_lines_for_repair: 10
   probabilistic_repair_probability: 0.5
+  passed_task_keep_probability: 0.2
 
 storage:
-  root_dir: ./runs/18_04
+  root_dir: ./runs/29_04
   keep_last_n_checkpoints: 2
   hard_buffer_max_size: 2048
 
@@ -25,6 +26,8 @@ curriculum:
   low_reward_boost: 1.5
   iteration_weak_topic_boost: 0.15
   repeat_topic_reset_threshold: 5
+  adaptive_weighting_until_iteration: 150
+  post_adaptation_topic_weight: 1.0
   topics:
     - name: Conditional Statements
       weight: 1.0
@@ -42,11 +45,7 @@ curriculum:
       weight: 1.0
     - name: NumPy and Linear Algebra
       weight: 1.0
-<<<<<<< Updated upstream
-=======
     - name: Decorators and Closures
-      weight: 1.0
-    - name: Iterators, Generators, and Lazy Evaluation
       weight: 1.0
     - name: Exception Handling and Custom Exceptions
       weight: 1.0
@@ -54,36 +53,32 @@ curriculum:
       weight: 1.0
     - name: Inheritance, MRO, and Dunder Methods
       weight: 1.0
-    - name: Context Managers and Resource Lifecycles
-      weight: 1.0
-    - name: Metaclasses and Descriptor Protocol
-      weight: 1.0
-    - name: Concurrency with Asyncio
-      weight: 1.0
     - name: Lists, Tuples, and Slicing
       weight: 1.0
     - name: Loops and Iteration
       weight: 1.0
     - name: Arithmetic and Type Conversion
       weight: 1.0
->>>>>>> Stashed changes
 
 socratic:
-  model_name_or_path: /home/jovyan/cs5483_24b/Tutorial1/2026/Training/runs/qwen2b-grpo/model
+  # Choose "grpo" for online reward optimization or "dpo" for Judge-ranked
+  # preference learning over multiple sampled hints per task.
+  training_method: dpo
+  model_name_or_path: Qwen/Qwen3-1.7B
   tokenizer_name_or_path:
   base_adapter_path:
-  quantization:
+  quantization: 8bit
   enable_thinking: false
   hardware:
-    gpu_ids: [1, 2, 3]
-    persistent: true
-    per_gpu_memory_gib: 46
+    gpu_ids: [1]
+    persistent: false
+    per_gpu_memory_gib: 40
     cpu_offload_gib: 128
   generation:
     batch_size: 1
     max_new_tokens: 480
-    temperature: 1.10
-    top_p: 1.0
+    temperature: 1.20
+    top_p: 0.9
     do_sample: true
     repetition_penalty: 1.05
   lora:
@@ -113,11 +108,39 @@ socratic:
     fp16: false
     gradient_checkpointing: true
     full_ft: false
+  dpo:
+    update_every_episodes: 8
+    min_preference_pairs_before_update: 16
+    max_training_pairs: 128
+    num_hint_candidates: 4
+    max_pairs_per_task: 2
+    min_score_gap: 0.10
+    learning_rate: 5.0e-5
+    epochs: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 4
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    beta: 0.1
+    max_length: 2048
+    max_prompt_length: 1536
+    logging_steps: 10
+    save_steps: 100
+    save_total_limit: 2
+    bf16: true
+    fp16: false
+    gradient_checkpointing: true
+    full_ft: false
 
 judge:
   model_name_or_path: Qwen/Qwen3-32B
   tokenizer_name_or_path:
   base_adapter_path:
+  inference_backend: vllm_server
+  vllm_base_url: http://localhost:8000/v1
+  vllm_api_key: EMPTY
+  vllm_timeout_seconds: 120
+  vllm_max_retries: 2
   quantization: 8bit
   enable_thinking: false
   reward_weights:
@@ -127,7 +150,7 @@ judge:
     socratic_style: 0.15
     technical_accuracy: 0.1
   batch_spread_strength: 0.15
-  episode_batch_size: 4
+  episode_batch_size: 1
   bad_task_threshold: 3.0
   hardware:
     gpu_ids: [0]
@@ -136,9 +159,9 @@ judge:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 860
+    max_new_tokens: 2400
     temperature: 0.5
-    top_p: 1.0
+    top_p: 0.7
     do_sample: false
     repetition_penalty: 1.0
 
@@ -148,23 +171,24 @@ red:
   base_adapter_path:
   quantization:
   generation_quantization: 8bit
-  update_quantization: 8bit
+  update_quantization: 4bit
+  force_base_generation_after_iteration: 17
   enable_thinking: false
   hardware:
-    gpu_ids: [1, 2, 3]
+    gpu_ids: [2, 3]
     persistent: false
-    per_gpu_memory_gib: 46
+    per_gpu_memory_gib: 40
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 1000
+    max_new_tokens: 1536
     temperature: 1.1
     top_p: 0.90
     do_sample: true
     repetition_penalty: 1.02
   lora:
     enabled: true
-    r: 64
+    r: 32
     alpha: 128
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
@@ -172,13 +196,14 @@ red:
     update_every_episodes: 8
     min_hard_examples: 4
     max_sft_examples: 256
-    max_dpo_pairs: 128
+    max_dpo_pairs: 64
     mining_bottom_fraction: 0.25
-    learning_rate: 1.0e-4
+    hard_reward_max: 0.80
+    learning_rate: 4.0e-5
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
-    max_length: 2048
+    max_length: 1536
     logging_steps: 10
     dpo_enabled: true
     dpo_beta: 0.1

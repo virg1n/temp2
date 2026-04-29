@@ -134,6 +134,31 @@ class RedRejectedExample:
 
 
 @dataclass
+class SocraticPreferenceExample:
+    example_id: str
+    topic: str
+    task: PythonTask
+    chosen_hint: str
+    rejected_hint: str
+    chosen_score: float
+    rejected_score: float
+    chosen_judge: Dict[str, Any] = field(default_factory=dict)
+    rejected_judge: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["task"] = self.task.to_dict()
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "SocraticPreferenceExample":
+        row = dict(payload)
+        row["task"] = PythonTask(**row["task"])
+        return cls(**row)
+
+
+@dataclass
 class EpisodeRecord:
     episode_id: int
     topic: str
