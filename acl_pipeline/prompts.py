@@ -107,7 +107,10 @@ def build_red_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[s
 
 
 def build_red_response_prefix(topic: str) -> str:
-    return '{\n  "topic": ' + json.dumps(topic, ensure_ascii=False) + ',\n  "target_function": "'
+    # End at a safe key boundary (after a comma + indent), not mid-string.
+    # Opening a string slot like `"target_function": "` confuses base models
+    # into restarting the JSON inside the value, producing duplicated keys.
+    return '{\n  "topic": ' + json.dumps(topic, ensure_ascii=False) + ',\n  '
 
 
 def build_judge_batch_messages(

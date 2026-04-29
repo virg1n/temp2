@@ -37,15 +37,6 @@ def _unique_ints(values: Iterable[int]) -> List[int]:
     return result
 
 
-def _remap_hardware_to_visible_ordinals(hardware: object, visible_physical_ids: List[int]) -> None:
-    gpu_ids = [int(item) for item in getattr(hardware, "gpu_ids", [])]
-    if not gpu_ids or not visible_physical_ids:
-        return
-    physical_to_local = {physical_id: index for index, physical_id in enumerate(visible_physical_ids)}
-    if all(gpu_id in physical_to_local for gpu_id in gpu_ids):
-        setattr(hardware, "gpu_ids", [physical_to_local[gpu_id] for gpu_id in gpu_ids])
-
-
 def _configure_cuda_visibility(config: object) -> None:
     existing_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     visible_physical_ids = _parse_cuda_visible_devices(existing_visible) if existing_visible else []
@@ -75,9 +66,9 @@ def _configure_cuda_visibility(config: object) -> None:
         if requested:
             visible_physical_ids = requested
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in visible_physical_ids)
-
-    for hardware in local_hardware:
-        _remap_hardware_to_visible_ordinals(hardware, visible_physical_ids)
+    # Physical -> local CUDA index remapping is handled exclusively by
+    # modeling._local_cuda_ids. Doing it here too caused a double-remap that
+    # silently moved roles onto unintended physical GPUs.
 
 
 def main() -> None:

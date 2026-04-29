@@ -461,10 +461,12 @@ def _generate_texts(
                 gen_kwargs["top_p"] = float(generation.top_p)
             result = model.generate(**gen_kwargs)
 
-            attention_mask = encoded["attention_mask"]
+            # Tokenizer uses left padding, so all rows are right-aligned at the
+            # same input width. Slicing by attention_mask.sum() leaks the prompt
+            # tail into shorter rows; use the padded input width instead.
+            prompt_width = int(encoded["input_ids"].shape[1])
             for row_index in range(result.size(0)):
-                prompt_len = int(attention_mask[row_index].sum().item())
-                new_tokens = result[row_index, prompt_len:]
+                new_tokens = result[row_index, prompt_width:]
                 outputs.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
             start += len(chunk)
         except RuntimeError as exc:
