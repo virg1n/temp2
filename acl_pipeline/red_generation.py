@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import ast
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -41,6 +42,33 @@ def _extract_json(text: str) -> Optional[Any]:
     return None
 
 
+def _is_pytest_raises_with(node: ast.AST) -> bool:
+    if not isinstance(node, ast.With):
+        return False
+    for item in node.items:
+        expr = item.context_expr
+        if not isinstance(expr, ast.Call):
+            continue
+        func = expr.func
+        if isinstance(func, ast.Attribute) and func.attr == "raises":
+            return True
+        if isinstance(func, ast.Name) and func.id == "raises":
+            return True
+    return False
+
+
+def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
+    try:
+        tree = ast.parse(program or "")
+    except SyntaxError as exc:
+        return [], f"syntax error while parsing tests: {exc.msg}"
+    signature: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assert) or _is_pytest_raises_with(node):
+            signature.append(ast.dump(node, include_attributes=False))
+    return signature, None
+
+
 class RedTaskGenerator:
     def __init__(self, logger: StructuredLogger) -> None:
         self.logger = logger
@@ -63,12 +91,14 @@ class RedTaskGenerator:
         intended_bug = str(payload.get("intended_bug") or "").strip()
         expected_first_failure = str(payload.get("expected_first_failure") or "").strip()
         statement = str(payload.get("statement") or "").strip()
+        reference_solution = str(payload.get("reference_solution") or "").strip()
         solution = str(payload.get("buggy_solution") or "").strip()
         failing_asserts = payload.get("failing_asserts") or payload.get("asserts") or []
         if isinstance(failing_asserts, str):
             failing_asserts = [failing_asserts]
         failing_asserts = [str(item).strip() for item in failing_asserts if str(item).strip()]
         metadata = dict(payload.get("metadata") or {})
+        difficulty = str(metadata.get("difficulty") or "").strip().lower()
         reasons: List[str] = []
         if not topic:
             reasons.append("missing topic")
@@ -82,8 +112,27 @@ class RedTaskGenerator:
             reasons.append("missing expected_first_failure")
         if not statement:
             reasons.append("missing statement")
+        if not reference_solution:
+            reasons.append("missing reference_solution")
         if not solution:
             reasons.append("missing buggy_solution")
+        if not str(metadata.get("failure_mode") or "").strip():
+            reasons.append("missing metadata.failure_mode")
+        if difficulty not in {"medium", "hard"}:
+            reasons.append("invalid metadata.difficulty")
+        if reference_solution and solution:
+            reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
+            buggy_tests, buggy_parse_error = _shared_test_signature(solution)
+            if reference_parse_error:
+                reasons.append("reference_solution parse error")
+            if buggy_parse_error:
+                reasons.append("buggy_solution parse error")
+            if not reference_tests:
+                reasons.append("missing shared tests in reference_solution")
+            if not buggy_tests:
+                reasons.append("missing shared tests in buggy_solution")
+            if reference_tests and buggy_tests and reference_tests != buggy_tests:
+                reasons.append("solutions do not share identical tests")
         if reasons:
             return None, list(dict.fromkeys(reasons))
 
@@ -100,14 +149,17 @@ class RedTaskGenerator:
             topic=topic,
             statement=statement,
             buggy_solution=solution,
-            failing_asserts=failing_asserts,
             metadata=metadata,
+            failing_asserts=failing_asserts,
+            reference_solution=reference_solution,
         )
+        task.metadata["reference_solution"] = reference_solution
         task.metadata["red_spec"] = spec.to_dict()
         task.metadata.setdefault("failure_mode", str(metadata.get("failure_mode") or intended_bug))
+        task.metadata.setdefault("difficulty", difficulty)
         task.metadata.setdefault("observed_failure", "AssertionError")
         task.metadata["raw_response"] = raw
-        task.metadata["red_format"] = "single_json_v1"
+        task.metadata["red_format"] = "dual_solution_json_v1"
         self.logger.debug_dump("red_task", task=task)
         return task, []
 

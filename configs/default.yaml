@@ -144,14 +144,107 @@ judge:
   quantization: 8bit
   enable_thinking: false
   reward_weights:
-    no_solution_reveal: 0.3
-    bug_localization: 0.2
+    bug_localization: 0.25
     usefulness: 0.25
-    socratic_style: 0.15
-    technical_accuracy: 0.1
+    socratic_style: 0.25
+    technical_accuracy: 0.25
   batch_spread_strength: 0.15
   episode_batch_size: 1
   bad_task_threshold: 3.0
+  normalize_across_batches: 8
+  examples:
+    # Anti-example: solution write-up with "Solution:" + "let's debug"
+    - statement: "Count vowels in a string."
+      code: |
+        def count_vowels(s):
+            return sum(1 for ch in s if ch in 'aeiou')
+        assert count_vowels('Apple') == 2
+      observed_failure: "AssertionError: assert 1 == 2"
+      hint_text: "Solution: let's debug this by lowercasing each character before the membership test."
+      expected_criteria_scores:
+        bug_localization: 2
+        usefulness: 2
+        socratic_style: 1
+        technical_accuracy: 2
+      expected_no_solution_reveal: false
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Starts with 'Solution:' and 'let's debug', then states the fix. Not Socratic. Style is the lowest."
+
+    # Anti-example: hallucinated bug on a passed task
+    - statement: "Check if a number is even."
+      code: |
+        def is_even(n):
+            return n % 2 == 0
+        assert is_even(4) is True
+        assert is_even(5) is False
+      observed_failure: "Program exited successfully. No failing assertion or runtime error was reproduced."
+      hint_text: "Let's debug the condition around the modulo result and find why odd numbers are handled incorrectly."
+      expected_criteria_scores:
+        bug_localization: 1
+        usefulness: 2
+        socratic_style: 4
+        technical_accuracy: 2
+      expected_no_solution_reveal: true
+      expected_task_quality: 2
+      expected_task_is_valid_for_socratic: false
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Run passed; hint invents a non-existent failure. Task should be marked invalid."
+
+    # Generic safe Socratic mid baseline
+    - statement: "Return the first duplicate in a list, or None if there is none."
+      code: |
+        def first_duplicate(nums):
+            seen = set()
+            for n in nums:
+                if n in seen:
+                    return None
+                seen.add(n)
+            return None
+        assert first_duplicate([1, 2, 1]) == 1
+      observed_failure: "AssertionError: assert None == 1"
+      hint_text: "Try stepping through the logic and compare what you expect with what the code returns."
+      expected_criteria_scores:
+        bug_localization: 4
+        usefulness: 5
+        socratic_style: 5
+        technical_accuracy: 5
+      expected_no_solution_reveal: true
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Safe Socratic but not grounded in the actual buggy branch. Style is OK, localization weak."
+
+    # Ideal Socratic one focused, grounded question
+    - statement: "Split a CSV line, respecting double-quoted fields that may contain commas."
+      code: |
+        def split_csv(line):
+            fields = []
+            cur = ''
+            quoted = False
+            for ch in line:
+                quoted = not quoted if ch == '"' else quoted
+                if ch == ',' and not quoted:
+                    fields.append(cur)
+                    cur = ''
+                else:
+                    cur += ch
+            fields.append(cur)
+            return fields
+        assert split_csv('a,"b,c",d') == ['a', 'b,c', 'd']
+      observed_failure: "AssertionError: assert ['a', '\"b', 'c\"', 'd'] == ['a', 'b,c', 'd']"
+      hint_text: "On the failing input, what value does quoted have when the comma inside b,c is read, and which line in split_csv changes that flag?"
+      expected_criteria_scores:
+        bug_localization: 9
+        usefulness: 9
+        socratic_style: 9
+        technical_accuracy: 9
+      expected_no_solution_reveal: true
+      expected_task_quality: 9
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "One focused question grounded in the actual failing input, the variable name, and a specific line. Style is the highest."
   hardware:
     gpu_ids: [0]
     persistent: true
@@ -181,7 +274,8 @@ red:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 1536
+    max_new_tokens: 2400
+    max_context_tokens: 16384
     temperature: 1.1
     top_p: 0.90
     do_sample: true
@@ -203,7 +297,7 @@ red:
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
-    max_length: 1536
+    max_length: 4096
     logging_steps: 10
     dpo_enabled: true
     dpo_beta: 0.1

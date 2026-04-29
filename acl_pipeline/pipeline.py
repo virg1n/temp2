@@ -23,7 +23,7 @@ from .socratic_dpo import SocraticDpoUpdater
 from .socratic_generation import generate_socratic_hint, generate_socratic_hints
 from .socratic_grpo import SocraticGrpoUpdater
 from .storage import SimpleStorage
-from .task_execution import execute_task
+from .task_execution import audit_buggy_solution_asserts, execute_program, execute_task
 
 
 class AdversarialCurriculumPipeline:
@@ -129,9 +129,15 @@ class AdversarialCurriculumPipeline:
         text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
         return "already_correct_code" in text or "already_correct" in text
 
+    def _is_dual_solution_validation_rejection(self, reason: Any) -> bool:
+        text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return "reference_invalid" in text or "buggy_too_correct" in text
+
     def _is_trainable_red_dpo_rejection(self, reason: Any) -> bool:
         text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
         if self._is_already_correct_red_rejection(text):
+            return True
+        if self._is_dual_solution_validation_rejection(text):
             return True
         return any(
             marker in text
@@ -201,6 +207,78 @@ class AdversarialCurriculumPipeline:
         )
         return example
 
+    def _primary_trainable_validation_reason(self, reasons: List[str]) -> Optional[str]:
+        for reason in reasons:
+            if self._is_dual_solution_validation_rejection(reason):
+                return str(reason)
+        for reason in reasons:
+            if self._is_already_correct_red_rejection(reason):
+                return "already_correct_code"
+        for reason in reasons:
+            if self._is_trainable_red_dpo_rejection(reason):
+                return str(reason)
+        return None
+
+    def _format_assert_audit_repair_context(self, task, audit: List[Dict[str, Any]]) -> str:
+        spec = self._task_spec_from_metadata(task)
+        intended_bug = str(spec.intended_bug if spec is not None else task.metadata.get("failure_mode") or "").strip()
+        lines = [
+            "Your previous output produced a buggy_solution that incorrectly passed all tests.",
+            "Here is what each assert evaluated to:",
+        ]
+        if not audit:
+            lines.append("  Test 1: audit unavailable -> reference=None, buggy=None (unknown)")
+        for offset, row in enumerate(audit, start=1):
+            index = row.get("test_index")
+            label = f"Test {index}" if isinstance(index, int) else f"Test {offset}"
+            if row.get("kind") == "timeout":
+                lines.append(f"  {label}: timeout -> reference=None, buggy=None (unknown)")
+                continue
+            expression = str(row.get("args_repr") or row.get("expression") or "assert").strip()
+            if row.get("reference_value") is not None or row.get("buggy_value") is not None:
+                equal = row.get("equal")
+                relation = "equal" if equal is True else "different" if equal is False else "unknown"
+                passed = "assert passed" if equal is True else "check the asserted condition"
+                lines.append(
+                    "  "
+                    + f"{label}: {expression} -> reference={row.get('reference_value')}, "
+                    + f"buggy={row.get('buggy_value')} ({relation} -> {passed})"
+                )
+                continue
+            if row.get("left_value") is not None or row.get("right_value") is not None:
+                operator = str(row.get("operator") or "?")
+                lines.append(
+                    "  "
+                    + f"{label}: {expression} -> left={row.get('left_value')} {operator} "
+                    + f"right={row.get('right_value')} (assert passed)"
+                )
+                continue
+            lines.append(
+                "  "
+                + f"{label}: {expression} -> value={row.get('boolean_value', row.get('expression'))} "
+                + "(assert passed)"
+            )
+        lines.extend(
+            [
+                f'The intended_bug ("{intended_bug}") is NOT present in your buggy_solution.',
+                "Modify buggy_solution so its behavior diverges from reference_solution on at least one test, in the way intended_bug describes.",
+                "Do NOT change the tests unless reference_solution itself fails them.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _red_repair_message_for_item(self, item: Dict[str, Any], rejection_reasons: List[str]) -> Dict[str, str]:
+        task = item.get("task")
+        repair_context = None
+        normalized = {
+            str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+            for reason in rejection_reasons
+        }
+        if task is not None and "buggy_too_correct" in normalized:
+            audit = list(item.get("assert_audit") or task.metadata.get("assert_audit") or [])
+            repair_context = self._format_assert_audit_repair_context(task, audit)
+        return build_red_repair_message(str(item["topic"]), rejection_reasons, repair_context=repair_context)
+
     def _candidate_rejection_reasons(
         self,
         *,
@@ -236,9 +314,32 @@ class AdversarialCurriculumPipeline:
         rejection_reasons: List[str] = []
         if task is None:
             return execution, rejection_reasons
+        item.pop("assert_audit", None)
         if self.config.task_execution.enabled:
-            execution = execute_task(task, self.config.task_execution)
-            self._attach_execution(task, execution)
+            reference_solution = str(task.reference_solution or task.metadata.get("reference_solution") or "").strip()
+            if reference_solution:
+                reference_execution = execute_program(reference_solution, self.config.task_execution)
+                task.metadata["reference_execution"] = reference_execution.to_dict()
+                item["validation_reference_execution"] = reference_execution
+                if reference_execution.status != "passed":
+                    rejection_reasons.append("reference_invalid")
+                    task.metadata["validation_rejection_reason"] = "reference_invalid"
+                    task.metadata["observed_failure"] = reference_execution.error_message
+                    item["validation_execution"] = None
+                    item["validation_reasons"] = list(dict.fromkeys(rejection_reasons))
+                    return None, item["validation_reasons"]
+
+                execution = execute_task(task, self.config.task_execution)
+                self._attach_execution(task, execution)
+                if execution.status == "passed":
+                    rejection_reasons.append("buggy_too_correct")
+                    audit = audit_buggy_solution_asserts(task, self.config.task_execution)
+                    item["assert_audit"] = audit
+                    task.metadata["assert_audit"] = audit
+                    task.metadata["validation_rejection_reason"] = "buggy_too_correct"
+            else:
+                execution = execute_task(task, self.config.task_execution)
+                self._attach_execution(task, execution)
         rejection_reasons.extend(
             self._candidate_rejection_reasons(
                 requested_topic=str(item["topic"]),
@@ -357,7 +458,7 @@ class AdversarialCurriculumPipeline:
                     rejection_reasons=item["last_rejection_reasons"],
                     execution_status=None,
                 )
-                item["messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"]))
+                item["messages"].append(self._red_repair_message_for_item(item, item["last_rejection_reasons"]))
 
         for item in requests:
             if item.get("task") is None:
@@ -378,18 +479,25 @@ class AdversarialCurriculumPipeline:
                 continue
             _, rejection_reasons = self._validate_request_item(item)
             if rejection_reasons:
-                if any(self._is_already_correct_red_rejection(reason) for reason in rejection_reasons):
+                primary_rejection = self._primary_trainable_validation_reason(rejection_reasons)
+                if primary_rejection:
                     spec = self._task_spec_from_metadata(task)
                     self._record_red_rejection(
                         topic=str(item["topic"]),
                         prompt=str(item.get("task_prompt") or task.metadata.get("red_prompt") or ""),
                         rejected_completion=serialize_task_json(task),
-                        rejection_reason="already_correct_code",
+                        rejection_reason=primary_rejection,
                         spec=spec,
                         metadata={
                             "stage": "validation",
                             "weakness_summary": item.get("weakness_summary"),
                             "validation_reasons": list(rejection_reasons),
+                            "assert_audit": list(item.get("assert_audit") or task.metadata.get("assert_audit") or []),
+                            "reference_execution": (
+                                item["validation_reference_execution"].to_dict()
+                                if item.get("validation_reference_execution") is not None
+                                else task.metadata.get("reference_execution")
+                            ),
                             "execution_status": (
                                 item["validation_execution"].status
                                 if item.get("validation_execution") is not None
@@ -430,7 +538,7 @@ class AdversarialCurriculumPipeline:
 
         for item in pending:
             repair_reasons = item.get("validation_reasons") or ["validation requested regeneration"]
-            item["messages"].append(build_red_repair_message(str(item["topic"]), repair_reasons))
+            item["messages"].append(self._red_repair_message_for_item(item, repair_reasons))
 
         for attempt in range(1, max_attempts + 1):
             if not pending:
@@ -486,6 +594,13 @@ class AdversarialCurriculumPipeline:
                                 "stage": "task_repair_final_validation",
                                 "attempt": attempt,
                                 "weakness_summary": item["weakness_summary"],
+                                "validation_reasons": list(validation_reasons),
+                                "assert_audit": list(item.get("assert_audit") or repaired_task.metadata.get("assert_audit") or []),
+                                "reference_execution": (
+                                    item["validation_reference_execution"].to_dict()
+                                    if item.get("validation_reference_execution") is not None
+                                    else repaired_task.metadata.get("reference_execution")
+                                ),
                                 "execution_status": (
                                     item["validation_execution"].status
                                     if item.get("validation_execution") is not None
@@ -501,7 +616,7 @@ class AdversarialCurriculumPipeline:
                             attempt=attempt,
                             rejection_reasons=validation_reasons,
                         )
-                        item["messages"].append(build_red_repair_message(topic, validation_reasons))
+                        item["messages"].append(self._red_repair_message_for_item(item, validation_reasons))
                         next_pending.append(item)
                         continue
 
@@ -526,7 +641,7 @@ class AdversarialCurriculumPipeline:
                         attempt=attempt,
                         rejection_reasons=item["last_rejection_reasons"],
                     )
-                    item["messages"].append(build_red_repair_message(topic, item["last_rejection_reasons"]))
+                    item["messages"].append(self._red_repair_message_for_item(item, item["last_rejection_reasons"]))
                     next_pending.append(item)
             pending = next_pending
 
@@ -685,12 +800,12 @@ class AdversarialCurriculumPipeline:
 
         settings = self.config.socratic.dpo
         chosen = socratic_trainable_ranked[0]
-        chosen_score = float(chosen["judge"].metadata.get("adjusted_score") or chosen["judge"].score)
+        chosen_score = float(chosen["judge"].metadata.get("post_normalize") or chosen["judge"].metadata.get("adjusted_score") or chosen["judge"].score)
         added = 0
         for rejected in socratic_trainable_ranked:
             if rejected is chosen:
                 continue
-            rejected_score = float(rejected["judge"].metadata.get("adjusted_score") or rejected["judge"].score)
+            rejected_score = float(rejected["judge"].metadata.get("post_normalize") or rejected["judge"].metadata.get("adjusted_score") or rejected["judge"].score)
             if chosen_score - rejected_score < float(settings.min_score_gap):
                 continue
 
@@ -754,6 +869,7 @@ class AdversarialCurriculumPipeline:
             socratic_hint=episode.hint.text,
             socratic_hint_raw=episode.hint.raw_text,
             judge_grade=episode.judge.score,
+            judge_post_normalize=episode.judge.metadata.get("post_normalize"),
             judge_adjusted_score=episode.judge.metadata.get("adjusted_score"),
             judge_criteria=episode.judge.criteria_scores,
             judge_task_quality=episode.judge.metadata.get("task_quality"),
@@ -837,7 +953,7 @@ class AdversarialCurriculumPipeline:
                 candidates_per_task=[len(group) for group in hint_groups],
                 topics=[item["task"].topic for item in pending_batch],
                 ranked_scores=[
-                    [candidate["judge"].metadata.get("adjusted_score") for candidate in item.get("hint_candidate_rankings", [])]
+                    [candidate["judge"].metadata.get("post_normalize") for candidate in item.get("hint_candidate_rankings", [])]
                     for item in pending_batch
                 ],
                 ranked_valid=[
@@ -858,6 +974,7 @@ class AdversarialCurriculumPipeline:
             socratic_training_method=self._socratic_training_method(),
             topics=[item["task"].topic for item in pending_batch],
             raw_scores=[output.score for output in judge_outputs],
+            post_normalize_scores=[output.metadata.get("post_normalize") for output in judge_outputs],
             adjusted_scores=[output.metadata.get("adjusted_score") for output in judge_outputs],
             adjusted_rewards=[output.normalized_reward for output in judge_outputs],
             task_quality=[output.metadata.get("task_quality") for output in judge_outputs],
@@ -932,7 +1049,7 @@ class AdversarialCurriculumPipeline:
                     "socratic_training_method": self._socratic_training_method(),
                     "socratic_candidate_count": len(item.get("hint_candidates") or [item["hint"]]),
                     "socratic_candidate_scores": [
-                        candidate["judge"].metadata.get("adjusted_score")
+                        candidate["judge"].metadata.get("post_normalize")
                         for candidate in ranked_candidates
                     ],
                     "socratic_dpo_pairs_added": preference_pairs_added,
@@ -951,6 +1068,7 @@ class AdversarialCurriculumPipeline:
                 topic=episode.topic,
                 reward=judge_output.normalized_reward,
                 score=judge_output.score,
+                post_normalize=judge_output.metadata.get("post_normalize"),
                 adjusted_score=judge_output.metadata.get("adjusted_score"),
                 task_is_valid_for_socratic=task_is_valid,
                 hint_is_valid_for_socratic=hint_is_valid,

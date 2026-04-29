@@ -440,11 +440,18 @@ def _generate_texts(
     while start < len(prompts):
         chunk = prompts[start : start + batch_size]
         try:
+            context_tokens = max(0, int(getattr(generation, "max_context_tokens", 0) or 0))
+            tokenizer_kwargs: Dict[str, Any] = {
+                "return_tensors": "pt",
+                "padding": True,
+                "truncation": True,
+            }
+            if context_tokens > 0:
+                prompt_budget = max(1, context_tokens - max(1, int(generation.max_new_tokens)))
+                tokenizer_kwargs["max_length"] = prompt_budget
             encoded = tokenizer(
                 chunk,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
+                **tokenizer_kwargs,
             )
             encoded = {key: value.to(input_device) for key, value in encoded.items()}
             do_sample = bool(generation.do_sample and generation.temperature > 0)
@@ -486,6 +493,7 @@ def _generate_texts(
                 generation = GenerationSettings(
                     batch_size=1,
                     max_new_tokens=max(64, generation.max_new_tokens // 2),
+                    max_context_tokens=generation.max_context_tokens,
                     temperature=generation.temperature,
                     top_p=generation.top_p,
                     do_sample=generation.do_sample,

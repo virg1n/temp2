@@ -80,12 +80,14 @@ def _task_buggy_solution_for_output(task: PythonTask) -> str:
 
 def serialize_task_json(task: PythonTask) -> str:
     spec = dict(task.metadata.get("red_spec") or {})
+    reference_solution = str(task.reference_solution or task.metadata.get("reference_solution") or "").strip()
     payload = {
         "topic": task.topic,
         "target_function": spec.get("target_function", ""),
         "intended_bug": spec.get("intended_bug", task.metadata.get("failure_mode", "")),
         "expected_first_failure": spec.get("expected_first_failure", task.observed_failure()),
         "statement": task.statement,
+        "reference_solution": reference_solution,
         "buggy_solution": _task_buggy_solution_for_output(task),
         "metadata": _task_output_metadata(task),
     }
@@ -154,6 +156,8 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
         marker in text
         for marker in (
             "non_json_response",
+            "reference_invalid",
+            "buggy_too_correct",
             "blocking_syntax_error",
             "blocking_indentation_error",
             "blocking_nameerror",
@@ -378,7 +382,7 @@ class RedUpdater:
             )
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
-        full_context_length = max(1024, min(int(settings.max_length), 1536))
+        full_context_length = max(1024, int(settings.max_length))
         attempts = [
             {
                 "max_length": full_context_length,

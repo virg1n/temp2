@@ -4,7 +4,8 @@ import builtins
 import json
 import keyword
 import re
-from typing import Any, Dict, Iterable, List, Optional, Set
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool
@@ -540,24 +541,47 @@ class JudgeService:
     def __init__(self, model_pool: ModelPool, logger: StructuredLogger) -> None:
         self.model_pool = model_pool
         self.logger = logger
+        window_size = max(1, int(getattr(self.model_pool.config.judge, "normalize_across_batches", 8)))
+        self._normalization_window: Deque[float] = deque(maxlen=window_size)
 
     def _weights(self) -> Dict[str, float]:
-        return dict(self.model_pool.config.judge.reward_weights)
+        return {
+            key: float(value)
+            for key, value in dict(self.model_pool.config.judge.reward_weights).items()
+            if key != "no_solution_reveal"
+        }
 
     def _coerce_criteria_scores(self, item: Any) -> Dict[str, float]:
         weights = self._weights()
 
         def coerce(raw: Any) -> float:
             if isinstance(raw, bool):
-                return 10.0 if raw else 0.0
+                return 1.0 if raw else 0.0
             try:
-                return max(0.0, min(10.0, float(raw)))
+                return max(0.0, float(raw))
             except Exception:
                 return 0.0
 
         if isinstance(item, dict):
             return {key: coerce(item.get(key, 0.0)) for key in weights}
         return {key: coerce(item) for key in weights}
+
+    def _coerce_no_solution_reveal(self, item: Any, gate: Dict[str, Any]) -> bool:
+        if gate.get("contains_direct_fix") or gate.get("contains_code_output"):
+            return False
+        if not isinstance(item, dict) or "no_solution_reveal" not in item:
+            return True
+        raw = item.get("no_solution_reveal")
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return float(raw) >= 5.0
+        text = str(raw or "").strip().lower()
+        if text in {"true", "yes", "no leak", "no leakage", "clean"}:
+            return True
+        if text in {"false", "no", "leak", "leaked", "solution leak"}:
+            return False
+        return True
 
     def _weighted_score(self, criteria_scores: Dict[str, float]) -> float:
         weights = self._weights()
@@ -567,7 +591,32 @@ class JudgeService:
         total = 0.0
         for key, weight in weights.items():
             total += float(criteria_scores.get(key, 0.0)) * float(weight)
-        return max(0.0, min(10.0, total / total_weight))
+        return max(0.0, total / total_weight)
+
+    def _normalize_post_scores(self, pre_normalize_scores: List[float]) -> List[float]:
+        window_size = max(1, int(getattr(self.model_pool.config.judge, "normalize_across_batches", 8)))
+        episode_batch_size = max(1, int(getattr(self.model_pool.config.judge, "episode_batch_size", 1)))
+        if self._normalization_window.maxlen != window_size:
+            self._normalization_window = deque(self._normalization_window, maxlen=window_size)
+        active_window: Deque[float]
+        if window_size <= episode_batch_size:
+            active_window = deque(maxlen=window_size)
+        else:
+            active_window = self._normalization_window
+
+        post_scores: List[float] = []
+        for pre_normalize in pre_normalize_scores:
+            pre = float(pre_normalize)
+            active_window.append(pre)
+            window = list(active_window)
+            if not window:
+                post_scores.append(max(0.0, min(10.0, pre)))
+                continue
+            observed_max = max(window) if window else pre
+            max_norm = min(10.0, observed_max)
+            scale = (max_norm / observed_max) if observed_max > 0 else 1.0
+            post_scores.append(max(0.0, min(10.0, pre * scale)))
+        return post_scores
 
     def _hard_rule_gate(
         self,
@@ -733,7 +782,7 @@ class JudgeService:
         for score in scores:
             z = (score - mean) / std
             spread_score = score + (strength * 2.0 * z)
-            adjusted.append(max(0.0, min(10.0, spread_score)))
+            adjusted.append(max(0.0, spread_score))
         return adjusted
 
     def score_pair_details(
@@ -772,7 +821,11 @@ class JudgeService:
         if judge_indexes:
             judge_rows = [rows[index] for index in judge_indexes]
             session = self.model_pool.get_judge()
-            messages = build_judge_batch_messages(judge_rows, self._weights())
+            messages = build_judge_batch_messages(
+                judge_rows,
+                self._weights(),
+                examples=getattr(self.model_pool.config.judge, "examples", []),
+            )
             max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
             raw = ""
             parsed_items: List[Any] = []
@@ -821,7 +874,10 @@ class JudgeService:
             else:
                 criteria_list.append(self._coerce_criteria_scores(item))
 
-        raw_scores: List[float] = []
+        raw_unclamped_scores: List[float] = []
+        pre_normalize_scores: List[float] = []
+        no_solution_reveals: List[bool] = []
+        no_solution_multipliers: List[float] = []
         assessments: List[Dict[str, Any]] = []
         zero_criteria = {key: 0.0 for key in self._weights()}
         for index, (criteria, item, corruption, features, gate) in enumerate(zip(criteria_list, raw_items, corruption_flags, quality_features, hard_gates)):
@@ -830,21 +886,22 @@ class JudgeService:
             if zero_out and forced_score is None:
                 criteria = dict(zero_criteria)
                 criteria_list[index] = criteria
+            no_solution_reveal = self._coerce_no_solution_reveal(item, gate)
+            no_solution_multiplier = 1.0 if no_solution_reveal else 0.1
             if forced_score is not None:
-                score = max(0.0, min(10.0, float(forced_score)))
+                raw_unclamped = max(0.0, float(forced_score))
+                pre_normalize = raw_unclamped * no_solution_multiplier
             else:
                 base_score = self._weighted_score(criteria)
                 if zero_out:
-                    score = 0.0
+                    raw_unclamped = 0.0
                 else:
                     delta = float(features["delta"])
-                    if delta > 0:
-                        headroom = max(0.0, 10.0 - base_score)
-                        delta = delta * (headroom / 10.0)
-                    score = max(0.0, min(10.0, base_score + delta))
+                    raw_unclamped = max(0.0, base_score + delta)
+                pre_normalize = raw_unclamped * no_solution_multiplier
             assessment = self._task_and_hint_assessment(
                 item,
-                score=score,
+                score=pre_normalize,
                 severe_hint_failure=bool(features["severe_hint_failure"]),
                 corruption_detected=bool(corruption["is_corrupted"]),
                 hard_gate=gate,
@@ -856,25 +913,32 @@ class JudgeService:
                 "contains_code_output": gate["contains_code_output"],
                 "contains_direct_fix": gate["contains_direct_fix"],
             }
-            raw_scores.append(score)
+            raw_unclamped_scores.append(raw_unclamped)
+            pre_normalize_scores.append(pre_normalize)
+            no_solution_reveals.append(no_solution_reveal)
+            no_solution_multipliers.append(no_solution_multiplier)
             assessments.append(assessment)
 
-        adjusted_scores = self._apply_batch_spread(raw_scores) if apply_batch_spread else list(raw_scores)
+        post_normalize_scores = self._normalize_post_scores(pre_normalize_scores)
+        adjusted_scores = self._apply_batch_spread(post_normalize_scores) if apply_batch_spread else list(post_normalize_scores)
         for index, (corruption, features, assessment, gate) in enumerate(zip(corruption_flags, quality_features, assessments, hard_gates)):
             if corruption["is_corrupted"] or features["severe_hint_failure"] or gate.get("forced_score") == 0.0:
-                raw_scores[index] = 0.0
+                raw_unclamped_scores[index] = 0.0
+                pre_normalize_scores[index] = 0.0
+                post_normalize_scores[index] = 0.0
                 adjusted_scores[index] = 0.0
                 assessment["hint_is_valid_for_socratic"] = False
-            elif gate.get("forced_score") is not None:
-                cap = max(0.0, min(10.0, float(gate["forced_score"])))
-                raw_scores[index] = min(raw_scores[index], cap)
-                adjusted_scores[index] = min(adjusted_scores[index], cap)
 
         return [
             {
                 "criteria_scores": criteria,
-                "raw_score": raw_score,
+                "raw_score": pre_normalize,
+                "raw_unclamped": raw_unclamped,
+                "pre_normalize": pre_normalize,
+                "post_normalize": post_normalize,
                 "adjusted_score": adjusted_score,
+                "no_solution_reveal": no_solution_reveal,
+                "no_solution_reveal_multiplier": no_solution_multiplier,
                 "raw_response": raw_response,
                 "task_quality": assessment["task_quality"],
                 "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
@@ -885,10 +949,14 @@ class JudgeService:
                 "hint_corruption": corruption,
                 "local_tiebreak": features,
             }
-            for criteria, raw_score, adjusted_score, raw_response, assessment, corruption, features in zip(
+            for criteria, raw_unclamped, pre_normalize, post_normalize, adjusted_score, no_solution_reveal, no_solution_multiplier, raw_response, assessment, corruption, features in zip(
                 criteria_list,
-                raw_scores,
+                raw_unclamped_scores,
+                pre_normalize_scores,
+                post_normalize_scores,
                 adjusted_scores,
+                no_solution_reveals,
+                no_solution_multipliers,
                 raw_responses,
                 assessments,
                 corruption_flags,
@@ -911,20 +979,26 @@ class JudgeService:
         return [float(item["adjusted_score"]) for item in details]
 
     def _output_from_details(self, task: PythonTask, hint: SocraticHint, details: Dict[str, Any]) -> JudgeOutput:
-        raw_score = float(details["raw_score"])
+        pre_normalize = float(details["pre_normalize"])
+        post_normalize = float(details["post_normalize"])
         adjusted_score = float(details["adjusted_score"])
         scored_text = _hint_text_for_judge(hint)
         scored_text_source = "raw_text" if str(getattr(hint, "raw_text", "") or "").strip() else "text"
         return JudgeOutput(
             task_id=task.task_id,
-            score=raw_score,
-            normalized_reward=adjusted_score / 10.0,
+            score=pre_normalize,
+            normalized_reward=post_normalize / 10.0,
             raw_text=str(details["raw_response"]),
             criteria_scores=dict(details["criteria_scores"]),
             metadata={
                 "topic": task.topic,
-                "raw_score": raw_score,
+                "raw_score": pre_normalize,
+                "raw_unclamped": float(details["raw_unclamped"]),
+                "pre_normalize": pre_normalize,
+                "post_normalize": post_normalize,
                 "adjusted_score": adjusted_score,
+                "no_solution_reveal": bool(details["no_solution_reveal"]),
+                "no_solution_reveal_multiplier": float(details["no_solution_reveal_multiplier"]),
                 "task_quality": float(details["task_quality"]),
                 "task_is_valid_for_socratic": bool(details["task_is_valid_for_socratic"]),
                 "hint_is_valid_for_socratic": bool(details["hint_is_valid_for_socratic"]),
@@ -982,7 +1056,7 @@ class JudgeService:
             offset += group_size
 
             if apply_group_spread and len(group_details) > 1:
-                adjusted_scores = self._apply_batch_spread([float(item["raw_score"]) for item in group_details])
+                adjusted_scores = self._apply_batch_spread([float(item["post_normalize"]) for item in group_details])
                 for details, adjusted_score in zip(group_details, adjusted_scores):
                     details["adjusted_score"] = adjusted_score
 
@@ -1003,7 +1077,7 @@ class JudgeService:
                     bool(item["judge"].metadata.get("task_is_valid_for_socratic", True)),
                     bool(item["judge"].metadata.get("hint_is_valid_for_socratic", True)),
                     float(item["judge"].metadata.get("adjusted_score") or 0.0),
-                    float(item["judge"].score),
+                    float(item["judge"].metadata.get("post_normalize") or 0.0),
                 ),
                 reverse=True,
             )

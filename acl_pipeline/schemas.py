@@ -23,8 +23,15 @@ class PythonTask:
     topic: str
     statement: str
     buggy_solution: str
-    failing_asserts: List[str]
     metadata: Dict[str, Any] = field(default_factory=dict)
+    failing_asserts: List[str] = field(default_factory=list)
+    reference_solution: str = ""
+
+    def __post_init__(self) -> None:
+        reference = str(self.reference_solution or self.metadata.get("reference_solution") or "")
+        self.reference_solution = reference
+        if reference:
+            self.metadata["reference_solution"] = reference
 
     def non_empty_line_count(self) -> int:
         return len([line for line in (self.buggy_solution or "").splitlines() if line.strip()])

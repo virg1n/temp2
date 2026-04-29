@@ -47,10 +47,25 @@ class HardwareAllocation:
 class GenerationSettings:
     batch_size: int = 1
     max_new_tokens: int = 256
+    max_context_tokens: int = 0
     temperature: float = 0.7
     top_p: float = 0.95
     do_sample: bool = True
     repetition_penalty: float = 1.05
+
+
+@dataclass
+class JudgeExample:
+    statement: str
+    code: str
+    observed_failure: str
+    hint_text: str
+    expected_criteria_scores: Dict[str, float]
+    expected_no_solution_reveal: bool
+    expected_task_quality: float
+    expected_task_is_valid_for_socratic: bool
+    expected_hint_is_valid_for_socratic: bool
+    explanation: str = ""
 
 
 @dataclass
@@ -134,7 +149,7 @@ class RedUpdateSettings:
     epochs: int = 1
     per_device_batch_size: int = 1
     gradient_accumulation_steps: int = 8
-    max_length: int = 1536
+    max_length: int = 4096
     logging_steps: int = 10
     dpo_enabled: bool = True
     dpo_beta: float = 0.1
@@ -168,16 +183,17 @@ class JudgeConfig(RoleConfig):
     vllm_max_retries: int = 2
     reward_weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "no_solution_reveal": 0.30,
             "bug_localization": 0.25,
-            "usefulness": 0.20,
-            "socratic_style": 0.15,
-            "technical_accuracy": 0.10,
+            "usefulness": 0.25,
+            "socratic_style": 0.25,
+            "technical_accuracy": 0.25,
         }
     )
     batch_spread_strength: float = 0.15
     episode_batch_size: int = 4
     bad_task_threshold: float = 3.0
+    normalize_across_batches: int = 8
+    examples: List[JudgeExample] = field(default_factory=list)
 
 
 @dataclass
@@ -239,6 +255,7 @@ def _generation(payload: Optional[Dict[str, Any]]) -> GenerationSettings:
     return GenerationSettings(
         batch_size=int(payload.get("batch_size", 1)),
         max_new_tokens=int(payload.get("max_new_tokens", 256)),
+        max_context_tokens=int(payload.get("max_context_tokens", 0) or 0),
         temperature=float(payload.get("temperature", 0.7)),
         top_p=float(payload.get("top_p", 0.95)),
         do_sample=bool(payload.get("do_sample", True)),
@@ -324,11 +341,40 @@ def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),
         gradient_accumulation_steps=int(payload.get("gradient_accumulation_steps", 8)),
-        max_length=int(payload.get("max_length", 1536)),
+        max_length=int(payload.get("max_length", 4096)),
         logging_steps=int(payload.get("logging_steps", 10)),
         dpo_enabled=bool(payload.get("dpo_enabled", True)),
         dpo_beta=float(payload.get("dpo_beta", 0.1)),
     )
+
+
+def _judge_examples(payload: Optional[List[Dict[str, Any]]]) -> List[JudgeExample]:
+    examples: List[JudgeExample] = []
+    for item in payload or []:
+        row = dict(item or {})
+        scores = dict(row.get("expected_criteria_scores") or {})
+        statement = str(row.get("statement") or row.get("task_excerpt") or "")
+        code = str(row.get("code") or row.get("task_excerpt") or "")
+        examples.append(
+            JudgeExample(
+                statement=statement,
+                code=code,
+                observed_failure=str(row.get("observed_failure") or ""),
+                hint_text=str(row.get("hint_text") or ""),
+                expected_criteria_scores={
+                    "bug_localization": float(scores.get("bug_localization", 0.0)),
+                    "usefulness": float(scores.get("usefulness", 0.0)),
+                    "socratic_style": float(scores.get("socratic_style", 0.0)),
+                    "technical_accuracy": float(scores.get("technical_accuracy", 0.0)),
+                },
+                expected_no_solution_reveal=bool(row.get("expected_no_solution_reveal", True)),
+                expected_task_quality=float(row.get("expected_task_quality", 5.0)),
+                expected_task_is_valid_for_socratic=bool(row.get("expected_task_is_valid_for_socratic", True)),
+                expected_hint_is_valid_for_socratic=bool(row.get("expected_hint_is_valid_for_socratic", True)),
+                explanation=str(row.get("explanation") or ""),
+            )
+        )
+    return examples
 
 
 def _role(payload: Dict[str, Any]) -> RoleConfig:
@@ -368,6 +414,9 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
     base = _role(payload)
     reward_weights = dict(payload.get("reward_weights") or {})
     default_weights = JudgeConfig(model_name_or_path=base.model_name_or_path).reward_weights
+    no_solution_weight = reward_weights.pop("no_solution_reveal", None)
+    if no_solution_weight is not None:
+        reward_weights = {key: value for key, value in reward_weights.items() if key != "no_solution_reveal"}
     return JudgeConfig(
         model_name_or_path=base.model_name_or_path,
         tokenizer_name_or_path=base.tokenizer_name_or_path,
@@ -389,6 +438,8 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         batch_spread_strength=float(payload.get("batch_spread_strength", 0.15)),
         episode_batch_size=int(payload.get("episode_batch_size", 4)),
         bad_task_threshold=float(payload.get("bad_task_threshold", 3.0)),
+        normalize_across_batches=int(payload.get("normalize_across_batches", 8)),
+        examples=_judge_examples(payload.get("examples") or []),
     )
 
 

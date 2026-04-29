@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .schemas import PythonTask
 
@@ -20,9 +20,9 @@ RED_SYSTEM_PROMPT = (
     "Generate realistic medium-to-hard Python debugging tasks that expose weaknesses in a Socratic tutor. "
     "Return exactly one strict JSON object only. "
     "The same JSON object must include the spec fields and the task fields together. "
-    "The task JSON must contain a full Python program in buggy_solution with any asserts placed inside that program at the end. "
+    "The task JSON must contain full Python programs in reference_solution and buggy_solution with the same asserts placed at the end of both programs. "
     "Do not use a separate failing_asserts field in new outputs. "
-    "The code should be realistic, debuggable, and actually broken in a meaningful way. "
+    "The reference_solution must be correct, and the buggy_solution must be realistically broken in a meaningful way. "
     "Never emit markdown fences, role labels, or <think> tags. "
     "If the response is prefilled with the beginning of a JSON object, continue that exact JSON object directly. "
     "Do not include explanations outside the JSON."
@@ -62,11 +62,17 @@ def build_red_training_prompt(
         '  "intended_bug": "...",\n'
         '  "expected_first_failure": "...",\n'
         '  "statement": "...",\n'
-        '  "buggy_solution": "full python program without markdown fences; include asserts at the end inside this string",\n'
+        '  "reference_solution": "correct full Python program without markdown fences; shared asserts at the end must pass",\n'
+        '  "buggy_solution": "broken full Python program without markdown fences; same shared asserts at the end must fail",\n'
         '  "metadata": {"failure_mode": "...", "difficulty": "medium|hard"}\n'
         "}\n\n"
         "Requirements:\n"
         "- Keep topic exact.\n"
+        "- Generate two implementations of the same task plus shared tests.\n"
+        "- The reference_solution must pass all tests.\n"
+        "- The buggy_solution must fail at least one test due to the intended_bug.\n"
+        "- The two solutions must differ in observable behavior on at least 2 distinct test inputs (not just one literal value).\n"
+        "- Include the exact same assert/test block at the end of reference_solution and buggy_solution.\n"
         "- Make the bug spec coherent with the actual code and tests.\n"
         "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
         "- Prefer semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
@@ -79,7 +85,7 @@ def build_red_training_prompt(
         "- The task should be debuggable from the code and reproduced failure alone.\n"
         "- Avoid trivial one-function arithmetic exercises.\n"
         "- The program should usually be 25-90 non-empty lines.\n"
-        "- At least one assert or runtime path should fail on execution.\n"
+        "- At least one assert or runtime path should fail when buggy_solution executes.\n"
         "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
         "- JSON only."
     )
@@ -91,8 +97,14 @@ def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict
     ]
 
 
-def build_red_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[str, str]:
+def build_red_repair_message(
+    topic: str,
+    rejection_reasons: List[str],
+    *,
+    repair_context: Optional[str] = None,
+) -> Dict[str, str]:
     reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
+    context = ("\n\n" + repair_context.strip()) if repair_context and repair_context.strip() else ""
     return {
         "role": "user",
         "content": (
@@ -100,8 +112,10 @@ def build_red_repair_message(topic: str, rejection_reasons: List[str]) -> Dict[s
             f"Rejection reasons: {reasons}. "
             "Return a new strict JSON object with the same schema. "
             "Keep topic exact. "
-            "Keep the code realistic, ensure the bug is real, and put any asserts inside buggy_solution at the end of the program. "
+            "Keep the code realistic, ensure the bug is real, and put the exact same asserts at the end of reference_solution and buggy_solution. "
+            "The reference_solution must pass all tests, and buggy_solution must fail at least one shared test because of intended_bug. "
             "If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it, and do not add prose."
+            + context
         ),
     }
 
@@ -116,6 +130,7 @@ def build_red_response_prefix(topic: str) -> str:
 def build_judge_batch_messages(
     items: Iterable[Dict[str, str]],
     reward_weights: Dict[str, float],
+    examples: Optional[Iterable[Any]] = None,
 ) -> List[Dict[str, str]]:
     payload = list(items)
     weight_block = json.dumps(reward_weights, ensure_ascii=False)
@@ -124,6 +139,7 @@ def build_judge_batch_messages(
         "The assistant must help a student debug Python code using only Socratic hints.\n"
         "The assistant must not reveal the full solution, corrected code, direct fix, or hidden reasoning.\n"
         "Use the full 0-10 scale. Generic safe hints should usually land around 4-6, not 8-10.\n"
+        "The examples below show calibrated grading; follow this calibration.\n"
         "When several items are alternative hints for the same task, score each independently so the pipeline can rank them.\n"
         "Scores of 8-10 require concrete grounding in the actual failing code and error.\n"
         "8-10 only if the hint names the exact failing assertion, function, variable, or state transition and asks a precise debugging question.\n"
@@ -139,8 +155,8 @@ def build_judge_batch_messages(
         "If the broken code/task is mindless, contradictory, already correct, unsolvable from the given information, or otherwise poor Red output, mark task_is_valid_for_socratic false.\n"
         "If the task is fine but the hint is confusing, hallucinated, generic, malformed, or otherwise poor tutoring, keep task_is_valid_for_socratic true and mark hint_is_valid_for_socratic false.\n"
         "Do not mark a valid task as invalid just because the hint is bad.\n"
-        "Return one JSON object per item with these fields. Scores are integers 0-10 unless noted; do NOT use true/false for score fields:\n"
-        "- no_solution_reveal: integer 0-10 (10 = no leakage; 0 = full solution leaked)\n"
+        "Return one JSON object per item with these fields. Criterion scores are integers 0-10; do NOT use true/false for score fields:\n"
+        "- no_solution_reveal: boolean (true = no solution leak; false = solution leak detected)\n"
         "- bug_localization: integer 0-10\n"
         "- usefulness: integer 0-10\n"
         "- socratic_style: integer 0-10\n"
@@ -155,10 +171,59 @@ def build_judge_batch_messages(
         + "\n"
         "Output format: STRICT JSON array of objects. No prose."
     )
-    user_prompt = "N = " + str(len(payload)) + "\n\n" + json.dumps(payload, ensure_ascii=False)
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+    for example in list(examples or []):
+        example_input, example_output = _judge_example_turns(example)
+        messages.append({"role": "user", "content": _judge_user_prompt([example_input])})
+        messages.append({"role": "assistant", "content": json.dumps([example_output], ensure_ascii=False)})
+    messages.append({"role": "user", "content": _judge_user_prompt(payload)})
+    return messages
+
+
+def _judge_user_prompt(payload: List[Dict[str, Any]]) -> str:
+    return "N = " + str(len(payload)) + "\n\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _judge_example_turns(example: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    statement = str(getattr(example, "statement", "") or getattr(example, "task_excerpt", "") or "")
+    code = str(getattr(example, "code", "") or getattr(example, "task_excerpt", "") or "")
+    observed_failure = str(getattr(example, "observed_failure", "") or "")
+    criteria = dict(getattr(example, "expected_criteria_scores", {}) or {})
+    example_input = {
+        "statement": statement,
+        "code": code,
+        "observed_failure": observed_failure,
+        "execution_status": _example_execution_status(observed_failure),
+        "assistant_response": str(getattr(example, "hint_text", "") or ""),
+    }
+    example_output = {
+        "no_solution_reveal": bool(getattr(example, "expected_no_solution_reveal", True)),
+        "bug_localization": int(float(criteria.get("bug_localization", 0))),
+        "usefulness": int(float(criteria.get("usefulness", 0))),
+        "socratic_style": int(float(criteria.get("socratic_style", 0))),
+        "technical_accuracy": int(float(criteria.get("technical_accuracy", 0))),
+        "task_quality": int(float(getattr(example, "expected_task_quality", 5))),
+        "task_is_valid_for_socratic": bool(getattr(example, "expected_task_is_valid_for_socratic", True)),
+        "hint_is_valid_for_socratic": bool(getattr(example, "expected_hint_is_valid_for_socratic", True)),
+        "red_rejection_reason": None,
+        "hint_rejection_reason": None,
+    }
+    explanation = str(getattr(example, "explanation", "") or "").strip()
+    if explanation:
+        example_output["explanation"] = explanation
+    return example_input, example_output
+
+
+def _example_execution_status(observed_failure: str) -> str:
+    text = str(observed_failure or "")
+    if text.strip().lower() == "passed" or "No failing assertion or runtime error was reproduced." in text:
+        return "passed"
+    if "IndentationError" in text or "TabError" in text:
+        return "indentation_error"
+    if "SyntaxError" in text:
+        return "syntax_error"
+    if "NameError" in text:
+        return "nameerror"
+    return "failed"
 
 
