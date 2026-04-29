@@ -89,11 +89,13 @@ def generate_socratic_hints(
         contract_violation = socratic_contract_violation(raw)
         hint = SocraticHint(
             task_id=task.task_id,
-            text=cleaned,
+            text=raw,
             raw_text=raw,
             metadata={
                 "topic": task.topic,
                 "candidate_index": candidate_index,
+                "text_source": "raw_text",
+                "sanitized_text": cleaned,
                 "socratic_contract_violation": contract_violation,
                 "sanitized_to_fallback": cleaned == _FALLBACK_HINT and bool(str(raw or "").strip()),
                 "is_corrupted": corruption["is_corrupted"],

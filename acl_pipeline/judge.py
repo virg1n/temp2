@@ -159,6 +159,8 @@ _DIRECT_FIX_PATTERNS = [
         r"\badd a missing\b",
         r"\brename\b.+\bto\b",
         r"\b(?:it|this|that|the (?:answer|result|output|value|code|line|function|return value|expected))\s+should be\b",
+        r"\b(?:only|just|always|never|every|all|any)\s+[^.\n]{0,80}\s+should\s+(?:be|return|raise|equal|produce|yield|contain|include|match)\b",
+        r"\bshould\s+(?:return|raise|equal|produce|yield|contain|include|match)\b",
     )
 ]
 _CODE_OUTPUT_PATTERNS = [
@@ -468,6 +470,9 @@ def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
 
     malformed_reasons = _hint_malformed_reasons(hint_text)
 
+    word_count = len(hint_text.split())
+    question_count = hint_text.count("?")
+
     delta = 0.0
     reasons: List[str] = []
     if grounding_hits:
@@ -491,6 +496,15 @@ def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
     if malformed_reasons:
         delta -= min(2.0, 0.8 * len(malformed_reasons))
         reasons.extend(malformed_reasons)
+
+    if word_count > 180:
+        length_penalty = min(1.5, 0.01 * (word_count - 180))
+        delta -= length_penalty
+        reasons.append(f"too_long:{word_count}w")
+    if question_count > 4:
+        question_penalty = min(1.0, 0.3 * (question_count - 4))
+        delta -= question_penalty
+        reasons.append(f"too_many_questions:{question_count}")
 
     severe_hint_failure = False
     if malformed_reasons and invented_references:
@@ -532,16 +546,18 @@ class JudgeService:
 
     def _coerce_criteria_scores(self, item: Any) -> Dict[str, float]:
         weights = self._weights()
+
+        def coerce(raw: Any) -> float:
+            if isinstance(raw, bool):
+                return 10.0 if raw else 0.0
+            try:
+                return max(0.0, min(10.0, float(raw)))
+            except Exception:
+                return 0.0
+
         if isinstance(item, dict):
-            return {
-                key: max(0.0, min(10.0, float(item.get(key, 0.0))))
-                for key in weights
-            }
-        try:
-            value = max(0.0, min(10.0, float(item)))
-        except Exception:
-            value = 0.0
-        return {key: value for key in weights}
+            return {key: coerce(item.get(key, 0.0)) for key in weights}
+        return {key: coerce(item) for key in weights}
 
     def _weighted_score(self, criteria_scores: Dict[str, float]) -> float:
         weights = self._weights()
@@ -897,6 +913,7 @@ class JudgeService:
     def _output_from_details(self, task: PythonTask, hint: SocraticHint, details: Dict[str, Any]) -> JudgeOutput:
         raw_score = float(details["raw_score"])
         adjusted_score = float(details["adjusted_score"])
+        scored_text = _hint_text_for_judge(hint)
         scored_text_source = "raw_text" if str(getattr(hint, "raw_text", "") or "").strip() else "text"
         return JudgeOutput(
             task_id=task.task_id,
@@ -916,8 +933,9 @@ class JudgeService:
                 "hint_rejection_reason": str(details["hint_rejection_reason"]),
                 "hint_corruption": dict(details["hint_corruption"]),
                 "hint_is_corrupted": bool(details["hint_corruption"].get("is_corrupted")),
-                "hint_clean_text": hint.text,
+                "hint_clean_text": str(hint.metadata.get("sanitized_text") or hint.text),
                 "hint_scored_text_source": scored_text_source,
+                "hint_scored_text": scored_text,
                 "local_tiebreak": dict(details["local_tiebreak"]),
             },
         )

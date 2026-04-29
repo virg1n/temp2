@@ -90,6 +90,9 @@ class AdversarialCurriculumPipeline:
         # so the preference pair should train on that same model output.
         return str(getattr(hint, "raw_text", "") or hint.text or "").strip()
 
+    def _socratic_sanitized_text(self, hint) -> str:
+        return str(getattr(hint, "metadata", {}).get("sanitized_text") or hint.text or "").strip()
+
     def _effective_red_generation_adapter(self, iteration_index: int) -> Optional[str]:
         if self._using_base_red_generation(iteration_index):
             return None
@@ -719,8 +722,8 @@ class AdversarialCurriculumPipeline:
                     "rejected_rank": rejected.get("rank"),
                     "score_gap": chosen_score - rejected_score,
                     "preference_text_source": "raw_text",
-                    "chosen_clean_hint": chosen_hint.text,
-                    "rejected_clean_hint": rejected_hint.text,
+                    "chosen_clean_hint": self._socratic_sanitized_text(chosen_hint),
+                    "rejected_clean_hint": self._socratic_sanitized_text(rejected_hint),
                 },
             )
             self.storage.append_socratic_preference(example)
