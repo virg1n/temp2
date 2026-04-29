@@ -556,6 +556,10 @@ class RedUpdater:
                 sft_dataset = None
                 dpo_dataset = None
                 model = None
+                # The OOM handler above creates a `for trainer in (...)` loop
+                # whose variable persists in this scope and would otherwise
+                # keep one trainer object alive past the explicit nulls.
+                trainer = None  # noqa: F841
                 clear_cuda_memory()
 
         return RedUpdateResult(adapter_path=adapter_path, skipped_reason="oom_after_retries")

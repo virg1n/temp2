@@ -40,6 +40,7 @@ def release_trainer_memory(trainer: Any) -> None:
         "train_dataset",
         "eval_dataset",
         "model_wrapped",
+        "model",
         "processing_class",
         "tokenizer",
         "ref_model",
