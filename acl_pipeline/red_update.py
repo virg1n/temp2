@@ -299,12 +299,18 @@ def _build_dpo_dataset(
     }
 
 
-def _hard_or_low_reward_episode_examples(episodes: List[EpisodeRecord], *, limit: int) -> List[RedTrainingExample]:
+def _hard_or_low_reward_episode_examples(
+    episodes: List[EpisodeRecord],
+    *,
+    limit: int,
+    max_reward: float,
+) -> List[RedTrainingExample]:
     rows: List[RedTrainingExample] = []
     valid_episodes = [
         episode
         for episode in episodes
         if episode.metadata.get("task_is_valid_for_socratic") is not False
+        and float(episode.judge.normalized_reward) <= max_reward
     ]
     for episode in sorted(valid_episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
         weakness_summary = str(episode.metadata.get("weakness_summary") or "general weakness probing")
@@ -343,11 +349,17 @@ class RedUpdater:
         adapter_path: Optional[str],
     ) -> RedUpdateResult:
         settings = self.config.red.update
-        chosen_examples = list(hard_examples)
+        hard_reward_max = float(settings.hard_reward_max)
+        chosen_examples = [
+            example
+            for example in hard_examples
+            if float(example.reward) <= hard_reward_max
+        ]
         if len(chosen_examples) < settings.min_hard_examples:
             fallback = _hard_or_low_reward_episode_examples(
                 recent_episodes,
                 limit=settings.min_hard_examples - len(chosen_examples),
+                max_reward=hard_reward_max,
             )
             existing_ids = {item.task.task_id for item in chosen_examples}
             for item in fallback:
@@ -357,7 +369,13 @@ class RedUpdater:
 
         if len(chosen_examples) < settings.min_hard_examples:
             reason = f"need_{settings.min_hard_examples}_chosen_examples_have_{len(chosen_examples)}"
-            self.logger.event("red_update_skip", reason=reason)
+            self.logger.event(
+                "red_update_skip",
+                reason=reason,
+                hard_examples=len(hard_examples),
+                eligible_chosen_examples=len(chosen_examples),
+                hard_reward_max=hard_reward_max,
+            )
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
         full_context_length = max(1024, min(int(settings.max_length), 1536))
@@ -520,6 +538,7 @@ class RedUpdater:
                     adapter_path=str(save_dir),
                     hard_examples=len(hard_examples),
                     chosen_examples=len(chosen_examples),
+                    hard_reward_max=hard_reward_max,
                     rejected_examples=len(rejected_examples),
                     red_dpo_pairs=dpo_pair_count,
                     red_dpo_stats=dpo_stats,

@@ -129,6 +129,7 @@ class RedUpdateSettings:
     max_sft_examples: int = 256
     max_dpo_pairs: int = 64
     mining_bottom_fraction: float = 0.25
+    hard_reward_max: float = 0.85
     learning_rate: float = 5e-5
     epochs: int = 1
     per_device_batch_size: int = 1
@@ -318,6 +319,7 @@ def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
         max_sft_examples=int(payload.get("max_sft_examples", 256)),
         max_dpo_pairs=int(payload.get("max_dpo_pairs", 64)),
         mining_bottom_fraction=float(payload.get("mining_bottom_fraction", 0.25)),
+        hard_reward_max=float(payload.get("hard_reward_max", 0.85)),
         learning_rate=float(payload.get("learning_rate", 5e-5)),
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),

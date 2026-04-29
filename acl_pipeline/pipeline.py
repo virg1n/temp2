@@ -595,23 +595,33 @@ class AdversarialCurriculumPipeline:
             }
         )
 
-    def _store_hard_examples_for_batch(self, batch_records: List[EpisodeRecord], iteration_index: int) -> None:
+    def _store_hard_examples_for_iteration(self, iteration_records: List[EpisodeRecord], iteration_index: int) -> None:
         valid_records = [
             episode
-            for episode in batch_records
+            for episode in iteration_records
             if bool(episode.metadata.get("task_is_valid_for_socratic", True))
         ]
         if not valid_records:
             return
         bottom_fraction = float(self.config.red.update.mining_bottom_fraction)
+        hard_reward_max = float(self.config.red.update.hard_reward_max)
+        eligible_records = [
+            episode
+            for episode in valid_records
+            if float(episode.judge.normalized_reward) <= hard_reward_max
+        ]
         keep_count = max(1, math.ceil(len(valid_records) * bottom_fraction))
-        selected = sorted(valid_records, key=lambda episode: episode.judge.normalized_reward)[:keep_count]
+        selected = sorted(eligible_records, key=lambda episode: episode.judge.normalized_reward)[:keep_count]
         self.logger.event(
-            "hard_example_batch_selection",
+            "hard_example_iteration_selection",
+            iteration=iteration_index,
             selected_episode_ids=[episode.episode_id for episode in selected],
             selected_rewards=[episode.judge.normalized_reward for episode in selected],
-            batch_episode_ids=[episode.episode_id for episode in batch_records],
-            red_trainable_episode_ids=[episode.episode_id for episode in valid_records],
+            iteration_episode_ids=[episode.episode_id for episode in iteration_records],
+            valid_episode_ids=[episode.episode_id for episode in valid_records],
+            eligible_episode_ids=[episode.episode_id for episode in eligible_records],
+            mining_bottom_fraction=bottom_fraction,
+            hard_reward_max=hard_reward_max,
         )
         for episode in selected:
             weakness_summary = str(episode.metadata.get("weakness_summary") or "")
@@ -627,7 +637,8 @@ class AdversarialCurriculumPipeline:
                 episode_id=episode.episode_id,
                 topic=episode.topic,
                 reward=episode.judge.normalized_reward,
-                batch_bottom_fraction=bottom_fraction,
+                mining_bottom_fraction=bottom_fraction,
+                hard_reward_max=hard_reward_max,
                 red_dpo_rejection_id=example.metadata.get("red_dpo_rejection_id"),
                 red_dpo_pairing=example.metadata.get("red_dpo_pairing"),
             )
@@ -939,7 +950,6 @@ class AdversarialCurriculumPipeline:
                 self._reset_red_and_curriculum(episode.episode_id)
             records.append(episode)
 
-        self._store_hard_examples_for_batch(records, iteration_index)
         return records, next_episode_id
 
     def _load_red_generation_session(self, iteration_index: int):
@@ -1237,6 +1247,7 @@ class AdversarialCurriculumPipeline:
                     )
                     accepted_records.extend(batch_records)
 
+                self._store_hard_examples_for_iteration(accepted_records, iteration_index)
                 self._run_iteration_updates(accepted_records, iteration_index)
                 self._apply_iteration_curriculum_focus(iteration_index)
 
