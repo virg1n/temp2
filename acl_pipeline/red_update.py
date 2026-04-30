@@ -156,7 +156,6 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
         marker in text
         for marker in (
             "non_json_response",
-            "reference_invalid",
             "buggy_too_correct",
             "blocking_syntax_error",
             "blocking_indentation_error",

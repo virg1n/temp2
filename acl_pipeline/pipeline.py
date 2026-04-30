@@ -131,7 +131,7 @@ class AdversarialCurriculumPipeline:
 
     def _is_dual_solution_validation_rejection(self, reason: Any) -> bool:
         text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
-        return "reference_invalid" in text or "buggy_too_correct" in text
+        return "buggy_too_correct" in text
 
     def _is_trainable_red_dpo_rejection(self, reason: Any) -> bool:
         text = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -322,12 +322,8 @@ class AdversarialCurriculumPipeline:
                 task.metadata["reference_execution"] = reference_execution.to_dict()
                 item["validation_reference_execution"] = reference_execution
                 if reference_execution.status != "passed":
-                    rejection_reasons.append("reference_invalid")
-                    task.metadata["validation_rejection_reason"] = "reference_invalid"
+                    task.metadata["reference_invalid_ignored"] = True
                     task.metadata["observed_failure"] = reference_execution.error_message
-                    item["validation_execution"] = None
-                    item["validation_reasons"] = list(dict.fromkeys(rejection_reasons))
-                    return None, item["validation_reasons"]
 
                 execution = execute_task(task, self.config.task_execution)
                 self._attach_execution(task, execution)

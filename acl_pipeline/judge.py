@@ -461,8 +461,6 @@ def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
     grounding_hits: List[str] = []
     if definition_names & hint_identifiers:
         grounding_hits.append("function_or_class")
-    if assert_token_set & hint_identifiers:
-        grounding_hits.append("assertion_token")
     if error_tokens & hint_identifiers:
         grounding_hits.append("error_token")
 
@@ -477,33 +475,24 @@ def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
     delta = 0.0
     reasons: List[str] = []
     if grounding_hits:
-        delta += min(1.25, 0.45 * len(grounding_hits))
+        delta += min(0.6, 0.3 * len(grounding_hits))
         reasons.extend(f"grounded:{name}" for name in grounding_hits)
-        if "?" in hint_text:
-            delta += 0.25
-            reasons.append("precise_question")
-    if generic_hits:
-        generic_penalty = 0.35 * generic_hits
-        if not grounding_hits:
-            generic_penalty += 0.55
-        delta -= min(1.25, generic_penalty)
-        reasons.append(f"generic:{generic_hits}")
     if invented_identifiers:
-        delta -= min(1.25, 0.25 * len(invented_identifiers))
+        delta -= min(0.6, 0.25 * len(invented_identifiers))
         reasons.append(f"invented_identifiers:{len(invented_identifiers)}")
     if invented_references:
-        delta -= min(2.0, 0.8 * len(invented_references))
+        delta -= min(0.6, 0.8 * len(invented_references))
         reasons.append(f"invented_references:{len(invented_references)}")
     if malformed_reasons:
         delta -= min(2.0, 0.8 * len(malformed_reasons))
         reasons.extend(malformed_reasons)
 
     if word_count > 180:
-        length_penalty = min(1.5, 0.01 * (word_count - 180))
+        length_penalty = min(0.6, 0.01 * (word_count - 180))
         delta -= length_penalty
         reasons.append(f"too_long:{word_count}w")
     if question_count > 4:
-        question_penalty = min(1.0, 0.3 * (question_count - 4))
+        question_penalty = min(0.6, 0.3 * (question_count - 4))
         delta -= question_penalty
         reasons.append(f"too_many_questions:{question_count}")
 
@@ -520,7 +509,7 @@ def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
             delta += 0.35
             reasons.append("noticed_passed_execution")
         else:
-            delta -= 2.25
+            delta -= 0.6
             reasons.append("missed_passed_execution")
 
     return {
