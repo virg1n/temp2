@@ -366,6 +366,7 @@ class AdversarialCurriculumPipeline:
         generation = GenerationSettings(
             batch_size=self._red_effective_batch_size(len(messages_batch)),
             max_new_tokens=int(self.config.red.generation.max_new_tokens),
+            max_context_tokens=int(self.config.red.generation.max_context_tokens),
             temperature=float(self.config.red.generation.temperature),
             top_p=float(self.config.red.generation.top_p),
             do_sample=bool(self.config.red.generation.do_sample),

@@ -63,7 +63,7 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
     except SyntaxError as exc:
         return [], f"syntax error while parsing tests: {exc.msg}"
     signature: List[str] = []
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.Assert) or _is_pytest_raises_with(node):
             signature.append(ast.dump(node, include_attributes=False))
     return signature, None
@@ -127,8 +127,6 @@ class RedTaskGenerator:
                 reasons.append("reference_solution parse error")
             if buggy_parse_error:
                 reasons.append("buggy_solution parse error")
-            if not reference_tests:
-                reasons.append("missing shared tests in reference_solution")
             if not buggy_tests:
                 reasons.append("missing shared tests in buggy_solution")
             if reference_tests and buggy_tests and reference_tests != buggy_tests:

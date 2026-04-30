@@ -274,7 +274,7 @@ red:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 2400
+    max_new_tokens: 4096
     max_context_tokens: 16384
     temperature: 1.1
     top_p: 0.90
