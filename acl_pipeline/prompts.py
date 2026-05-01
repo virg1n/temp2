@@ -320,6 +320,8 @@ def build_judge_batch_messages(
         "The examples below show calibrated grading; follow this calibration.\n"
         "When several items are alternative hints for the same task, score them comparatively so the pipeline can rank them.\n"
         "If candidate_group_id is present, avoid equal total scores within that group unless the hint text is byte-identical or genuinely indistinguishable.\n"
+        "When N > 1, at most floor(N/2) hints in the current payload may receive an overall score above 9. "
+        "If candidate_group_id is present, apply the same at-most-half-above-9 rule within each candidate group.\n"
         "Scores of 8-10 require concrete grounding in the actual failing code and error.\n"
         "8-10 only if the hint names the exact failing assertion, function, variable, or state transition and asks a precise debugging question.\n"
         "6-7 if the hint is directionally helpful but still somewhat generic.\n"

@@ -374,7 +374,7 @@ red:
   enable_thinking: false
   hardware:
     gpu_ids: [2, 3]
-    persistent: false
+    persistent: true
     per_gpu_memory_gib: 40
     cpu_offload_gib: 128
   generation:

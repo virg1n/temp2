@@ -69,6 +69,71 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
     return signature, None
 
 
+_TASK_FILE_LINE_RE = re.compile(r'File "[^"\n]*task\.py", line (\d+)')
+
+
+def _toplevel_test_lines(program: str) -> List[tuple[int, int]]:
+    """Return (start_line, end_line) for each top-level assert / pytest.raises With in the module."""
+    try:
+        tree = ast.parse(program or "")
+    except SyntaxError:
+        return []
+    spans: List[tuple[int, int]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assert) or _is_pytest_raises_with(node):
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", start)
+            if start and end:
+                spans.append((int(start), int(end)))
+    return spans
+
+
+def _failed_line_from_traceback(error_message: str) -> Optional[int]:
+    """Extract the LAST 'File task.py, line N' from the traceback (innermost frame)."""
+    matches = _TASK_FILE_LINE_RE.findall(str(error_message or ""))
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def relax_reference_drop_failing_assert(
+    program: str,
+    error_message: str,
+    *,
+    min_remaining_asserts: int = 2,
+) -> Optional[str]:
+    """If exactly one top-level assert/raises block contains the failing line, return the
+    program with that block commented out. Otherwise return None.
+
+    The failing line must be inside a top-level test (not inside a `def` body). At least
+    `min_remaining_asserts` top-level tests must remain after the drop.
+    """
+    program_text = str(program or "")
+    failed_line = _failed_line_from_traceback(error_message)
+    if failed_line is None:
+        return None
+    spans = _toplevel_test_lines(program_text)
+    if len(spans) < min_remaining_asserts + 1:
+        return None
+    matching = [(s, e) for s, e in spans if s <= failed_line <= e]
+    if len(matching) != 1:
+        return None
+    drop_start, drop_end = matching[0]
+    lines = program_text.splitlines()
+    if drop_end > len(lines):
+        return None
+    new_lines: List[str] = []
+    for index, line in enumerate(lines, start=1):
+        if drop_start <= index <= drop_end:
+            new_lines.append("# [stage1-relaxed] " + line)
+        else:
+            new_lines.append(line)
+    return "\n".join(new_lines)
+
+
 def _payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     metadata = dict(payload.get("metadata") or {})
     if "failure_mode" not in metadata and payload.get("intended_bug"):
