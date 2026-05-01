@@ -64,8 +64,8 @@ socratic:
   # Choose "grpo" for online reward optimization or "dpo" for Judge-ranked
   # preference learning over multiple sampled hints per task.
   training_method: dpo
-  model_name_or_path: Qwen/Qwen3-1.7B
-  tokenizer_name_or_path:
+  model_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/
+  tokenizer_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/
   base_adapter_path:
   quantization: 8bit
   enable_thinking: false
