@@ -1,14 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python *)",
-      "Bash(awk 'BEGIN{n=0; s=0} {n++; s+=$1; vals[n]=$1} END {print \"count:\", n, \"mean:\", s/n}')",
-      "Bash(awk '$1 < 0.1 {n++} END {print \"count below 0.1:\", n}' /tmp/rewards.txt)",
-      "Bash(awk 'BEGIN {n=0} {n++; vals[n]=$1} END {print \"min:\", vals[1], \"p25:\", vals[int\\(n*0.25\\)], \"p50:\", vals[int\\(n*0.5\\)], \"p75:\", vals[int\\(n*0.75\\)], \"p95:\", vals[int\\(n*0.95\\)], \"max:\", vals[n]}')",
-      "Bash(awk ' *)",
-      "Bash(grep -oE '\"reason\": \"[^\"]{0,140}\"')",
-      "Bash(awk '-F\"reward\":' ' *)",
-      "Bash(grep -oE '\"chosen_text\":\\\\s*\"[^\"]{40,200}' \"c:/Users/bogda/github/temp2/logs/socratic_preferences \\(3\\).jsonl\")"
+      "Bash(python *)"
     ]
   }
 }

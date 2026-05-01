@@ -279,7 +279,6 @@ class RoleSession:
         *,
         generation: Optional[GenerationSettings] = None,
         response_prefixes: Optional[List[str]] = None,
-        guided_json_schema: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         effective = generation or self.generation
         prompts: List[str] = []
@@ -369,7 +368,6 @@ class ServerRoleSession:
         *,
         generation: Optional[GenerationSettings] = None,
         response_prefixes: Optional[List[str]] = None,
-        guided_json_schema: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         if response_prefixes:
             raise RuntimeError("response_prefixes are not supported for server-backed generation.")
@@ -380,21 +378,15 @@ class ServerRoleSession:
             text = ""
             last_err: Optional[Exception] = None
             max_tokens = max(1, int(effective.max_new_tokens))
-            schema_for_attempt = guided_json_schema
             for attempt in range(max(1, int(self.max_retries) + 1)):
                 try:
-                    extra_body: Dict[str, Any] = {
-                        "chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}
-                    }
-                    if schema_for_attempt is not None:
-                        extra_body["guided_json"] = schema_for_attempt
                     response = client.chat.completions.create(
                         model=self.model_name_or_path,
                         messages=list(messages),
                         temperature=float(effective.temperature) if effective.do_sample else 0.0,
                         top_p=float(effective.top_p),
                         max_tokens=max_tokens,
-                        extra_body=extra_body,
+                        extra_body={"chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}},
                     )
                     text = str(response.choices[0].message.content or "").strip()
                     last_err = None
@@ -411,15 +403,6 @@ class ServerRoleSession:
                             next_max_tokens=max_tokens,
                             error=str(exc),
                         )
-                        continue
-                    if schema_for_attempt is not None and ("guided_json" in message or "guided" in message or "json schema" in message):
-                        self.logger.warning(
-                            "server_generate_guided_json_fallback",
-                            role=self.role_name,
-                            model_name_or_path=self.model_name_or_path,
-                            error=str(exc),
-                        )
-                        schema_for_attempt = None
                         continue
                     time.sleep(min(2**attempt, 8))
             if last_err is not None:

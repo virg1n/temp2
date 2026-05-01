@@ -161,66 +161,6 @@ class RedTaskGenerator:
         self.logger.debug_dump("red_task", task=task)
         return task, []
 
-    def parse_reference_response(
-        self,
-        raw: str,
-        *,
-        requested_topic: str,
-    ) -> tuple[Optional[Dict[str, Any]], List[str]]:
-        payload = _extract_json(raw)
-        if not isinstance(payload, dict):
-            return None, ["non-json response"]
-
-        topic = str(payload.get("topic") or "").strip()
-        target_function = str(payload.get("target_function") or "").strip()
-        intended_bug = str(payload.get("intended_bug") or "").strip()
-        expected_first_failure = str(payload.get("expected_first_failure") or "").strip()
-        statement = str(payload.get("statement") or "").strip()
-        reference_solution = str(payload.get("reference_solution") or "").strip()
-        metadata = dict(payload.get("metadata") or {})
-        difficulty = str(metadata.get("difficulty") or "").strip().lower()
-        reasons: List[str] = []
-
-        if not topic:
-            reasons.append("missing topic")
-        elif topic != requested_topic:
-            reasons.append("wrong topic")
-        if not target_function:
-            reasons.append("missing target_function")
-        if not intended_bug:
-            reasons.append("missing intended_bug")
-        if not expected_first_failure:
-            reasons.append("missing expected_first_failure")
-        if not statement:
-            reasons.append("missing statement")
-        if not reference_solution:
-            reasons.append("missing reference_solution")
-        if payload.get("buggy_solution"):
-            reasons.append("unexpected buggy_solution in reference stage")
-        if not str(metadata.get("failure_mode") or "").strip():
-            reasons.append("missing metadata.failure_mode")
-        if difficulty not in {"medium", "hard"}:
-            reasons.append("invalid metadata.difficulty")
-        if reference_solution:
-            reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
-            if reference_parse_error:
-                reasons.append("reference_solution parse error")
-            if not reference_tests:
-                reasons.append("missing frozen tests in reference_solution")
-        if reasons:
-            return None, list(dict.fromkeys(reasons))
-
-        normalized = {
-            "topic": topic,
-            "target_function": target_function,
-            "intended_bug": intended_bug,
-            "expected_first_failure": expected_first_failure,
-            "statement": statement,
-            "reference_solution": reference_solution,
-            "metadata": metadata,
-        }
-        return normalized, []
-
     def generate_task(
         self,
         session: "RoleSession",

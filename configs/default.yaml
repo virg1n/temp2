@@ -76,7 +76,7 @@ socratic:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 180
+    max_new_tokens: 480
     temperature: 1.20
     top_p: 0.9
     do_sample: true
@@ -172,25 +172,6 @@ judge:
       expected_hint_is_valid_for_socratic: false
       explanation: "Starts with 'Solution:' and 'let's debug', then states the fix. Not Socratic. Style is the lowest."
 
-    # Anti-example: answer-shaped question with exact operator replacement
-    - statement: "Return the average of integer readings."
-      code: |
-        def average_reading(values):
-            return sum(values) // len(values)
-        assert average_reading([1, 2]) == 1.5
-      observed_failure: "AssertionError: assert 1 == 1.5"
-      hint_text: "What happens if you use / instead of // in the return expression?"
-      expected_criteria_scores:
-        bug_localization: 2
-        usefulness: 2
-        socratic_style: 2
-        technical_accuracy: 8
-      expected_no_solution_reveal: false
-      expected_task_quality: 8
-      expected_task_is_valid_for_socratic: true
-      expected_hint_is_valid_for_socratic: false
-      explanation: "Question form still gives the exact operator replacement, so it leaks the solution."
-
     # Anti-example: hallucinated bug on a passed task
     - statement: "Check if a number is even."
       code: |
@@ -264,85 +245,6 @@ judge:
       expected_task_is_valid_for_socratic: true
       expected_hint_is_valid_for_socratic: true
       explanation: "One focused question grounded in the actual failing input, the variable name, and a specific line. Style is the highest."
-
-  socratic_ranking_examples:
-    - statement: "Return the average of integer readings."
-      code: |
-        def average_reading(values):
-            return sum(values) // len(values)
-        assert average_reading([1, 2]) == 1.5
-      observed_failure: "AssertionError: assert 1 == 1.5"
-      hints:
-        - id: h0
-          text: "Before choosing an operation, what value does the return line produce for [1, 2], and how does its type compare with the expected value?"
-        - id: h1
-          text: "Use / instead of // in the return expression."
-        - id: h2
-          text: "Look at the code carefully and think about the math."
-      ranked_hint_ids: [h0, h2, h1]
-      invalid_hint_ids: [h1]
-      leak_hint_ids: [h1]
-      task_quality: 8
-      task_is_valid_for_socratic: true
-      explanation: "h0 localizes without the edit; h1 leaks the exact operator."
-
-    - statement: "Track the highest score seen by a player."
-      code: |
-        class ScoreTracker:
-            def __init__(self):
-                self.best = 0
-            def add(self, player, score):
-                best = max(self.best, score)
-                return best
-        tracker = ScoreTracker()
-        assert tracker.add('a', 10) == 10
-        assert tracker.add('a', 5) == 10
-      observed_failure: "AssertionError: assert 5 == 10"
-      hints:
-        - id: h0
-          text: "When add is called a second time, which value is supposed to remember the previous score, and where is that value stored after the first call?"
-        - id: h1
-          text: "Make best an instance variable so it persists."
-        - id: h2
-          text: "What changes between the first and second call?"
-      ranked_hint_ids: [h0, h2, h1]
-      invalid_hint_ids: [h1]
-      leak_hint_ids: [h1]
-      task_quality: 8
-      task_is_valid_for_socratic: true
-      explanation: "h1 directly names the storage fix."
-
-  red_evaluation_examples:
-    - statement: "Return the first duplicate in a list, or None if there is none."
-      code: |
-        def first_duplicate(nums):
-            seen = set()
-            for n in nums:
-                if n in seen:
-                    return None
-                seen.add(n)
-            return None
-        assert first_duplicate([1, 2, 1]) == 1
-      observed_failure: "AssertionError: assert None == 1"
-      task_quality: 8
-      debugging_difficulty: 5
-      targets_socratic_weakness: 7
-      task_is_valid_for_red_training: true
-      explanation: "Coherent failing task with a semantic branch bug."
-
-    - statement: "Check if a number is even."
-      code: |
-        def is_even(n):
-            return n % 2 == 0
-        assert is_even(4) is True
-        assert is_even(5) is False
-      observed_failure: "Program exited successfully. No failing assertion or runtime error was reproduced."
-      task_quality: 2
-      debugging_difficulty: 1
-      targets_socratic_weakness: 1
-      task_is_valid_for_red_training: false
-      reason_not_valid: "already_correct_code"
-      explanation: "No reproduced failure, so this should not train Red as a successful adversarial task."
   hardware:
     gpu_ids: [0]
     persistent: true
