@@ -69,6 +69,33 @@ class JudgeExample:
 
 
 @dataclass
+class SocraticRankingExample:
+    statement: str
+    code: str
+    observed_failure: str
+    hints: List[Dict[str, str]]
+    ranked_hint_ids: List[str]
+    invalid_hint_ids: List[str] = field(default_factory=list)
+    leak_hint_ids: List[str] = field(default_factory=list)
+    task_quality: float = 8.0
+    task_is_valid_for_socratic: bool = True
+    explanation: str = ""
+
+
+@dataclass
+class RedEvaluationExample:
+    statement: str
+    code: str
+    observed_failure: str
+    task_quality: float
+    debugging_difficulty: float
+    targets_socratic_weakness: float
+    task_is_valid_for_red_training: bool
+    reason_not_valid: str = ""
+    explanation: str = ""
+
+
+@dataclass
 class LoRASettings:
     enabled: bool = True
     r: int = 64
@@ -194,6 +221,8 @@ class JudgeConfig(RoleConfig):
     bad_task_threshold: float = 3.0
     normalize_across_batches: int = 8
     examples: List[JudgeExample] = field(default_factory=list)
+    socratic_ranking_examples: List[SocraticRankingExample] = field(default_factory=list)
+    red_evaluation_examples: List[RedEvaluationExample] = field(default_factory=list)
 
 
 @dataclass
@@ -377,6 +406,55 @@ def _judge_examples(payload: Optional[List[Dict[str, Any]]]) -> List[JudgeExampl
     return examples
 
 
+def _socratic_ranking_examples(payload: Optional[List[Dict[str, Any]]]) -> List[SocraticRankingExample]:
+    examples: List[SocraticRankingExample] = []
+    for item in payload or []:
+        row = dict(item or {})
+        hints: List[Dict[str, str]] = []
+        for hint in row.get("hints") or []:
+            if not isinstance(hint, dict):
+                continue
+            hint_id = str(hint.get("id") or "").strip()
+            text = str(hint.get("text") or "").strip()
+            if hint_id and text:
+                hints.append({"id": hint_id, "text": text})
+        examples.append(
+            SocraticRankingExample(
+                statement=str(row.get("statement") or row.get("task_excerpt") or ""),
+                code=str(row.get("code") or row.get("task_excerpt") or ""),
+                observed_failure=str(row.get("observed_failure") or ""),
+                hints=hints,
+                ranked_hint_ids=[str(x) for x in row.get("ranked_hint_ids") or []],
+                invalid_hint_ids=[str(x) for x in row.get("invalid_hint_ids") or []],
+                leak_hint_ids=[str(x) for x in row.get("leak_hint_ids") or []],
+                task_quality=float(row.get("task_quality", 8.0)),
+                task_is_valid_for_socratic=bool(row.get("task_is_valid_for_socratic", True)),
+                explanation=str(row.get("explanation") or ""),
+            )
+        )
+    return examples
+
+
+def _red_evaluation_examples(payload: Optional[List[Dict[str, Any]]]) -> List[RedEvaluationExample]:
+    examples: List[RedEvaluationExample] = []
+    for item in payload or []:
+        row = dict(item or {})
+        examples.append(
+            RedEvaluationExample(
+                statement=str(row.get("statement") or row.get("task_excerpt") or ""),
+                code=str(row.get("code") or row.get("task_excerpt") or ""),
+                observed_failure=str(row.get("observed_failure") or ""),
+                task_quality=float(row.get("task_quality", 5.0)),
+                debugging_difficulty=float(row.get("debugging_difficulty", 5.0)),
+                targets_socratic_weakness=float(row.get("targets_socratic_weakness", 5.0)),
+                task_is_valid_for_red_training=bool(row.get("task_is_valid_for_red_training", True)),
+                reason_not_valid=str(row.get("reason_not_valid") or ""),
+                explanation=str(row.get("explanation") or ""),
+            )
+        )
+    return examples
+
+
 def _role(payload: Dict[str, Any]) -> RoleConfig:
     return RoleConfig(
         model_name_or_path=str(payload["model_name_or_path"]),
@@ -440,6 +518,8 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         bad_task_threshold=float(payload.get("bad_task_threshold", 3.0)),
         normalize_across_batches=int(payload.get("normalize_across_batches", 8)),
         examples=_judge_examples(payload.get("examples") or []),
+        socratic_ranking_examples=_socratic_ranking_examples(payload.get("socratic_ranking_examples") or []),
+        red_evaluation_examples=_red_evaluation_examples(payload.get("red_evaluation_examples") or []),
     )
 
 

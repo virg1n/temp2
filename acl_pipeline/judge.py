@@ -9,7 +9,12 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool
-from .prompts import build_judge_batch_messages, build_socratic_messages
+from .prompts import (
+    build_judge_batch_messages,
+    build_red_task_evaluation_messages,
+    build_socratic_messages,
+    build_socratic_ranking_messages,
+)
 from .schemas import JudgeOutput, PythonTask, SocraticHint
 from .text_quality import detect_corrupted_hint_text
 
@@ -153,12 +158,21 @@ _DIRECT_FIX_PATTERNS = [
     for pattern in (
         r"\bthe fix is\b",
         r"\bthe bug is\b",
+        r"\bthe correct approach is\b",
         r"\bfix (?:it|this) by\b",
         r"\breplace\b.+\bwith\b",
         r"\bchange\b.+\bto\b",
+        r"\bcurrent code uses\b.+\bbut should use\b",
         r"\buse\s+[^.\n]{0,80}\s+instead\b",
+        r"\buse\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\s+instead of\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\b",
         r"\badd a missing\b",
         r"\brename\b.+\bto\b",
+        r"\bfinal code should\b",
+        r"\bmake\s+[A-Za-z_][A-Za-z0-9_]*\s+an instance variable\b",
+        r"\b(?:swap|switch|change)\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\s+(?:to|for|with)\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\b",
+        r"`[^`\n]{1,80}`\s+(?:instead of|rather than)\s+`[^`\n]{1,80}`",
+        r"\b(?:formula|expression)\s+should\s+be\b",
+        r"\b(?:call|use)\s+[A-Za-z_][A-Za-z0-9_\.]*\([^)\n]{0,80}\)",
         r"\b(?:it|this|that|the (?:answer|result|output|value|code|line|function|return value|expected))\s+should be\b",
         r"\b(?:only|just|always|never|every|all|any)\s+[^.\n]{0,80}\s+should\s+(?:be|return|raise|equal|produce|yield|contain|include|match)\b",
         r"\bshould\s+(?:return|raise|equal|produce|yield|contain|include|match)\b",
@@ -246,10 +260,137 @@ def _judge_items_from_parsed(parsed: Any, expected_count: int) -> List[Any]:
                 "task_quality",
                 "task_is_valid_for_socratic",
                 "hint_is_valid_for_socratic",
+                "task_is_valid_for_red_training",
+                "debugging_difficulty",
+                "targets_socratic_weakness",
             )
         ):
             return [parsed]
     return []
+
+
+def _align_items_to_rows(parsed_items: List[Any], rows: List[Dict[str, Any]]) -> List[Any]:
+    if len(parsed_items) != len(rows):
+        return []
+    expected_ids = [str(row.get("id") or "") for row in rows]
+    if all(expected_ids):
+        by_id = {
+            str(item.get("id") or ""): item
+            for item in parsed_items
+            if isinstance(item, dict) and str(item.get("id") or "")
+        }
+        if all(item_id in by_id for item_id in expected_ids):
+            return [by_id[item_id] for item_id in expected_ids]
+    return parsed_items
+
+
+def _clamp_score(raw: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, min(10.0, float(raw)))
+    except Exception:
+        return default
+
+
+def _coerce_bool(raw: Any, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return float(raw) >= 0.5
+    text = str(raw or "").strip().lower()
+    if text in {"true", "yes", "valid", "clean", "1"}:
+        return True
+    if text in {"false", "no", "invalid", "leak", "0"}:
+        return False
+    return default
+
+
+def _judge_score_schema(expected_count: int) -> Dict[str, Any]:
+    return {
+        "type": "array",
+        "minItems": int(expected_count),
+        "maxItems": int(expected_count),
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "id": {"type": "string"},
+                "no_solution_reveal": {"type": "boolean"},
+                "bug_localization": {"type": "integer", "minimum": 0, "maximum": 10},
+                "usefulness": {"type": "integer", "minimum": 0, "maximum": 10},
+                "socratic_style": {"type": "integer", "minimum": 0, "maximum": 10},
+                "technical_accuracy": {"type": "integer", "minimum": 0, "maximum": 10},
+                "task_quality": {"type": "integer", "minimum": 0, "maximum": 10},
+                "task_is_valid_for_socratic": {"type": "boolean"},
+                "hint_is_valid_for_socratic": {"type": "boolean"},
+                "red_rejection_reason": {"type": ["string", "null"]},
+                "hint_rejection_reason": {"type": ["string", "null"]},
+            },
+            "required": [
+                "id",
+                "no_solution_reveal",
+                "bug_localization",
+                "usefulness",
+                "socratic_style",
+                "technical_accuracy",
+                "task_quality",
+                "task_is_valid_for_socratic",
+                "hint_is_valid_for_socratic",
+                "red_rejection_reason",
+                "hint_rejection_reason",
+            ],
+        },
+    }
+
+
+def _socratic_ranking_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ranked_hint_ids": {"type": "array", "items": {"type": "string"}},
+            "invalid_hint_ids": {"type": "array", "items": {"type": "string"}},
+            "leak_hint_ids": {"type": "array", "items": {"type": "string"}},
+            "task_quality": {"type": "integer", "minimum": 0, "maximum": 10},
+            "task_is_valid_for_socratic": {"type": "boolean"},
+            "notes": {"type": "string"},
+        },
+        "required": [
+            "ranked_hint_ids",
+            "invalid_hint_ids",
+            "leak_hint_ids",
+            "task_quality",
+            "task_is_valid_for_socratic",
+            "notes",
+        ],
+    }
+
+
+def _red_task_eval_schema(expected_count: int) -> Dict[str, Any]:
+    return {
+        "type": "array",
+        "minItems": int(expected_count),
+        "maxItems": int(expected_count),
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "id": {"type": "string"},
+                "task_is_valid_for_red_training": {"type": "boolean"},
+                "task_quality": {"type": "integer", "minimum": 0, "maximum": 10},
+                "debugging_difficulty": {"type": "integer", "minimum": 0, "maximum": 10},
+                "targets_socratic_weakness": {"type": "integer", "minimum": 0, "maximum": 10},
+                "reason_not_valid": {"type": ["string", "null"]},
+            },
+            "required": [
+                "id",
+                "task_is_valid_for_red_training",
+                "task_quality",
+                "debugging_difficulty",
+                "targets_socratic_weakness",
+                "reason_not_valid",
+            ],
+        },
+    }
 
 
 def _extract_prompt_sections(prompt_text: str) -> Dict[str, str]:
@@ -808,7 +949,11 @@ class JudgeService:
         raw_items: List[Any] = [{} for _ in rows]
         raw_responses: List[str] = ["" for _ in rows]
         if judge_indexes:
-            judge_rows = [rows[index] for index in judge_indexes]
+            judge_rows = []
+            for index in judge_indexes:
+                row = dict(rows[index])
+                row["id"] = f"item_{index}"
+                judge_rows.append(row)
             session = self.model_pool.get_judge()
             messages = build_judge_batch_messages(
                 judge_rows,
@@ -819,11 +964,15 @@ class JudgeService:
             raw = ""
             parsed_items: List[Any] = []
             last_parsed_type = "None"
+            schema = _judge_score_schema(len(judge_rows))
             for attempt in range(1, max_attempts + 1):
-                raw = session.generate([messages])[0]
+                raw = session.generate([messages], guided_json_schema=schema)[0]
                 parsed = _extract_json(raw)
                 last_parsed_type = type(parsed).__name__ if parsed is not None else "None"
-                parsed_items = _judge_items_from_parsed(parsed, expected_count=len(judge_rows))
+                parsed_items = _align_items_to_rows(
+                    _judge_items_from_parsed(parsed, expected_count=len(judge_rows)),
+                    judge_rows,
+                )
                 if len(parsed_items) == len(judge_rows):
                     break
                 self.logger.warning(
@@ -838,23 +987,63 @@ class JudgeService:
                 )
 
             if len(parsed_items) != len(judge_rows):
-                self.logger.error(
-                    "judge_malformed_response_error",
+                self.logger.warning(
+                    "judge_batch_fallback_to_single",
                     expected_items=len(judge_rows),
                     parsed_items=len(parsed_items),
                     parsed_type=last_parsed_type,
                     raw_chars=len(raw),
                     raw_preview=str(raw or "")[:500],
                 )
-                raise RuntimeError(
-                    "Judge returned malformed or truncated JSON after "
-                    f"{max_attempts} attempt(s): expected {len(judge_rows)} item(s), "
-                    f"parsed {len(parsed_items)}. Increase judge.generation.max_new_tokens "
-                    "or reduce judge.episode_batch_size / socratic.dpo.num_hint_candidates."
-                )
-            for index, item in zip(judge_indexes, parsed_items):
+                parsed_items = []
+                for row in judge_rows:
+                    single_messages = build_judge_batch_messages(
+                        [row],
+                        self._weights(),
+                        examples=getattr(self.model_pool.config.judge, "examples", []),
+                    )
+                    single_raw = ""
+                    single_items: List[Any] = []
+                    single_type = "None"
+                    for attempt in range(1, max_attempts + 1):
+                        single_raw = session.generate(
+                            [single_messages],
+                            guided_json_schema=_judge_score_schema(1),
+                        )[0]
+                        single_parsed = _extract_json(single_raw)
+                        single_type = type(single_parsed).__name__ if single_parsed is not None else "None"
+                        single_items = _align_items_to_rows(
+                            _judge_items_from_parsed(single_parsed, expected_count=1),
+                            [row],
+                        )
+                        if len(single_items) == 1:
+                            break
+                        self.logger.warning(
+                            "judge_single_malformed_response_retry",
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            expected_items=1,
+                            parsed_items=len(single_items),
+                            parsed_type=single_type,
+                            raw_chars=len(single_raw),
+                            raw_preview=str(single_raw or "")[:500],
+                        )
+                    if len(single_items) != 1:
+                        self.logger.error(
+                            "judge_single_malformed_response_error",
+                            expected_items=1,
+                            parsed_items=len(single_items),
+                            parsed_type=single_type,
+                            raw_chars=len(single_raw),
+                            raw_preview=str(single_raw or "")[:500],
+                        )
+                        single_items = [{}]
+                    parsed_items.extend(single_items)
+                    raw_responses[judge_indexes[len(parsed_items) - 1]] = single_raw
+            for offset, (index, item) in enumerate(zip(judge_indexes, parsed_items)):
                 raw_items[index] = item
-                raw_responses[index] = raw
+                if not raw_responses[index]:
+                    raw_responses[index] = raw
 
         criteria_list: List[Dict[str, float]] = []
         for item, gate in zip(raw_items, hard_gates):
@@ -1003,6 +1192,204 @@ class JudgeService:
             },
         )
 
+    def _rank_hint_group_with_judge(
+        self,
+        task: PythonTask,
+        hints: List[SocraticHint],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not hints:
+            return []
+
+        prompt_text = build_socratic_messages(task)[-1]["content"]
+        rows: List[Dict[str, Any]] = []
+        for candidate_index, hint in enumerate(hints):
+            row = _build_row(prompt_text, _hint_text_for_judge(hint), task)
+            row["id"] = f"h{candidate_index}"
+            rows.append(row)
+
+        corruption_flags = [detect_corrupted_hint_text(_hint_text_for_judge(hint)) for hint in hints]
+        quality_features = [_hint_quality_features(row) for row in rows]
+        hard_gates = [
+            self._hard_rule_gate(
+                row=row,
+                task=task,
+                corruption=corruption,
+                features=features,
+            )
+            for row, corruption, features in zip(rows, corruption_flags, quality_features)
+        ]
+
+        payload = {
+            "statement": rows[0].get("statement", ""),
+            "code": rows[0].get("code", ""),
+            "observed_failure": rows[0].get("observed_failure", ""),
+            "execution_status": rows[0].get("execution_status", ""),
+            "red_spec": rows[0].get("red_spec", {}),
+            "hints": [
+                {
+                    "id": row["id"],
+                    "text": row.get("assistant_response", ""),
+                }
+                for row in rows
+            ],
+        }
+        messages = build_socratic_ranking_messages(
+            payload,
+            examples=getattr(self.model_pool.config.judge, "socratic_ranking_examples", []),
+        )
+        session = self.model_pool.get_judge()
+        max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
+        raw = ""
+        parsed: Any = None
+        for attempt in range(1, max_attempts + 1):
+            raw = session.generate([messages], guided_json_schema=_socratic_ranking_schema())[0]
+            parsed = _extract_json(raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("ranked_hint_ids"), list):
+                break
+            self.logger.warning(
+                "judge_hint_ranking_malformed_retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                parsed_type=type(parsed).__name__ if parsed is not None else "None",
+                raw_chars=len(raw),
+                raw_preview=str(raw or "")[:500],
+            )
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("ranked_hint_ids"), list):
+            self.logger.warning(
+                "judge_hint_ranking_fallback_to_scores",
+                hint_count=len(hints),
+                raw_chars=len(raw),
+                raw_preview=str(raw or "")[:500],
+            )
+            return None
+
+        all_ids = [row["id"] for row in rows]
+        hard_invalid_ids = {
+            row["id"]
+            for row, corruption, features, gate in zip(rows, corruption_flags, quality_features, hard_gates)
+            if corruption["is_corrupted"] or features["severe_hint_failure"] or gate.get("force_hint_valid") is False
+        }
+        hard_leak_ids = {
+            row["id"]
+            for row, gate in zip(rows, hard_gates)
+            if gate.get("contains_direct_fix") or gate.get("contains_code_output")
+        }
+        invalid_ids = {
+            str(item)
+            for item in list(parsed.get("invalid_hint_ids") or [])
+            if str(item) in all_ids
+        } | hard_invalid_ids
+        leak_ids = {
+            str(item)
+            for item in list(parsed.get("leak_hint_ids") or [])
+            if str(item) in all_ids
+        } | hard_leak_ids
+        invalid_ids |= leak_ids
+
+        ranked_ids: List[str] = []
+        for raw_id in list(parsed.get("ranked_hint_ids") or []):
+            hint_id = str(raw_id)
+            if hint_id in all_ids and hint_id not in ranked_ids:
+                ranked_ids.append(hint_id)
+        for hint_id in all_ids:
+            if hint_id not in ranked_ids:
+                ranked_ids.append(hint_id)
+        ranked_ids = [
+            hint_id for hint_id in ranked_ids if hint_id not in invalid_ids
+        ] + [
+            hint_id for hint_id in ranked_ids if hint_id in invalid_ids
+        ]
+        rank_by_id = {hint_id: rank for rank, hint_id in enumerate(ranked_ids)}
+
+        task_quality = _clamp_score(parsed.get("task_quality", 5.0), default=5.0)
+        task_is_valid = _coerce_bool(parsed.get("task_is_valid_for_socratic"), default=task_quality > float(self.model_pool.config.judge.bad_task_threshold))
+        for gate in hard_gates:
+            if gate.get("task_quality_override") is not None:
+                task_quality = min(task_quality, _clamp_score(gate.get("task_quality_override"), default=task_quality))
+            if gate.get("force_task_valid") is not None:
+                task_is_valid = bool(gate["force_task_valid"])
+
+        span = 8.0 / max(1, len(hints) - 1)
+        details_by_id: Dict[str, Dict[str, Any]] = {}
+        weights = self._weights()
+        zero_criteria = {key: 0.0 for key in weights}
+        for candidate_index, (row, hint, corruption, features, gate) in enumerate(zip(rows, hints, corruption_flags, quality_features, hard_gates)):
+            hint_id = row["id"]
+            rank = rank_by_id.get(hint_id, len(hints) - 1)
+            leaked = hint_id in leak_ids or gate.get("contains_direct_fix") or gate.get("contains_code_output")
+            invalid = hint_id in invalid_ids or corruption["is_corrupted"] or features["severe_hint_failure"]
+            if invalid or leaked:
+                score = 0.0
+                criteria = dict(zero_criteria)
+            else:
+                score = max(0.0, 10.0 - (rank * span))
+                criteria = {key: score for key in weights}
+            no_solution_reveal = not leaked
+            assessment = self._task_and_hint_assessment(
+                {
+                    "task_quality": task_quality,
+                    "task_is_valid_for_socratic": task_is_valid,
+                    "hint_is_valid_for_socratic": not invalid and not leaked,
+                    "red_rejection_reason": "judge_bad_task" if not task_is_valid else "",
+                    "hint_rejection_reason": "solution_reveal" if leaked else "invalid_ranked_hint" if invalid else "",
+                },
+                score=score,
+                severe_hint_failure=bool(features["severe_hint_failure"]),
+                corruption_detected=bool(corruption["is_corrupted"]),
+                hard_gate=gate,
+            )
+            features["hard_gate"] = {
+                "applied": bool(gate["reasons"]),
+                "reasons": list(gate["reasons"]),
+                "forced_score": gate["forced_score"],
+                "contains_code_output": gate["contains_code_output"],
+                "contains_direct_fix": gate["contains_direct_fix"],
+            }
+            features["judge_ranking"] = {
+                "ranked_hint_ids": ranked_ids,
+                "invalid_hint_ids": sorted(invalid_ids),
+                "leak_hint_ids": sorted(leak_ids),
+                "rank": rank,
+                "source": "judge_ranking",
+                "notes": str(parsed.get("notes") or ""),
+            }
+            details_by_id[hint_id] = {
+                "criteria_scores": criteria,
+                "raw_score": score,
+                "raw_unclamped": score,
+                "pre_normalize": score,
+                "post_normalize": score,
+                "adjusted_score": score,
+                "no_solution_reveal": no_solution_reveal,
+                "no_solution_reveal_multiplier": 1.0 if no_solution_reveal else 0.1,
+                "raw_response": raw,
+                "task_quality": assessment["task_quality"],
+                "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
+                "hint_is_valid_for_socratic": assessment["hint_is_valid_for_socratic"],
+                "use_for_socratic": assessment["hint_is_valid_for_socratic"],
+                "red_rejection_reason": assessment["red_rejection_reason"],
+                "hint_rejection_reason": assessment["hint_rejection_reason"],
+                "hint_corruption": corruption,
+                "local_tiebreak": features,
+            }
+
+        ranked: List[Dict[str, Any]] = []
+        for hint_id in ranked_ids:
+            candidate_index = all_ids.index(hint_id)
+            hint = hints[candidate_index]
+            judge = self._output_from_details(task, hint, details_by_id[hint_id])
+            judge.metadata["candidate_index"] = int(hint.metadata.get("candidate_index", candidate_index))
+            judge.metadata["candidate_rank"] = int(rank_by_id.get(hint_id, candidate_index))
+            ranked.append(
+                {
+                    "hint": hint,
+                    "judge": judge,
+                    "candidate_index": int(hint.metadata.get("candidate_index", candidate_index)),
+                    "rank": int(rank_by_id.get(hint_id, candidate_index)),
+                }
+            )
+        return ranked
+
     def rank_hint_candidates(
         self,
         tasks: List[PythonTask],
@@ -1015,45 +1402,37 @@ class JudgeService:
         if not tasks:
             return []
 
-        flat_tasks: List[PythonTask] = []
-        flat_hints: List[SocraticHint] = []
-        group_sizes: List[int] = []
-        for task, hints in zip(tasks, hint_groups):
-            usable_hints = list(hints)
-            group_sizes.append(len(usable_hints))
-            for hint in usable_hints:
-                flat_tasks.append(task)
-                flat_hints.append(hint)
-
-        if not flat_hints:
-            return [[] for _ in tasks]
-
-        prompt_texts = [build_socratic_messages(task)[-1]["content"] for task in flat_tasks]
-        hint_texts = [_hint_text_for_judge(hint) for hint in flat_hints]
-        details_list = self.score_pair_details(
-            prompt_texts,
-            hint_texts,
-            apply_batch_spread=False,
-            tasks=flat_tasks,
-        )
-
         ranked_groups: List[List[Dict[str, Any]]] = []
-        offset = 0
-        for task, group_size in zip(tasks, group_sizes):
-            group_hints = flat_hints[offset : offset + group_size]
-            group_details = [dict(item) for item in details_list[offset : offset + group_size]]
-            offset += group_size
+        for task, hints in zip(tasks, hint_groups):
+            group_hints = list(hints)
+            if not group_hints:
+                ranked_groups.append([])
+                continue
+
+            ranked = self._rank_hint_group_with_judge(task, group_hints)
+            if ranked is not None:
+                ranked_groups.append(ranked)
+                continue
+
+            prompt_texts = [build_socratic_messages(task)[-1]["content"] for _ in group_hints]
+            hint_texts = [_hint_text_for_judge(hint) for hint in group_hints]
+            group_details = self.score_pair_details(
+                prompt_texts,
+                hint_texts,
+                apply_batch_spread=False,
+                tasks=[task for _ in group_hints],
+            )
 
             if apply_group_spread and len(group_details) > 1:
                 adjusted_scores = self._apply_batch_spread([float(item["post_normalize"]) for item in group_details])
                 for details, adjusted_score in zip(group_details, adjusted_scores):
                     details["adjusted_score"] = adjusted_score
 
-            ranked: List[Dict[str, Any]] = []
+            fallback_ranked: List[Dict[str, Any]] = []
             for candidate_index, (hint, details) in enumerate(zip(group_hints, group_details)):
                 judge = self._output_from_details(task, hint, details)
                 judge.metadata["candidate_index"] = int(hint.metadata.get("candidate_index", candidate_index))
-                ranked.append(
+                fallback_ranked.append(
                     {
                         "hint": hint,
                         "judge": judge,
@@ -1061,7 +1440,7 @@ class JudgeService:
                     }
                 )
 
-            ranked.sort(
+            fallback_ranked.sort(
                 key=lambda item: (
                     bool(item["judge"].metadata.get("task_is_valid_for_socratic", True)),
                     bool(item["judge"].metadata.get("hint_is_valid_for_socratic", True)),
@@ -1070,12 +1449,147 @@ class JudgeService:
                 ),
                 reverse=True,
             )
-            for rank, item in enumerate(ranked):
+            for rank, item in enumerate(fallback_ranked):
                 item["rank"] = rank
                 item["judge"].metadata["candidate_rank"] = rank
-            ranked_groups.append(ranked)
+                item["judge"].metadata.setdefault("local_tiebreak", {})["judge_ranking"] = {"source": "score_fallback"}
+            ranked_groups.append(fallback_ranked)
 
         return ranked_groups
+
+    def evaluate_red_tasks(
+        self,
+        tasks: List[PythonTask],
+        *,
+        hint_rankings: Optional[List[List[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not tasks:
+            return []
+
+        items: List[Dict[str, Any]] = []
+        ranking_groups = list(hint_rankings or [])
+        for index, task in enumerate(tasks):
+            prompt_text = build_socratic_messages(task)[-1]["content"]
+            row = _build_row(prompt_text, "", task)
+            row["id"] = f"task_{index}"
+            rankings = ranking_groups[index] if index < len(ranking_groups) else []
+            if rankings:
+                row["hint_ranking_summary"] = [
+                    {
+                        "rank": candidate.get("rank"),
+                        "candidate_index": candidate.get("candidate_index"),
+                        "score": candidate["judge"].metadata.get("post_normalize"),
+                        "no_solution_reveal": candidate["judge"].metadata.get("no_solution_reveal"),
+                        "hint_is_valid_for_socratic": candidate["judge"].metadata.get("hint_is_valid_for_socratic"),
+                        "hint_rejection_reason": candidate["judge"].metadata.get("hint_rejection_reason"),
+                    }
+                    for candidate in rankings
+                    if isinstance(candidate, dict) and candidate.get("judge") is not None
+                ]
+            items.append(row)
+
+        session = self.model_pool.get_judge()
+        messages = build_red_task_evaluation_messages(
+            items,
+            examples=getattr(self.model_pool.config.judge, "red_evaluation_examples", []),
+        )
+        max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
+        raw = ""
+        parsed_items: List[Any] = []
+        raw_responses: List[str] = ["" for _ in items]
+        last_parsed_type = "None"
+        for attempt in range(1, max_attempts + 1):
+            raw = session.generate([messages], guided_json_schema=_red_task_eval_schema(len(items)))[0]
+            parsed = _extract_json(raw)
+            last_parsed_type = type(parsed).__name__ if parsed is not None else "None"
+            parsed_items = _align_items_to_rows(_judge_items_from_parsed(parsed, expected_count=len(items)), items)
+            if len(parsed_items) == len(items):
+                raw_responses = [raw for _ in items]
+                break
+            self.logger.warning(
+                "judge_red_task_eval_malformed_retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                expected_items=len(items),
+                parsed_items=len(parsed_items),
+                parsed_type=last_parsed_type,
+                raw_chars=len(raw),
+                raw_preview=str(raw or "")[:500],
+            )
+
+        if len(parsed_items) != len(items):
+            self.logger.warning(
+                "judge_red_task_eval_fallback_to_single",
+                expected_items=len(items),
+                parsed_items=len(parsed_items),
+                parsed_type=last_parsed_type,
+                raw_chars=len(raw),
+                raw_preview=str(raw or "")[:500],
+            )
+            parsed_items = []
+            raw_responses = []
+            for row in items:
+                single_messages = build_red_task_evaluation_messages(
+                    [row],
+                    examples=getattr(self.model_pool.config.judge, "red_evaluation_examples", []),
+                )
+                single_raw = ""
+                single_items: List[Any] = []
+                for attempt in range(1, max_attempts + 1):
+                    single_raw = session.generate(
+                        [single_messages],
+                        guided_json_schema=_red_task_eval_schema(1),
+                    )[0]
+                    single_parsed = _extract_json(single_raw)
+                    single_items = _align_items_to_rows(_judge_items_from_parsed(single_parsed, expected_count=1), [row])
+                    if len(single_items) == 1:
+                        break
+                if len(single_items) != 1:
+                    execution_status = str(row.get("execution_status") or "")
+                    valid = execution_status not in {"passed", "syntax_error", "indentation_error", "nameerror"}
+                    single_items = [
+                        {
+                            "id": row["id"],
+                            "task_is_valid_for_red_training": valid,
+                            "task_quality": 7 if valid else 2,
+                            "debugging_difficulty": 5 if valid else 1,
+                            "targets_socratic_weakness": 5 if valid else 1,
+                            "reason_not_valid": "" if valid else f"fallback_{execution_status or 'invalid'}",
+                        }
+                    ]
+                    single_raw = ""
+                parsed_items.extend(single_items)
+                raw_responses.append(single_raw)
+
+        outputs: List[Dict[str, Any]] = []
+        for task, row, item, item_raw in zip(tasks, items, parsed_items, raw_responses):
+            payload = dict(item or {}) if isinstance(item, dict) else {}
+            valid = _coerce_bool(payload.get("task_is_valid_for_red_training"), default=True)
+            task_quality = _clamp_score(payload.get("task_quality", 5.0), default=5.0)
+            difficulty = _clamp_score(payload.get("debugging_difficulty", 5.0), default=5.0)
+            weakness = _clamp_score(payload.get("targets_socratic_weakness", 5.0), default=5.0)
+            if row.get("execution_status") == "passed":
+                valid = False
+                task_quality = min(task_quality, 2.0)
+                difficulty = min(difficulty, 1.0)
+            red_reward = ((0.4 * task_quality) + (0.3 * difficulty) + (0.3 * weakness)) / 10.0 if valid else 0.0
+            result = {
+                "id": str(row["id"]),
+                "task_is_valid_for_red_training": valid,
+                "task_quality": task_quality,
+                "debugging_difficulty": difficulty,
+                "targets_socratic_weakness": weakness,
+                "red_task_reward": red_reward,
+                "reason_not_valid": str(payload.get("reason_not_valid") or ""),
+                "raw_response": item_raw,
+            }
+            task.metadata["red_task_evaluation"] = result
+            task.metadata["red_task_quality"] = task_quality
+            task.metadata["red_debugging_difficulty"] = difficulty
+            task.metadata["red_targets_socratic_weakness"] = weakness
+            task.metadata["red_task_reward"] = red_reward
+            outputs.append(result)
+        return outputs
 
     def evaluate(self, task: PythonTask, hint_text: str) -> JudgeOutput:
         hint = SocraticHint(task_id=task.task_id, text=hint_text, raw_text=hint_text)

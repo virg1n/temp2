@@ -18,12 +18,21 @@ _DIRECT_FIX_PATTERNS = [
     for pattern in (
         r"\bthe fix is\b",
         r"\bthe bug is\b",
+        r"\bthe correct approach is\b",
         r"\bfix (?:it|this) by\b",
         r"\breplace\b.+\bwith\b",
         r"\bchange\b.+\bto\b",
+        r"\bcurrent code uses\b.+\bbut should use\b",
         r"\buse\s+[^.\n]{0,80}\s+instead\b",
+        r"\buse\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\s+instead of\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\b",
         r"\badd a missing\b",
         r"\brename\b.+\bto\b",
+        r"\bfinal code should\b",
+        r"\bmake\s+[A-Za-z_][A-Za-z0-9_]*\s+an instance variable\b",
+        r"\b(?:swap|switch|change)\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\s+(?:to|for|with)\s+(?:/|//|%|\+|-|\*|\*\*|==|!=|<=|>=|<|>)\b",
+        r"`[^`\n]{1,80}`\s+(?:instead of|rather than)\s+`[^`\n]{1,80}`",
+        r"\b(?:formula|expression)\s+should\s+be\b",
+        r"\b(?:call|use)\s+[A-Za-z_][A-Za-z0-9_\.]*\([^)\n]{0,80}\)",
     )
 ]
 _CODE_LINE_PATTERNS = [
@@ -62,8 +71,8 @@ def sanitize_socratic_text(text: str) -> str:
         return _FALLBACK_HINT
     trimmed = "\n".join(lines[:4]).strip()
     words = trimmed.split()
-    if len(words) > 120:
-        trimmed = " ".join(words[:120]).strip()
+    if len(words) > 100:
+        trimmed = " ".join(words[:100]).strip()
     if socratic_contract_violation(trimmed):
         return _FALLBACK_HINT
     return trimmed

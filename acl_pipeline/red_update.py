@@ -157,6 +157,13 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
         for marker in (
             "non_json_response",
             "buggy_too_correct",
+            "reference_solution_failed",
+            "reference_solution_changed_after_freeze",
+            "frozen_task_changed",
+            "solutions_do_not_share_identical_tests",
+            "missing_buggy_solution",
+            "missing_shared_tests",
+            "buggy_solution_parse_error",
             "blocking_syntax_error",
             "blocking_indentation_error",
             "blocking_nameerror",
@@ -191,10 +198,32 @@ def _rejected_example_is_trainable_for_red_dpo(example: RedRejectedExample) -> b
 def _chosen_example_has_direct_trainable_rejection(example: RedTrainingExample) -> bool:
     metadata = dict(example.metadata or {})
     return (
-        _is_trainable_red_dpo_rejection_reason(metadata.get("red_dpo_rejection_reason"))
-        or _is_trainable_red_dpo_rejection_reason(metadata.get("rejection_reason"))
-        or _is_trainable_red_dpo_rejection_reason(metadata.get("rejected_reason"))
+        str(metadata.get("red_dpo_pairing") or "") == "same_attempt_direct_rejection"
+        and bool(str(example.rejected_completion or "").strip())
     )
+
+
+def _red_task_evaluation_payload(*, example: Optional[RedTrainingExample] = None, episode: Optional[EpisodeRecord] = None) -> Dict[str, Any]:
+    if example is not None:
+        metadata = dict(example.metadata or {})
+        payload = dict(metadata.get("red_task_evaluation") or {})
+        if not payload:
+            payload = dict(example.task.metadata.get("red_task_evaluation") or {})
+        return payload
+    if episode is not None:
+        metadata = dict(episode.metadata or {})
+        payload = dict(metadata.get("red_task_evaluation") or {})
+        if not payload:
+            payload = dict(episode.task.metadata.get("red_task_evaluation") or {})
+        return payload
+    return {}
+
+
+def _is_valid_for_red_training(*, example: Optional[RedTrainingExample] = None, episode: Optional[EpisodeRecord] = None) -> bool:
+    payload = _red_task_evaluation_payload(example=example, episode=episode)
+    if "task_is_valid_for_red_training" not in payload:
+        return True
+    return bool(payload.get("task_is_valid_for_red_training"))
 
 
 def _build_dpo_dataset(
@@ -214,13 +243,6 @@ def _build_dpo_dataset(
             "trainable_rejections": 0,
             "topic_matches": {},
         }
-
-    topic_index: Dict[str, List[RedTrainingExample]] = {}
-    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
-        topic_key = _normalize_topic(example.topic or example.task.topic)
-        if not topic_key:
-            continue
-        topic_index.setdefault(topic_key, []).append(example)
 
     direct_pairs = 0
     for example in sorted(chosen_examples, key=lambda entry: entry.reward):
@@ -255,50 +277,15 @@ def _build_dpo_dataset(
 
     already_correct_rejections = [item for item in rejected_examples if _rejected_example_is_already_correct(item)]
     trainable_rejections = [item for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)]
-    topic_offsets: Dict[str, int] = {}
-    topic_matches: Dict[str, int] = {}
-    topic_pairs = 0
-    seen_pairs = {
-        (row["prompt"], row["chosen"], row["rejected"])
-        for row in rows
-    }
-
-    for item in trainable_rejections:
-        topic_key = _normalize_topic(item.topic)
-        if not topic_key:
-            continue
-        candidates = topic_index.get(topic_key, [])
-        if not candidates:
-            continue
-        offset = topic_offsets.get(topic_key, 0)
-        candidate = candidates[offset % len(candidates)]
-        topic_offsets[topic_key] = offset + 1
-        prompt = str(candidate.prompt or candidate.task.metadata.get("red_prompt") or "").strip()
-        chosen = str(candidate.chosen_completion or "").strip()
-        rejected = str(item.rejected_completion or "").strip()
-        pair_key = (prompt, chosen, rejected)
-        if not prompt or not chosen or not rejected or chosen == rejected or pair_key in seen_pairs:
-            continue
-        rows.append(
-            {
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected,
-            }
-        )
-        seen_pairs.add(pair_key)
-        topic_pairs += 1
-        topic_matches[topic_key] = topic_matches.get(topic_key, 0) + 1
-        if len(rows) >= limit:
-            break
 
     return Dataset.from_list(rows), {
         "pairs": len(rows),
         "direct_pairs": direct_pairs,
-        "topic_pairs": topic_pairs,
+        "topic_pairs": 0,
         "already_correct_rejections": len(already_correct_rejections),
         "trainable_rejections": len(trainable_rejections),
-        "topic_matches": topic_matches,
+        "topic_matches": {},
+        "pairing_policy": "same_prompt_direct_only",
     }
 
 
@@ -313,6 +300,7 @@ def _hard_or_low_reward_episode_examples(
         episode
         for episode in episodes
         if episode.metadata.get("task_is_valid_for_socratic") is not False
+        and _is_valid_for_red_training(episode=episode)
         and float(episode.judge.normalized_reward) <= max_reward
     ]
     for episode in sorted(valid_episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
@@ -323,12 +311,15 @@ def _hard_or_low_reward_episode_examples(
                 topic=episode.topic,
                 prompt=str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary)),
                 chosen_completion=serialize_task_json(episode.task),
-                rejected_completion=None,
+                rejected_completion=str(episode.task.metadata.get("red_direct_rejected_completion") or "").strip() or None,
                 reward=episode.judge.normalized_reward,
                 task=episode.task,
                 metadata={
                     "episode_id": episode.episode_id,
                     "source": "low_reward_recent_episode",
+                    "red_dpo_rejection_reason": str(episode.task.metadata.get("red_dpo_rejection_reason") or ""),
+                    "red_dpo_pairing": episode.task.metadata.get("red_dpo_pairing"),
+                    "red_task_evaluation": dict(episode.task.metadata.get("red_task_evaluation") or {}),
                 },
             )
         )
@@ -357,6 +348,7 @@ class RedUpdater:
             example
             for example in hard_examples
             if float(example.reward) <= hard_reward_max
+            and _is_valid_for_red_training(example=example)
         ]
         if len(chosen_examples) < settings.min_hard_examples:
             fallback = _hard_or_low_reward_episode_examples(
