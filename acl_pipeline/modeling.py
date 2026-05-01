@@ -279,6 +279,7 @@ class RoleSession:
         *,
         generation: Optional[GenerationSettings] = None,
         response_prefixes: Optional[List[str]] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         effective = generation or self.generation
         prompts: List[str] = []
@@ -368,6 +369,7 @@ class ServerRoleSession:
         *,
         generation: Optional[GenerationSettings] = None,
         response_prefixes: Optional[List[str]] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         if response_prefixes:
             raise RuntimeError("response_prefixes are not supported for server-backed generation.")
@@ -378,6 +380,11 @@ class ServerRoleSession:
             text = ""
             last_err: Optional[Exception] = None
             max_tokens = max(1, int(effective.max_new_tokens))
+            request_extra_body: Dict[str, Any] = {
+                "chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}
+            }
+            if extra_body:
+                request_extra_body.update(dict(extra_body))
             for attempt in range(max(1, int(self.max_retries) + 1)):
                 try:
                     response = client.chat.completions.create(
@@ -386,7 +393,7 @@ class ServerRoleSession:
                         temperature=float(effective.temperature) if effective.do_sample else 0.0,
                         top_p=float(effective.top_p),
                         max_tokens=max_tokens,
-                        extra_body={"chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}},
+                        extra_body=request_extra_body,
                     )
                     text = str(response.choices[0].message.content or "").strip()
                     last_err = None
@@ -394,6 +401,18 @@ class ServerRoleSession:
                 except Exception as exc:  # noqa: BLE001
                     last_err = exc
                     message = str(exc).lower()
+                    if extra_body and ("guided" in message or "guided_json" in message or "json schema" in message):
+                        self.logger.warning(
+                            "server_generate_guided_json_fallback",
+                            role=self.role_name,
+                            model_name_or_path=self.model_name_or_path,
+                            error=str(exc),
+                        )
+                        extra_body = None
+                        request_extra_body = {
+                            "chat_template_kwargs": {"enable_thinking": bool(self.enable_thinking)}
+                        }
+                        continue
                     if "context length" in message and max_tokens > 64:
                         max_tokens = max(64, max_tokens // 2)
                         self.logger.warning(

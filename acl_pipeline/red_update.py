@@ -160,7 +160,14 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
             "blocking_syntax_error",
             "blocking_indentation_error",
             "blocking_nameerror",
+            "blocking_timeout",
             "unrelated_nameerror",
+            "changed_tests",
+            "changed_reference_solution",
+            "changed_statement",
+            "changed_target_function",
+            "changed_intended_bug",
+            "missing_buggy_solution",
         )
     )
 
@@ -197,6 +204,35 @@ def _chosen_example_has_direct_trainable_rejection(example: RedTrainingExample) 
     )
 
 
+def _red_reward_from_example(example: RedTrainingExample) -> float:
+    for source in (
+        dict(example.metadata or {}),
+        dict(getattr(example.task, "metadata", {}) or {}),
+    ):
+        try:
+            return float(source.get("red_reward"))
+        except Exception:
+            continue
+    return 0.0
+
+
+def _red_reward_from_episode(episode: EpisodeRecord) -> float:
+    for source in (
+        dict(episode.metadata or {}),
+        dict(episode.judge.metadata or {}),
+        dict(episode.task.metadata or {}),
+    ):
+        try:
+            return float(source.get("red_reward"))
+        except Exception:
+            continue
+    return 0.0
+
+
+def _passes_red_reward_gate(value: float, min_red_reward: float) -> bool:
+    return float(value) >= float(min_red_reward)
+
+
 def _build_dpo_dataset(
     chosen_examples: List[RedTrainingExample],
     rejected_examples: List[RedRejectedExample],
@@ -214,13 +250,6 @@ def _build_dpo_dataset(
             "trainable_rejections": 0,
             "topic_matches": {},
         }
-
-    topic_index: Dict[str, List[RedTrainingExample]] = {}
-    for example in sorted(chosen_examples, key=lambda entry: entry.reward):
-        topic_key = _normalize_topic(example.topic or example.task.topic)
-        if not topic_key:
-            continue
-        topic_index.setdefault(topic_key, []).append(example)
 
     direct_pairs = 0
     for example in sorted(chosen_examples, key=lambda entry: entry.reward):
@@ -253,52 +282,13 @@ def _build_dpo_dataset(
                 "topic_matches": {},
             }
 
-    already_correct_rejections = [item for item in rejected_examples if _rejected_example_is_already_correct(item)]
-    trainable_rejections = [item for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)]
-    topic_offsets: Dict[str, int] = {}
-    topic_matches: Dict[str, int] = {}
-    topic_pairs = 0
-    seen_pairs = {
-        (row["prompt"], row["chosen"], row["rejected"])
-        for row in rows
-    }
-
-    for item in trainable_rejections:
-        topic_key = _normalize_topic(item.topic)
-        if not topic_key:
-            continue
-        candidates = topic_index.get(topic_key, [])
-        if not candidates:
-            continue
-        offset = topic_offsets.get(topic_key, 0)
-        candidate = candidates[offset % len(candidates)]
-        topic_offsets[topic_key] = offset + 1
-        prompt = str(candidate.prompt or candidate.task.metadata.get("red_prompt") or "").strip()
-        chosen = str(candidate.chosen_completion or "").strip()
-        rejected = str(item.rejected_completion or "").strip()
-        pair_key = (prompt, chosen, rejected)
-        if not prompt or not chosen or not rejected or chosen == rejected or pair_key in seen_pairs:
-            continue
-        rows.append(
-            {
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected,
-            }
-        )
-        seen_pairs.add(pair_key)
-        topic_pairs += 1
-        topic_matches[topic_key] = topic_matches.get(topic_key, 0) + 1
-        if len(rows) >= limit:
-            break
-
     return Dataset.from_list(rows), {
         "pairs": len(rows),
         "direct_pairs": direct_pairs,
-        "topic_pairs": topic_pairs,
-        "already_correct_rejections": len(already_correct_rejections),
-        "trainable_rejections": len(trainable_rejections),
-        "topic_matches": topic_matches,
+        "topic_pairs": 0,
+        "already_correct_rejections": sum(1 for item in rejected_examples if _rejected_example_is_already_correct(item)),
+        "trainable_rejections": sum(1 for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)),
+        "topic_matches": {},
     }
 
 
@@ -307,6 +297,7 @@ def _hard_or_low_reward_episode_examples(
     *,
     limit: int,
     max_reward: float,
+    min_red_reward: float,
 ) -> List[RedTrainingExample]:
     rows: List[RedTrainingExample] = []
     valid_episodes = [
@@ -314,9 +305,11 @@ def _hard_or_low_reward_episode_examples(
         for episode in episodes
         if episode.metadata.get("task_is_valid_for_socratic") is not False
         and float(episode.judge.normalized_reward) <= max_reward
+        and _passes_red_reward_gate(_red_reward_from_episode(episode), min_red_reward)
     ]
     for episode in sorted(valid_episodes, key=lambda item: item.judge.normalized_reward)[:limit]:
         weakness_summary = str(episode.metadata.get("weakness_summary") or "general weakness probing")
+        red_reward = _red_reward_from_episode(episode)
         rows.append(
             RedTrainingExample(
                 example_id=f"low_reward_recent_{episode.episode_id}",
@@ -329,6 +322,9 @@ def _hard_or_low_reward_episode_examples(
                 metadata={
                     "episode_id": episode.episode_id,
                     "source": "low_reward_recent_episode",
+                    "red_task_quality": episode.task.metadata.get("red_task_quality") or episode.judge.metadata.get("task_quality"),
+                    "red_task_hardness": episode.task.metadata.get("red_task_hardness") or episode.judge.metadata.get("task_hardness"),
+                    "red_reward": red_reward,
                 },
             )
         )
@@ -353,16 +349,19 @@ class RedUpdater:
     ) -> RedUpdateResult:
         settings = self.config.red.update
         hard_reward_max = float(settings.hard_reward_max)
+        min_red_reward = float(settings.min_red_reward)
         chosen_examples = [
             example
             for example in hard_examples
             if float(example.reward) <= hard_reward_max
+            and _passes_red_reward_gate(_red_reward_from_example(example), min_red_reward)
         ]
         if len(chosen_examples) < settings.min_hard_examples:
             fallback = _hard_or_low_reward_episode_examples(
                 recent_episodes,
                 limit=settings.min_hard_examples - len(chosen_examples),
                 max_reward=hard_reward_max,
+                min_red_reward=min_red_reward,
             )
             existing_ids = {item.task.task_id for item in chosen_examples}
             for item in fallback:
@@ -378,6 +377,7 @@ class RedUpdater:
                 hard_examples=len(hard_examples),
                 eligible_chosen_examples=len(chosen_examples),
                 hard_reward_max=hard_reward_max,
+                min_red_reward=min_red_reward,
             )
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
@@ -542,6 +542,8 @@ class RedUpdater:
                     hard_examples=len(hard_examples),
                     chosen_examples=len(chosen_examples),
                     hard_reward_max=hard_reward_max,
+                    min_red_reward=min_red_reward,
+                    chosen_red_rewards=[_red_reward_from_example(example) for example in chosen_examples],
                     rejected_examples=len(rejected_examples),
                     red_dpo_pairs=dpo_pair_count,
                     red_dpo_stats=dpo_stats,

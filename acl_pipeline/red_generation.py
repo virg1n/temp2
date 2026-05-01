@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
 from .logging_utils import StructuredLogger
-from .prompts import build_red_messages
+from .prompts import build_red_buggy_messages, build_red_messages
 from .schemas import PythonTask, RedTaskSpec
 
 if TYPE_CHECKING:
@@ -69,6 +69,87 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
     return signature, None
 
 
+def _payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = dict(payload.get("metadata") or {})
+    if "failure_mode" not in metadata and payload.get("intended_bug"):
+        metadata["failure_mode"] = str(payload.get("intended_bug") or "")
+    return metadata
+
+
+def _required_spec_reasons(payload: Dict[str, Any], requested_topic: str) -> List[str]:
+    topic = str(payload.get("topic") or "").strip()
+    metadata = _payload_metadata(payload)
+    difficulty = str(metadata.get("difficulty") or "").strip().lower()
+    reference_solution = str(payload.get("reference_solution") or "").strip()
+    reasons: List[str] = []
+    if not topic:
+        reasons.append("missing topic")
+    elif topic != requested_topic:
+        reasons.append("wrong topic")
+    for key in ("target_function", "intended_bug", "expected_first_failure", "statement"):
+        if not str(payload.get(key) or "").strip():
+            reasons.append(f"missing {key}")
+    if not reference_solution:
+        reasons.append("missing reference_solution")
+    if not str(metadata.get("failure_mode") or "").strip():
+        reasons.append("missing metadata.failure_mode")
+    if difficulty not in {"medium", "hard"}:
+        reasons.append("invalid metadata.difficulty")
+    if reference_solution:
+        reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
+        if reference_parse_error:
+            reasons.append("reference_solution parse error")
+        if not reference_tests:
+            reasons.append("missing tests in reference_solution")
+    return list(dict.fromkeys(reasons))
+
+
+def _normalized_spec_payload(payload: Dict[str, Any], requested_topic: str, raw: str) -> Dict[str, Any]:
+    metadata = _payload_metadata(payload)
+    difficulty = str(metadata.get("difficulty") or "").strip().lower()
+    metadata["difficulty"] = difficulty
+    return {
+        "topic": str(payload.get("topic") or requested_topic).strip(),
+        "target_function": str(payload.get("target_function") or "").strip(),
+        "intended_bug": str(payload.get("intended_bug") or "").strip(),
+        "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
+        "statement": str(payload.get("statement") or "").strip(),
+        "reference_solution": str(payload.get("reference_solution") or "").strip(),
+        "metadata": metadata,
+        "raw_response": raw,
+    }
+
+
+def _same_text(left: Any, right: Any) -> bool:
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def _locked_spec_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    for key in ("topic", "target_function", "intended_bug", "expected_first_failure", "statement"):
+        if not _same_text(payload.get(key), locked_spec.get(key)):
+            reasons.append(f"changed {key}")
+
+    if not _same_text(payload.get("reference_solution"), locked_spec.get("reference_solution")):
+        reasons.append("changed reference_solution")
+
+    locked_metadata = dict(locked_spec.get("metadata") or {})
+    metadata = _payload_metadata(payload)
+    for key in ("failure_mode", "difficulty"):
+        if not _same_text(metadata.get(key), locked_metadata.get(key)):
+            reasons.append(f"changed metadata.{key}")
+
+    locked_tests, locked_parse_error = _shared_test_signature(str(locked_spec.get("reference_solution") or ""))
+    buggy_tests, buggy_parse_error = _shared_test_signature(str(payload.get("buggy_solution") or ""))
+    if locked_parse_error:
+        reasons.append("locked reference_solution parse error")
+    if buggy_parse_error:
+        reasons.append("buggy_solution parse error")
+    if locked_tests and buggy_tests and locked_tests != buggy_tests:
+        reasons.append("changed tests")
+    return list(dict.fromkeys(reasons))
+
+
 class RedTaskGenerator:
     def __init__(self, logger: StructuredLogger) -> None:
         self.logger = logger
@@ -81,6 +162,7 @@ class RedTaskGenerator:
         raw: str,
         *,
         requested_topic: str,
+        locked_spec: Optional[Dict[str, Any]] = None,
     ) -> tuple[Optional[PythonTask], List[str]]:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
@@ -97,29 +179,12 @@ class RedTaskGenerator:
         if isinstance(failing_asserts, str):
             failing_asserts = [failing_asserts]
         failing_asserts = [str(item).strip() for item in failing_asserts if str(item).strip()]
-        metadata = dict(payload.get("metadata") or {})
+        metadata = _payload_metadata(payload)
         difficulty = str(metadata.get("difficulty") or "").strip().lower()
-        reasons: List[str] = []
-        if not topic:
-            reasons.append("missing topic")
-        elif topic != requested_topic:
-            reasons.append("wrong topic")
-        if not target_function:
-            reasons.append("missing target_function")
-        if not intended_bug:
-            reasons.append("missing intended_bug")
-        if not expected_first_failure:
-            reasons.append("missing expected_first_failure")
-        if not statement:
-            reasons.append("missing statement")
-        if not reference_solution:
-            reasons.append("missing reference_solution")
+        metadata["difficulty"] = difficulty
+        reasons: List[str] = _required_spec_reasons(payload, requested_topic)
         if not solution:
             reasons.append("missing buggy_solution")
-        if not str(metadata.get("failure_mode") or "").strip():
-            reasons.append("missing metadata.failure_mode")
-        if difficulty not in {"medium", "hard"}:
-            reasons.append("invalid metadata.difficulty")
         if reference_solution and solution:
             reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
             buggy_tests, buggy_parse_error = _shared_test_signature(solution)
@@ -131,6 +196,8 @@ class RedTaskGenerator:
                 reasons.append("missing shared tests in buggy_solution")
             if reference_tests and buggy_tests and reference_tests != buggy_tests:
                 reasons.append("solutions do not share identical tests")
+        if locked_spec is not None:
+            reasons.extend(_locked_spec_reasons(payload, locked_spec))
         if reasons:
             return None, list(dict.fromkeys(reasons))
 
@@ -157,9 +224,33 @@ class RedTaskGenerator:
         task.metadata.setdefault("difficulty", difficulty)
         task.metadata.setdefault("observed_failure", "AssertionError")
         task.metadata["raw_response"] = raw
-        task.metadata["red_format"] = "dual_solution_json_v1"
+        task.metadata["red_format"] = "iterative_dual_solution_json_v2" if locked_spec is not None else "dual_solution_json_v1"
+        if locked_spec is not None:
+            task.metadata["red_locked_spec"] = {
+                key: value
+                for key, value in locked_spec.items()
+                if key in {"topic", "target_function", "intended_bug", "expected_first_failure", "statement", "reference_solution", "metadata"}
+            }
         self.logger.debug_dump("red_task", task=task)
         return task, []
+
+    def parse_spec_response(
+        self,
+        raw: str,
+        *,
+        requested_topic: str,
+    ) -> tuple[Optional[Dict[str, Any]], List[str]]:
+        payload = _extract_json(raw)
+        if not isinstance(payload, dict):
+            return None, ["non-json response"]
+        reasons = _required_spec_reasons(payload, requested_topic)
+        if str(payload.get("buggy_solution") or "").strip():
+            reasons.append("spec stage included buggy_solution")
+        if reasons:
+            return None, list(dict.fromkeys(reasons))
+        spec_payload = _normalized_spec_payload(payload, requested_topic, raw)
+        self.logger.debug_dump("red_spec", spec=spec_payload)
+        return spec_payload, []
 
     def generate_task(
         self,
@@ -169,6 +260,10 @@ class RedTaskGenerator:
         weakness_summary: Optional[str],
     ) -> Optional[PythonTask]:
         messages = build_red_messages(topic, weakness_summary)
-        raw = self.generate_raw_response(session, messages, topic=topic)
-        task, _ = self.parse_task_response(raw, requested_topic=topic)
+        raw_spec = self.generate_raw_response(session, messages, topic=topic)
+        spec_payload, reasons = self.parse_spec_response(raw_spec, requested_topic=topic)
+        if spec_payload is None or reasons:
+            return None
+        raw = self.generate_raw_response(session, build_red_buggy_messages(topic, spec_payload), topic=topic)
+        task, _ = self.parse_task_response(raw, requested_topic=topic, locked_spec=spec_payload)
         return task

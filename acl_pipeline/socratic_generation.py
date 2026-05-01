@@ -19,11 +19,21 @@ _DIRECT_FIX_PATTERNS = [
         r"\bthe fix is\b",
         r"\bthe bug is\b",
         r"\bfix (?:it|this) by\b",
+        r"\bcorrect approach is\b",
+        r"\bcurrent code uses\b.+\bshould use\b",
         r"\breplace\b.+\bwith\b",
         r"\bchange\b.+\bto\b",
         r"\buse\s+[^.\n]{0,80}\s+instead\b",
+        r"\buse\s+[`']?[^`'\n]{1,40}(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%| and | or )[^`'\n]{0,40}[`']?\s+instead of\s+[`']?[^`'\n]{1,80}[`']?",
+        r"\buse\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?\s+instead of\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
         r"\badd a missing\b",
         r"\brename\b.+\bto\b",
+        r"\bfinal code should\b",
+        r"\bmake\s+[A-Za-z_][A-Za-z0-9_]*\s+an instance variable\b",
+        r"\b(?:swap|switch)\s+(?:the\s+)?(?:operator|comparison)?\s*[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?\s+(?:to|for|with)\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
+        r"\b(?:change|replace)\s+(?:the\s+)?(?:operator|comparison)\s+(?:from\s+)?[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
+        r"\b(?:return|set|compute)\s+[`']?[^.`'\n]{1,100}(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%)[^.`'\n]{1,100}[`']?",
+        r"\b(?:return|set|compute|call)\s+[`']?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\([^)\n]{0,120}\)[`']?",
     )
 ]
 _CODE_LINE_PATTERNS = [
@@ -62,8 +72,8 @@ def sanitize_socratic_text(text: str) -> str:
         return _FALLBACK_HINT
     trimmed = "\n".join(lines[:4]).strip()
     words = trimmed.split()
-    if len(words) > 120:
-        trimmed = " ".join(words[:120]).strip()
+    if len(words) > 100:
+        trimmed = " ".join(words[:100]).strip()
     if socratic_contract_violation(trimmed):
         return _FALLBACK_HINT
     return trimmed

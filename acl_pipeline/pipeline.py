@@ -11,9 +11,14 @@ from .judge import JudgeService
 from .logging_utils import build_logger
 from .modeling import ModelPool, clear_cuda_memory, is_oom_error
 from .prompts import (
-    build_red_messages,
+    build_red_buggy_messages,
+    build_red_buggy_repair_message,
+    build_red_buggy_response_prefix,
+    build_red_buggy_training_prompt,
     build_red_repair_message,
-    build_red_response_prefix,
+    build_red_spec_messages,
+    build_red_spec_repair_message,
+    build_red_spec_response_prefix,
     build_red_training_prompt,
 )
 from .red_generation import RedTaskGenerator
@@ -146,7 +151,14 @@ class AdversarialCurriculumPipeline:
                 "blocking_syntax_error",
                 "blocking_indentation_error",
                 "blocking_nameerror",
+                "blocking_timeout",
                 "unrelated_nameerror",
+                "changed_tests",
+                "changed_reference_solution",
+                "changed_statement",
+                "changed_target_function",
+                "changed_intended_bug",
+                "missing_buggy_solution",
             )
         )
 
@@ -207,6 +219,16 @@ class AdversarialCurriculumPipeline:
         )
         return example
 
+    def _remember_direct_red_rejection(self, item: Dict[str, Any], rejected: Optional[RedRejectedExample]) -> None:
+        if rejected is None:
+            return
+        item.setdefault("red_direct_rejections", []).append(rejected.to_dict())
+        task = item.get("task")
+        if task is not None:
+            direct = list(task.metadata.get("red_direct_rejections") or [])
+            direct.append(rejected.to_dict())
+            task.metadata["red_direct_rejections"] = direct
+
     def _primary_trainable_validation_reason(self, reasons: List[str]) -> Optional[str]:
         for reason in reasons:
             if self._is_dual_solution_validation_rejection(reason):
@@ -262,7 +284,7 @@ class AdversarialCurriculumPipeline:
             [
                 f'The intended_bug ("{intended_bug}") is NOT present in your buggy_solution.',
                 "Modify buggy_solution so its behavior diverges from reference_solution on at least one test, in the way intended_bug describes.",
-                "Do NOT change the tests unless reference_solution itself fails them.",
+                "Do NOT change the tests, reference_solution, statement, or spec.",
             ]
         )
         return "\n".join(lines)
@@ -277,6 +299,14 @@ class AdversarialCurriculumPipeline:
         if task is not None and "buggy_too_correct" in normalized:
             audit = list(item.get("assert_audit") or task.metadata.get("assert_audit") or [])
             repair_context = self._format_assert_audit_repair_context(task, audit)
+        spec_payload = item.get("spec_payload")
+        if isinstance(spec_payload, dict):
+            return build_red_buggy_repair_message(
+                str(item["topic"]),
+                rejection_reasons,
+                spec_payload,
+                repair_context=repair_context,
+            )
         return build_red_repair_message(str(item["topic"]), rejection_reasons, repair_context=repair_context)
 
     def _candidate_rejection_reasons(
@@ -302,6 +332,20 @@ class AdversarialCurriculumPipeline:
         if execution_result is not None:
             if execution_result.status in {"syntax_error", "indentation_error"}:
                 reasons.append(f"blocking {execution_result.status}")
+            elif execution_result.status == "nameerror":
+                spec = self._task_spec_from_metadata(task)
+                signal = " ".join(
+                    str(part or "").lower()
+                    for part in (
+                        getattr(spec, "intended_bug", "") if spec is not None else "",
+                        getattr(spec, "expected_first_failure", "") if spec is not None else "",
+                        task.metadata.get("failure_mode"),
+                    )
+                )
+                if not any(marker in signal for marker in ("nameerror", "name error", "undefined", "not defined", "missing name")):
+                    reasons.append("blocking nameerror")
+            elif execution_result.status == "timeout":
+                reasons.append("blocking timeout")
             elif execution_result.status == "passed":
                 keep_probability = max(0.0, min(1.0, float(self.config.task_execution.passed_task_keep_probability)))
                 if self.rng.random() >= keep_probability:
@@ -324,6 +368,7 @@ class AdversarialCurriculumPipeline:
                 if reference_execution.status != "passed":
                     task.metadata["reference_invalid_ignored"] = True
                     task.metadata["observed_failure"] = reference_execution.error_message
+                    rejection_reasons.append("reference_solution_failed")
 
                 execution = execute_task(task, self.config.task_execution)
                 self._attach_execution(task, execution)
@@ -389,9 +434,14 @@ class AdversarialCurriculumPipeline:
         return {
             "topic": topic,
             "weakness_summary": weakness_summary,
-            "messages": build_red_messages(topic, weakness_summary),
-            "task_prompt": build_red_training_prompt(topic, weakness_summary),
+            "spec_messages": build_red_spec_messages(topic, weakness_summary),
+            "spec_prompt": build_red_training_prompt(topic, weakness_summary),
+            "messages": [],
+            "task_prompt": "",
+            "spec_payload": None,
+            "spec_raw_response": "",
             "task": None,
+            "red_direct_rejections": [],
             "last_rejection_reasons": [],
             "validation_reasons": [],
             "validation_execution": None,
@@ -405,28 +455,118 @@ class AdversarialCurriculumPipeline:
     ) -> List[Dict[str, Any]]:
         generated: List[Dict[str, Any]] = []
         max_attempts = int(self.config.task_execution.max_red_generation_attempts)
+
         for attempt in range(1, max_attempts + 1):
-            pending = [item for item in requests if item.get("task") is None]
+            pending_specs = [item for item in requests if item.get("spec_payload") is None]
+            if not pending_specs:
+                break
+            raw_batch = self._batched_red_generate(
+                red_session,
+                [item["spec_messages"] for item in pending_specs],
+                stage="task_spec",
+                response_prefixes=[build_red_spec_response_prefix(str(item["topic"])) for item in pending_specs],
+            )
+            for item, raw in zip(pending_specs, raw_batch):
+                topic = str(item["topic"])
+                weakness_summary = str(item["weakness_summary"])
+                spec_payload, parse_reasons = self.red_generator.parse_spec_response(raw, requested_topic=topic)
+                rejection_reasons = list(dict.fromkeys(reason for reason in parse_reasons if reason))
+                if spec_payload is not None and not rejection_reasons:
+                    if self.config.task_execution.enabled:
+                        reference_execution = execute_program(
+                            str(spec_payload.get("reference_solution") or ""),
+                            self.config.task_execution,
+                        )
+                        spec_payload["reference_execution"] = reference_execution.to_dict()
+                        if reference_execution.status != "passed":
+                            rejection_reasons = ["reference_solution_failed"]
+                            self._record_red_rejection(
+                                topic=topic,
+                                prompt=str(item["spec_prompt"]),
+                                rejected_completion=raw,
+                                rejection_reason=", ".join(rejection_reasons),
+                                metadata={
+                                    "stage": "task_spec_reference_validation",
+                                    "attempt": attempt,
+                                    "weakness_summary": weakness_summary,
+                                    "reference_execution": reference_execution.to_dict(),
+                                },
+                                iteration_index=iteration_index,
+                            )
+                            self.logger.warning(
+                                "red_task_spec_reference_repair_requested",
+                                topic=topic,
+                                attempt=attempt,
+                                rejection_reasons=rejection_reasons,
+                                reference_status=reference_execution.status,
+                            )
+                            item["spec_messages"].append({"role": "assistant", "content": raw})
+                            item["spec_messages"].append(build_red_spec_repair_message(topic, rejection_reasons))
+                            continue
+                    item["spec_payload"] = spec_payload
+                    item["spec_raw_response"] = raw
+                    item["messages"] = build_red_buggy_messages(topic, spec_payload)
+                    item["task_prompt"] = build_red_buggy_training_prompt(topic, spec_payload)
+                    self.logger.event(
+                        "red_task_spec_generated",
+                        iteration=iteration_index,
+                        topic=topic,
+                        attempt=attempt,
+                        weakness_summary=weakness_summary,
+                    )
+                    continue
+
+                item["last_rejection_reasons"] = rejection_reasons or ["non-json response"]
+                self._record_red_rejection(
+                    topic=topic,
+                    prompt=str(item["spec_prompt"]),
+                    rejected_completion=raw,
+                    rejection_reason=", ".join(item["last_rejection_reasons"]),
+                    metadata={
+                        "stage": "task_spec",
+                        "attempt": attempt,
+                        "weakness_summary": weakness_summary,
+                    },
+                    iteration_index=iteration_index,
+                )
+                self.logger.warning(
+                    "red_task_spec_repair_requested",
+                    topic=topic,
+                    attempt=attempt,
+                    rejection_reasons=item["last_rejection_reasons"],
+                )
+                item["spec_messages"].append({"role": "assistant", "content": raw})
+                item["spec_messages"].append(build_red_spec_repair_message(topic, item["last_rejection_reasons"]))
+
+        for attempt in range(1, max_attempts + 1):
+            pending = [item for item in requests if item.get("spec_payload") is not None and item.get("task") is None]
             if not pending:
                 break
             raw_batch = self._batched_red_generate(
                 red_session,
                 [item["messages"] for item in pending],
-                stage="task",
-                response_prefixes=[build_red_response_prefix(str(item["topic"])) for item in pending],
+                stage="task_buggy",
+                response_prefixes=[build_red_buggy_response_prefix(str(item["topic"])) for item in pending],
             )
             for item, raw in zip(pending, raw_batch):
                 topic = str(item["topic"])
                 weakness_summary = str(item["weakness_summary"])
                 task_prompt = str(item["task_prompt"])
 
-                task, parse_reasons = self.red_generator.parse_task_response(raw, requested_topic=topic)
+                task, parse_reasons = self.red_generator.parse_task_response(
+                    raw,
+                    requested_topic=topic,
+                    locked_spec=item.get("spec_payload"),
+                )
                 rejection_reasons = list(parse_reasons)
 
                 if task is not None:
                     item["messages"].append({"role": "assistant", "content": raw})
                     task.metadata["red_prompt"] = task_prompt
                     task.metadata["weakness_summary"] = weakness_summary
+                    task.metadata["red_spec_prompt"] = str(item.get("spec_prompt") or "")
+                    task.metadata["red_spec_raw_response"] = str(item.get("spec_raw_response") or "")
+                    task.metadata["red_direct_rejections"] = list(item.get("red_direct_rejections") or [])
 
                 rejection_reasons = list(dict.fromkeys(reason for reason in rejection_reasons if reason))
                 if task is not None and not rejection_reasons:
@@ -435,21 +575,22 @@ class AdversarialCurriculumPipeline:
                     continue
 
                 item["last_rejection_reasons"] = rejection_reasons or ["unspecified issue"]
-                self._record_red_rejection(
+                rejected = self._record_red_rejection(
                     topic=topic,
                     prompt=task_prompt,
                     rejected_completion=raw,
                     rejection_reason=", ".join(item["last_rejection_reasons"]),
                     metadata={
-                        "stage": "task",
+                        "stage": "task_buggy",
                         "attempt": attempt,
                         "weakness_summary": weakness_summary,
                         "execution_status": None,
                     },
                     iteration_index=iteration_index,
                 )
+                self._remember_direct_red_rejection(item, rejected)
                 self.logger.warning(
-                    "red_task_repair_requested",
+                    "red_task_buggy_repair_requested",
                     topic=topic,
                     attempt=attempt,
                     rejection_reasons=item["last_rejection_reasons"],
@@ -479,7 +620,7 @@ class AdversarialCurriculumPipeline:
                 primary_rejection = self._primary_trainable_validation_reason(rejection_reasons)
                 if primary_rejection:
                     spec = self._task_spec_from_metadata(task)
-                    self._record_red_rejection(
+                    rejected = self._record_red_rejection(
                         topic=str(item["topic"]),
                         prompt=str(item.get("task_prompt") or task.metadata.get("red_prompt") or ""),
                         rejected_completion=serialize_task_json(task),
@@ -504,6 +645,7 @@ class AdversarialCurriculumPipeline:
                         },
                         iteration_index=iteration_index,
                     )
+                    self._remember_direct_red_rejection(item, rejected)
                 invalid.append(item)
             else:
                 valid.append(item)
@@ -547,17 +689,21 @@ class AdversarialCurriculumPipeline:
                     red_session,
                     [item["messages"] for item in chunk],
                     stage="task_repair_final",
-                    response_prefixes=[build_red_response_prefix(str(item["topic"])) for item in chunk],
+                    response_prefixes=[build_red_buggy_response_prefix(str(item["topic"])) for item in chunk],
                 )
                 for item, raw in zip(chunk, raw_batch):
                     topic = str(item["topic"])
                     repaired_task, parse_reasons = self.red_generator.parse_task_response(
                         raw,
                         requested_topic=topic,
+                        locked_spec=item.get("spec_payload"),
                     )
                     if repaired_task is not None and not parse_reasons:
                         repaired_task.metadata["red_prompt"] = str(item["task_prompt"])
                         repaired_task.metadata["weakness_summary"] = str(item["weakness_summary"])
+                        repaired_task.metadata["red_spec_prompt"] = str(item.get("spec_prompt") or "")
+                        repaired_task.metadata["red_spec_raw_response"] = str(item.get("spec_raw_response") or "")
+                        repaired_task.metadata["red_direct_rejections"] = list(item.get("red_direct_rejections") or [])
                         repaired_task.metadata["pre_repair_validation_reasons"] = list(item.get("validation_reasons") or [])
                         repaired_task.metadata["pre_repair_execution"] = (
                             item["validation_execution"].to_dict()
@@ -581,7 +727,7 @@ class AdversarialCurriculumPipeline:
                             continue
 
                         spec = self._task_spec_from_metadata(repaired_task)
-                        self._record_red_rejection(
+                        rejected = self._record_red_rejection(
                             topic=topic,
                             prompt=str(item["task_prompt"]),
                             rejected_completion=raw,
@@ -606,6 +752,7 @@ class AdversarialCurriculumPipeline:
                             },
                             iteration_index=iteration_index,
                         )
+                        self._remember_direct_red_rejection(item, rejected)
                         self.logger.warning(
                             "red_task_repair_retry_requested",
                             iteration=iteration_index,
@@ -619,7 +766,7 @@ class AdversarialCurriculumPipeline:
 
                     parse_reasons = list(dict.fromkeys(reason for reason in parse_reasons if reason))
                     item["last_rejection_reasons"] = parse_reasons or ["non-json response"]
-                    self._record_red_rejection(
+                    rejected = self._record_red_rejection(
                         topic=topic,
                         prompt=str(item["task_prompt"]),
                         rejected_completion=raw,
@@ -631,6 +778,7 @@ class AdversarialCurriculumPipeline:
                         },
                         iteration_index=iteration_index,
                     )
+                    self._remember_direct_red_rejection(item, rejected)
                     self.logger.warning(
                         "red_task_repair_retry_requested",
                         iteration=iteration_index,
@@ -652,6 +800,70 @@ class AdversarialCurriculumPipeline:
 
         return accepted
 
+    def _score_and_filter_red_tasks(self, requests: List[Dict[str, Any]], iteration_index: int) -> List[Dict[str, Any]]:
+        if not requests:
+            return []
+        tasks = [item["task"] for item in requests if item.get("task") is not None]
+        assessments = self.judge.evaluate_red_tasks(tasks)
+        by_task_id = {
+            task.task_id: assessment
+            for task, assessment in zip(tasks, assessments)
+        }
+        accepted: List[Dict[str, Any]] = []
+        rejected_count = 0
+        for item in requests:
+            task = item.get("task")
+            if task is None:
+                continue
+            assessment = dict(by_task_id.get(task.task_id) or task.metadata.get("red_judge") or {})
+            item["red_judge"] = assessment
+            task.metadata["red_judge"] = assessment
+            task.metadata["red_task_quality"] = float(assessment.get("task_quality", 5.0))
+            task.metadata["red_task_hardness"] = float(assessment.get("task_hardness", 5.0))
+            task.metadata["red_reward"] = float(assessment.get("red_reward", 0.0))
+            if bool(assessment.get("task_is_valid_for_socratic", True)):
+                accepted.append(item)
+                continue
+            rejected_count += 1
+            spec = self._task_spec_from_metadata(task)
+            rejection_reason = str(assessment.get("red_rejection_reason") or "judge_bad_task")
+            rejected = self._record_red_rejection(
+                topic=task.topic,
+                prompt=str(task.metadata.get("red_prompt") or item.get("task_prompt") or ""),
+                rejected_completion=serialize_task_json(task),
+                rejection_reason=rejection_reason,
+                spec=spec,
+                task_quality=float(assessment.get("task_quality") or 0.0),
+                metadata={
+                    "stage": "red_task_judge",
+                    "iteration": iteration_index,
+                    "weakness_summary": item.get("weakness_summary"),
+                    "red_judge": assessment,
+                    "observed_failure": task.observed_failure(),
+                },
+                iteration_index=iteration_index,
+            )
+            self._remember_direct_red_rejection(item, rejected)
+            self.logger.warning(
+                "red_task_rejected_by_task_judge",
+                iteration=iteration_index,
+                topic=task.topic,
+                task_quality=assessment.get("task_quality"),
+                task_hardness=assessment.get("task_hardness"),
+                rejection_reason=rejection_reason,
+            )
+        self.logger.event(
+            "red_task_judge_complete",
+            iteration=iteration_index,
+            candidate_count=len(requests),
+            accepted_count=len(accepted),
+            rejected_count=rejected_count,
+            task_quality=[item.get("red_judge", {}).get("task_quality") for item in requests],
+            task_hardness=[item.get("red_judge", {}).get("task_hardness") for item in requests],
+            red_reward=[item.get("red_judge", {}).get("red_reward") for item in requests],
+        )
+        return accepted
+
     def _build_hard_example(self, episode: EpisodeRecord, weakness_summary: str) -> RedTrainingExample:
         prompt = str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary))
         return RedTrainingExample(
@@ -668,6 +880,9 @@ class AdversarialCurriculumPipeline:
                 "socratic_score": episode.judge.score,
                 "weakness_summary": weakness_summary,
                 "observed_failure": episode.task.observed_failure(),
+                "red_task_quality": episode.task.metadata.get("red_task_quality"),
+                "red_task_hardness": episode.task.metadata.get("red_task_hardness"),
+                "red_reward": episode.task.metadata.get("red_reward"),
             },
         )
 
@@ -677,9 +892,10 @@ class AdversarialCurriculumPipeline:
         episode: EpisodeRecord,
         iteration_index: int,
     ) -> Optional[RedRejectedExample]:
-        topic_key = self._normalize_topic(episode.topic)
-        for rejected in self._red_rejections_by_iteration.get(iteration_index, []):
-            if self._normalize_topic(rejected.topic) != topic_key:
+        for payload in episode.task.metadata.get("red_direct_rejections") or []:
+            try:
+                rejected = RedRejectedExample(**payload)
+            except Exception:
                 continue
             if self._is_trainable_red_dpo_rejection(rejected.rejection_reason):
                 return rejected
@@ -711,7 +927,7 @@ class AdversarialCurriculumPipeline:
                 "red_dpo_rejection_id": rejected.example_id,
                 "red_dpo_rejection_reason": rejected.rejection_reason,
                 "red_dpo_rejection_stage": dict(rejected.metadata or {}).get("stage"),
-                "red_dpo_pairing": "same_iteration_topic_trainable_rejection",
+                "red_dpo_pairing": "same_task_spec_iterative_rejection",
             }
         )
 
@@ -725,10 +941,12 @@ class AdversarialCurriculumPipeline:
             return
         bottom_fraction = float(self.config.red.update.mining_bottom_fraction)
         hard_reward_max = float(self.config.red.update.hard_reward_max)
+        min_red_reward = float(self.config.red.update.min_red_reward)
         eligible_records = [
             episode
             for episode in valid_records
             if float(episode.judge.normalized_reward) <= hard_reward_max
+            and self._episode_red_reward(episode) >= min_red_reward
         ]
         keep_count = max(1, math.ceil(len(valid_records) * bottom_fraction))
         selected = sorted(eligible_records, key=lambda episode: episode.judge.normalized_reward)[:keep_count]
@@ -740,8 +958,10 @@ class AdversarialCurriculumPipeline:
             iteration_episode_ids=[episode.episode_id for episode in iteration_records],
             valid_episode_ids=[episode.episode_id for episode in valid_records],
             eligible_episode_ids=[episode.episode_id for episode in eligible_records],
+            eligible_red_rewards=[self._episode_red_reward(episode) for episode in eligible_records],
             mining_bottom_fraction=bottom_fraction,
             hard_reward_max=hard_reward_max,
+            min_red_reward=min_red_reward,
         )
         for episode in selected:
             weakness_summary = str(episode.metadata.get("weakness_summary") or "")
@@ -759,6 +979,8 @@ class AdversarialCurriculumPipeline:
                 reward=episode.judge.normalized_reward,
                 mining_bottom_fraction=bottom_fraction,
                 hard_reward_max=hard_reward_max,
+                min_red_reward=min_red_reward,
+                red_reward=self._episode_red_reward(episode),
                 red_dpo_rejection_id=example.metadata.get("red_dpo_rejection_id"),
                 red_dpo_pairing=example.metadata.get("red_dpo_pairing"),
             )
@@ -855,6 +1077,18 @@ class AdversarialCurriculumPipeline:
             )
         return added
 
+    def _episode_red_reward(self, episode: EpisodeRecord) -> float:
+        for source in (
+            episode.metadata,
+            episode.judge.metadata,
+            episode.task.metadata,
+        ):
+            try:
+                return float(dict(source or {}).get("red_reward"))
+            except Exception:
+                continue
+        return 0.0
+
     def _log_episode_debug(self, episode: EpisodeRecord, weakness_summary: str) -> None:
         self.logger.debug_dump(
             "episode_debug",
@@ -870,6 +1104,8 @@ class AdversarialCurriculumPipeline:
             judge_adjusted_score=episode.judge.metadata.get("adjusted_score"),
             judge_criteria=episode.judge.criteria_scores,
             judge_task_quality=episode.judge.metadata.get("task_quality"),
+            judge_task_hardness=episode.judge.metadata.get("task_hardness"),
+            red_reward=episode.judge.metadata.get("red_reward"),
             judge_task_is_valid=episode.judge.metadata.get("task_is_valid_for_socratic"),
             judge_task_rejection_reason=episode.judge.metadata.get("red_rejection_reason"),
             judge_hint_is_valid=episode.judge.metadata.get("hint_is_valid_for_socratic"),
@@ -965,6 +1201,18 @@ class AdversarialCurriculumPipeline:
                 hints,
                 apply_batch_spread=True,
             )
+        for item, judge_output in zip(pending_batch, judge_outputs):
+            red_judge = dict(item.get("red_judge") or item["task"].metadata.get("red_judge") or {})
+            if not red_judge:
+                continue
+            judge_output.metadata["task_quality"] = float(red_judge.get("task_quality", judge_output.metadata.get("task_quality", 5.0)))
+            judge_output.metadata["task_hardness"] = float(red_judge.get("task_hardness", 5.0))
+            judge_output.metadata["red_reward"] = float(red_judge.get("red_reward", 0.0))
+            judge_output.metadata["task_is_valid_for_socratic"] = bool(red_judge.get("task_is_valid_for_socratic", True))
+            if red_judge.get("red_rejection_reason"):
+                judge_output.metadata["red_rejection_reason"] = str(red_judge.get("red_rejection_reason"))
+            elif bool(red_judge.get("task_is_valid_for_socratic", True)):
+                judge_output.metadata["red_rejection_reason"] = ""
         self.logger.event(
             "judge_batch_complete",
             candidate_count=len(pending_batch),
@@ -975,6 +1223,8 @@ class AdversarialCurriculumPipeline:
             adjusted_scores=[output.metadata.get("adjusted_score") for output in judge_outputs],
             adjusted_rewards=[output.normalized_reward for output in judge_outputs],
             task_quality=[output.metadata.get("task_quality") for output in judge_outputs],
+            task_hardness=[output.metadata.get("task_hardness") for output in judge_outputs],
+            red_reward=[output.metadata.get("red_reward") for output in judge_outputs],
             task_is_valid_for_socratic=[output.metadata.get("task_is_valid_for_socratic") for output in judge_outputs],
             hint_is_valid_for_socratic=[output.metadata.get("hint_is_valid_for_socratic") for output in judge_outputs],
             local_tiebreak=[output.metadata.get("local_tiebreak") for output in judge_outputs],
@@ -1043,6 +1293,9 @@ class AdversarialCurriculumPipeline:
                     "iteration": iteration_index,
                     "task_is_valid_for_socratic": task_is_valid,
                     "hint_is_valid_for_socratic": hint_is_valid,
+                    "red_task_quality": judge_output.metadata.get("task_quality"),
+                    "red_task_hardness": judge_output.metadata.get("task_hardness"),
+                    "red_reward": judge_output.metadata.get("red_reward"),
                     "socratic_training_method": self._socratic_training_method(),
                     "socratic_candidate_count": len(item.get("hint_candidates") or [item["hint"]]),
                     "socratic_candidate_scores": [
@@ -1145,11 +1398,12 @@ class AdversarialCurriculumPipeline:
         finally:
             red_session.unload()
 
-        final_requests = valid_requests + repaired_requests
+        final_requests = self._score_and_filter_red_tasks(valid_requests + repaired_requests, iteration_index)
         result_items = [
             {
                 "task": item["task"],
                 "weakness_summary": item["weakness_summary"],
+                "red_judge": item.get("red_judge"),
             }
             for item in final_requests
             if item.get("task") is not None

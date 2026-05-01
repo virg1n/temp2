@@ -9,7 +9,13 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 
 from .logging_utils import StructuredLogger
 from .modeling import ModelPool
-from .prompts import build_judge_batch_messages, build_socratic_messages
+from .prompts import (
+    build_judge_batch_messages,
+    build_judge_guided_json_schema,
+    build_red_task_judge_guided_json_schema,
+    build_red_task_judge_messages,
+    build_socratic_messages,
+)
 from .schemas import JudgeOutput, PythonTask, SocraticHint
 from .text_quality import detect_corrupted_hint_text
 
@@ -154,11 +160,21 @@ _DIRECT_FIX_PATTERNS = [
         r"\bthe fix is\b",
         r"\bthe bug is\b",
         r"\bfix (?:it|this) by\b",
+        r"\bcorrect approach is\b",
+        r"\bcurrent code uses\b.+\bshould use\b",
         r"\breplace\b.+\bwith\b",
         r"\bchange\b.+\bto\b",
         r"\buse\s+[^.\n]{0,80}\s+instead\b",
+        r"\buse\s+[`']?[^`'\n]{1,40}(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%| and | or )[^`'\n]{0,40}[`']?\s+instead of\s+[`']?[^`'\n]{1,80}[`']?",
+        r"\buse\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?\s+instead of\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
         r"\badd a missing\b",
         r"\brename\b.+\bto\b",
+        r"\bfinal code should\b",
+        r"\bmake\s+[A-Za-z_][A-Za-z0-9_]*\s+an instance variable\b",
+        r"\b(?:swap|switch)\s+(?:the\s+)?(?:operator|comparison)?\s*[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?\s+(?:to|for|with)\s+[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
+        r"\b(?:change|replace)\s+(?:the\s+)?(?:operator|comparison)\s+(?:from\s+)?[`']?(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%|and|or)[`']?",
+        r"\b(?:return|set|compute)\s+[`']?[^.`'\n]{1,100}(?:==|!=|<=|>=|<|>|//|/|\+|-|\*|%)[^.`'\n]{1,100}[`']?",
+        r"\b(?:return|set|compute|call)\s+[`']?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\([^)\n]{0,120}\)[`']?",
         r"\b(?:it|this|that|the (?:answer|result|output|value|code|line|function|return value|expected))\s+should be\b",
         r"\b(?:only|just|always|never|every|all|any)\s+[^.\n]{0,80}\s+should\s+(?:be|return|raise|equal|produce|yield|contain|include|match)\b",
         r"\bshould\s+(?:return|raise|equal|produce|yield|contain|include|match)\b",
@@ -433,6 +449,26 @@ def _build_row(prompt_text: str, completion: str, task: Optional[PythonTask] = N
             "metadata": dict(spec.get("metadata") or {}),
         }
     return row
+
+
+def _build_red_task_row(task: PythonTask) -> Dict[str, Any]:
+    spec = dict(task.metadata.get("red_spec") or {})
+    return {
+        "task_id": task.task_id,
+        "topic": task.topic,
+        "statement": task.statement,
+        "code": task.combined_program()[:6000],
+        "reference_solution": str(task.reference_solution or task.metadata.get("reference_solution") or "")[:6000],
+        "observed_failure": task.observed_failure(),
+        "execution_status": str(task.metadata.get("execution_status") or _infer_execution_status(task.observed_failure())),
+        "red_spec": {
+            "topic": spec.get("topic", task.topic),
+            "target_function": spec.get("target_function", ""),
+            "intended_bug": spec.get("intended_bug", ""),
+            "expected_first_failure": spec.get("expected_first_failure", ""),
+            "metadata": dict(spec.get("metadata") or {}),
+        },
+    }
 
 
 def _hint_quality_features(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -774,6 +810,168 @@ class JudgeService:
             adjusted.append(max(0.0, spread_score))
         return adjusted
 
+    def _generate_json_array(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        expected_count: int,
+        guided_schema: Optional[Dict[str, Any]],
+        event_prefix: str,
+    ) -> tuple[List[Any], str, str]:
+        session = self.model_pool.get_judge()
+        max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
+        raw = ""
+        parsed_items: List[Any] = []
+        last_parsed_type = "None"
+        extra_body = {"guided_json": guided_schema} if guided_schema else None
+        for attempt in range(1, max_attempts + 1):
+            raw = session.generate([messages], extra_body=extra_body)[0]
+            parsed = _extract_json(raw)
+            last_parsed_type = type(parsed).__name__ if parsed is not None else "None"
+            parsed_items = _judge_items_from_parsed(parsed, expected_count=expected_count)
+            if len(parsed_items) == expected_count:
+                break
+            self.logger.warning(
+                f"{event_prefix}_malformed_response_retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                expected_items=expected_count,
+                parsed_items=len(parsed_items),
+                parsed_type=last_parsed_type,
+                raw_chars=len(raw),
+                raw_preview=str(raw or "")[:500],
+            )
+        return parsed_items, raw, last_parsed_type
+
+    def _judge_hint_rows_with_fallback(self, judge_rows: List[Dict[str, Any]]) -> tuple[List[Any], List[str]]:
+        if not judge_rows:
+            return [], []
+        examples = getattr(self.model_pool.config.judge, "examples", [])
+        messages = build_judge_batch_messages(judge_rows, self._weights(), examples=examples)
+        parsed_items, raw, last_parsed_type = self._generate_json_array(
+            messages,
+            expected_count=len(judge_rows),
+            guided_schema=build_judge_guided_json_schema(len(judge_rows)),
+            event_prefix="judge",
+        )
+        if len(parsed_items) == len(judge_rows):
+            return parsed_items, [raw for _ in judge_rows]
+
+        self.logger.error(
+            "judge_malformed_response_fallback_per_item",
+            expected_items=len(judge_rows),
+            parsed_items=len(parsed_items),
+            parsed_type=last_parsed_type,
+            raw_chars=len(raw),
+            raw_preview=str(raw or "")[:500],
+        )
+
+        fallback_items: List[Any] = []
+        fallback_raws: List[str] = []
+        for index, row in enumerate(judge_rows):
+            single_messages = build_judge_batch_messages([row], self._weights(), examples=examples)
+            single_items, single_raw, single_type = self._generate_json_array(
+                single_messages,
+                expected_count=1,
+                guided_schema=build_judge_guided_json_schema(1),
+                event_prefix="judge_single",
+            )
+            if len(single_items) == 1:
+                fallback_items.append(single_items[0])
+            else:
+                self.logger.error(
+                    "judge_single_malformed_response_defaulted",
+                    index=index,
+                    parsed_items=len(single_items),
+                    parsed_type=single_type,
+                    raw_chars=len(single_raw),
+                    raw_preview=str(single_raw or "")[:500],
+                )
+                fallback_items.append({})
+            fallback_raws.append(single_raw)
+        return fallback_items, fallback_raws
+
+    def _judge_red_task_rows_with_fallback(self, task_rows: List[Dict[str, Any]]) -> tuple[List[Any], List[str]]:
+        if not task_rows:
+            return [], []
+        examples = getattr(self.model_pool.config.judge, "red_examples", [])
+        messages = build_red_task_judge_messages(task_rows, examples=examples)
+        parsed_items, raw, last_parsed_type = self._generate_json_array(
+            messages,
+            expected_count=len(task_rows),
+            guided_schema=build_red_task_judge_guided_json_schema(len(task_rows)),
+            event_prefix="red_task_judge",
+        )
+        if len(parsed_items) == len(task_rows):
+            return parsed_items, [raw for _ in task_rows]
+
+        self.logger.error(
+            "red_task_judge_malformed_response_fallback_per_item",
+            expected_items=len(task_rows),
+            parsed_items=len(parsed_items),
+            parsed_type=last_parsed_type,
+            raw_chars=len(raw),
+            raw_preview=str(raw or "")[:500],
+        )
+
+        fallback_items: List[Any] = []
+        fallback_raws: List[str] = []
+        for index, row in enumerate(task_rows):
+            single_messages = build_red_task_judge_messages([row], examples=examples)
+            single_items, single_raw, single_type = self._generate_json_array(
+                single_messages,
+                expected_count=1,
+                guided_schema=build_red_task_judge_guided_json_schema(1),
+                event_prefix="red_task_judge_single",
+            )
+            if len(single_items) == 1:
+                fallback_items.append(single_items[0])
+            else:
+                self.logger.error(
+                    "red_task_judge_single_malformed_response_defaulted",
+                    index=index,
+                    parsed_items=len(single_items),
+                    parsed_type=single_type,
+                    raw_chars=len(single_raw),
+                    raw_preview=str(single_raw or "")[:500],
+                )
+                fallback_items.append({})
+            fallback_raws.append(single_raw)
+        return fallback_items, fallback_raws
+
+    def _coerce_red_task_assessment(self, item: Any, raw_response: str) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return {
+                "task_quality": 5.0,
+                "task_hardness": 5.0,
+                "red_reward": 0.25,
+                "task_is_valid_for_socratic": True,
+                "red_rejection_reason": "",
+                "raw_response": raw_response,
+            }
+        try:
+            task_quality = max(0.0, min(10.0, float(item.get("task_quality", 5.0))))
+        except Exception:
+            task_quality = 5.0
+        try:
+            task_hardness = max(0.0, min(10.0, float(item.get("task_hardness", 5.0))))
+        except Exception:
+            task_hardness = 5.0
+        explicit_valid = item.get("task_is_valid_for_socratic")
+        task_is_valid = bool(explicit_valid) if explicit_valid is not None else task_quality > float(self.model_pool.config.judge.bad_task_threshold)
+        red_rejection_reason = str(item.get("red_rejection_reason") or "").strip()
+        if not task_is_valid and not red_rejection_reason:
+            red_rejection_reason = "judge_bad_task"
+        red_reward = (task_quality / 10.0) * (task_hardness / 10.0) if task_is_valid else 0.0
+        return {
+            "task_quality": task_quality,
+            "task_hardness": task_hardness,
+            "red_reward": red_reward,
+            "task_is_valid_for_socratic": task_is_valid,
+            "red_rejection_reason": red_rejection_reason,
+            "raw_response": raw_response,
+        }
+
     def score_pair_details(
         self,
         prompt_texts: List[str],
@@ -781,6 +979,8 @@ class JudgeService:
         *,
         apply_batch_spread: bool,
         tasks: Optional[List[Optional[PythonTask]]] = None,
+        candidate_group_ids: Optional[List[Optional[str]]] = None,
+        candidate_indexes: Optional[List[Optional[int]]] = None,
     ) -> List[Dict[str, Any]]:
         if not prompt_texts:
             return []
@@ -792,6 +992,13 @@ class JudgeService:
             _build_row(prompt, completion, task)
             for prompt, completion, task in zip(prompt_texts, completions, task_items)
         ]
+        group_ids = list(candidate_group_ids or [])
+        indexes = list(candidate_indexes or [])
+        for index, row in enumerate(rows):
+            if index < len(group_ids) and group_ids[index] is not None:
+                row["candidate_group_id"] = str(group_ids[index])
+            if index < len(indexes) and indexes[index] is not None:
+                row["candidate_index"] = int(indexes[index])
         corruption_flags = [detect_corrupted_hint_text(text) for text in completions]
         quality_features = [_hint_quality_features(row) for row in rows]
         hard_gates = [
@@ -809,52 +1016,10 @@ class JudgeService:
         raw_responses: List[str] = ["" for _ in rows]
         if judge_indexes:
             judge_rows = [rows[index] for index in judge_indexes]
-            session = self.model_pool.get_judge()
-            messages = build_judge_batch_messages(
-                judge_rows,
-                self._weights(),
-                examples=getattr(self.model_pool.config.judge, "examples", []),
-            )
-            max_attempts = max(2, int(getattr(self.model_pool.config.judge, "vllm_max_retries", 2)) + 1)
-            raw = ""
-            parsed_items: List[Any] = []
-            last_parsed_type = "None"
-            for attempt in range(1, max_attempts + 1):
-                raw = session.generate([messages])[0]
-                parsed = _extract_json(raw)
-                last_parsed_type = type(parsed).__name__ if parsed is not None else "None"
-                parsed_items = _judge_items_from_parsed(parsed, expected_count=len(judge_rows))
-                if len(parsed_items) == len(judge_rows):
-                    break
-                self.logger.warning(
-                    "judge_malformed_response_retry",
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    expected_items=len(judge_rows),
-                    parsed_items=len(parsed_items),
-                    parsed_type=last_parsed_type,
-                    raw_chars=len(raw),
-                    raw_preview=str(raw or "")[:500],
-                )
-
-            if len(parsed_items) != len(judge_rows):
-                self.logger.error(
-                    "judge_malformed_response_error",
-                    expected_items=len(judge_rows),
-                    parsed_items=len(parsed_items),
-                    parsed_type=last_parsed_type,
-                    raw_chars=len(raw),
-                    raw_preview=str(raw or "")[:500],
-                )
-                raise RuntimeError(
-                    "Judge returned malformed or truncated JSON after "
-                    f"{max_attempts} attempt(s): expected {len(judge_rows)} item(s), "
-                    f"parsed {len(parsed_items)}. Increase judge.generation.max_new_tokens "
-                    "or reduce judge.episode_batch_size / socratic.dpo.num_hint_candidates."
-                )
-            for index, item in zip(judge_indexes, parsed_items):
+            parsed_items, parsed_raws = self._judge_hint_rows_with_fallback(judge_rows)
+            for index, item, raw_response in zip(judge_indexes, parsed_items, parsed_raws):
                 raw_items[index] = item
-                raw_responses[index] = raw
+                raw_responses[index] = raw_response
 
         criteria_list: List[Dict[str, float]] = []
         for item, gate in zip(raw_items, hard_gates):
@@ -1017,13 +1182,17 @@ class JudgeService:
 
         flat_tasks: List[PythonTask] = []
         flat_hints: List[SocraticHint] = []
+        flat_group_ids: List[str] = []
+        flat_candidate_indexes: List[int] = []
         group_sizes: List[int] = []
-        for task, hints in zip(tasks, hint_groups):
+        for group_index, (task, hints) in enumerate(zip(tasks, hint_groups)):
             usable_hints = list(hints)
             group_sizes.append(len(usable_hints))
-            for hint in usable_hints:
+            for candidate_index, hint in enumerate(usable_hints):
                 flat_tasks.append(task)
                 flat_hints.append(hint)
+                flat_group_ids.append(task.task_id or f"group_{group_index}")
+                flat_candidate_indexes.append(int(hint.metadata.get("candidate_index", candidate_index)))
 
         if not flat_hints:
             return [[] for _ in tasks]
@@ -1035,6 +1204,8 @@ class JudgeService:
             hint_texts,
             apply_batch_spread=False,
             tasks=flat_tasks,
+            candidate_group_ids=flat_group_ids,
+            candidate_indexes=flat_candidate_indexes,
         )
 
         ranked_groups: List[List[Dict[str, Any]]] = []
@@ -1080,6 +1251,22 @@ class JudgeService:
     def evaluate(self, task: PythonTask, hint_text: str) -> JudgeOutput:
         hint = SocraticHint(task_id=task.task_id, text=hint_text, raw_text=hint_text)
         return self.evaluate_batch([task], [hint], apply_batch_spread=False)[0]
+
+    def evaluate_red_tasks(self, tasks: List[PythonTask]) -> List[Dict[str, Any]]:
+        if not tasks:
+            return []
+        batch_size = max(1, int(getattr(self.model_pool.config.judge, "red_task_batch_size", 4)))
+        outputs: List[Dict[str, Any]] = []
+        for start in range(0, len(tasks), batch_size):
+            chunk = tasks[start : start + batch_size]
+            rows = [_build_red_task_row(task) for task in chunk]
+            raw_items, raw_responses = self._judge_red_task_rows_with_fallback(rows)
+            for task, item, raw_response in zip(chunk, raw_items, raw_responses):
+                assessment = self._coerce_red_task_assessment(item, raw_response)
+                task.metadata["red_judge"] = dict(assessment)
+                self.logger.debug_dump("red_task_judge_eval", task=task, red_judge=assessment)
+                outputs.append(assessment)
+        return outputs
 
     def evaluate_batch(
         self,

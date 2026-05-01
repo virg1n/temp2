@@ -69,6 +69,19 @@ class JudgeExample:
 
 
 @dataclass
+class RedTaskJudgeExample:
+    topic: str
+    statement: str
+    code: str
+    observed_failure: str
+    red_spec: Dict[str, Any]
+    expected_task_quality: float
+    expected_task_hardness: float
+    expected_task_is_valid_for_socratic: bool
+    expected_red_rejection_reason: Optional[str] = None
+
+
+@dataclass
 class LoRASettings:
     enabled: bool = True
     r: int = 64
@@ -145,6 +158,7 @@ class RedUpdateSettings:
     max_dpo_pairs: int = 64
     mining_bottom_fraction: float = 0.25
     hard_reward_max: float = 0.85
+    min_red_reward: float = 0.50
     learning_rate: float = 5e-5
     epochs: int = 1
     per_device_batch_size: int = 1
@@ -194,6 +208,8 @@ class JudgeConfig(RoleConfig):
     bad_task_threshold: float = 3.0
     normalize_across_batches: int = 8
     examples: List[JudgeExample] = field(default_factory=list)
+    red_task_batch_size: int = 4
+    red_examples: List[RedTaskJudgeExample] = field(default_factory=list)
 
 
 @dataclass
@@ -337,6 +353,7 @@ def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
         max_dpo_pairs=int(payload.get("max_dpo_pairs", 64)),
         mining_bottom_fraction=float(payload.get("mining_bottom_fraction", 0.25)),
         hard_reward_max=float(payload.get("hard_reward_max", 0.85)),
+        min_red_reward=float(payload.get("min_red_reward", 0.50)),
         learning_rate=float(payload.get("learning_rate", 5e-5)),
         epochs=int(payload.get("epochs", 1)),
         per_device_batch_size=int(payload.get("per_device_batch_size", 1)),
@@ -372,6 +389,30 @@ def _judge_examples(payload: Optional[List[Dict[str, Any]]]) -> List[JudgeExampl
                 expected_task_is_valid_for_socratic=bool(row.get("expected_task_is_valid_for_socratic", True)),
                 expected_hint_is_valid_for_socratic=bool(row.get("expected_hint_is_valid_for_socratic", True)),
                 explanation=str(row.get("explanation") or ""),
+            )
+        )
+    return examples
+
+
+def _red_task_judge_examples(payload: Optional[List[Dict[str, Any]]]) -> List[RedTaskJudgeExample]:
+    examples: List[RedTaskJudgeExample] = []
+    for item in payload or []:
+        row = dict(item or {})
+        examples.append(
+            RedTaskJudgeExample(
+                topic=str(row.get("topic") or ""),
+                statement=str(row.get("statement") or ""),
+                code=str(row.get("code") or ""),
+                observed_failure=str(row.get("observed_failure") or ""),
+                red_spec=dict(row.get("red_spec") or {}),
+                expected_task_quality=float(row.get("expected_task_quality", 5.0)),
+                expected_task_hardness=float(row.get("expected_task_hardness", 5.0)),
+                expected_task_is_valid_for_socratic=bool(row.get("expected_task_is_valid_for_socratic", True)),
+                expected_red_rejection_reason=(
+                    str(row.get("expected_red_rejection_reason"))
+                    if row.get("expected_red_rejection_reason") is not None
+                    else None
+                ),
             )
         )
     return examples
@@ -440,6 +481,8 @@ def _judge_role(payload: Dict[str, Any]) -> JudgeConfig:
         bad_task_threshold=float(payload.get("bad_task_threshold", 3.0)),
         normalize_across_batches=int(payload.get("normalize_across_batches", 8)),
         examples=_judge_examples(payload.get("examples") or []),
+        red_task_batch_size=int(payload.get("red_task_batch_size", 4)),
+        red_examples=_red_task_judge_examples(payload.get("red_examples") or []),
     )
 
 

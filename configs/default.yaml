@@ -76,7 +76,7 @@ socratic:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 480
+    max_new_tokens: 180
     temperature: 1.20
     top_p: 0.9
     do_sample: true
@@ -152,6 +152,7 @@ judge:
   episode_batch_size: 1
   bad_task_threshold: 3.0
   normalize_across_batches: 8
+  red_task_batch_size: 4
   examples:
     # Anti-example: solution write-up with "Solution:" + "let's debug"
     - statement: "Count vowels in a string."
@@ -245,6 +246,110 @@ judge:
       expected_task_is_valid_for_socratic: true
       expected_hint_is_valid_for_socratic: true
       explanation: "One focused question grounded in the actual failing input, the variable name, and a specific line. Style is the highest."
+
+    # Anti-example: exact operator replacement is a solution leak
+    - statement: "Compute the average of non-empty numeric lists."
+      code: |
+        def average(nums):
+            return sum(nums) // len(nums)
+        assert average([1, 2]) == 1.5
+      observed_failure: "AssertionError: assert 1 == 1.5"
+      hint_text: "The correct approach is to use / instead of // in the return expression."
+      expected_criteria_scores:
+        bug_localization: 2
+        usefulness: 2
+        socratic_style: 0
+        technical_accuracy: 2
+      expected_no_solution_reveal: false
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Names the exact operator swap, so it leaks the answer."
+
+    # Good Socratic concise question without replacement expression
+    - statement: "Keep a running total on an object across method calls."
+      code: |
+        class Counter:
+            def __init__(self):
+                self.total = 0
+            def add(self, amount):
+                total = self.total
+                total += amount
+                return total
+        c = Counter()
+        assert c.add(2) == 2
+        assert c.add(3) == 5
+      observed_failure: "AssertionError: assert 3 == 5"
+      hint_text: "After the first call to add, which attribute on c actually changes, and what value does the second call read before adding 3?"
+      expected_criteria_scores:
+        bug_localization: 9
+        usefulness: 9
+        socratic_style: 9
+        technical_accuracy: 9
+      expected_no_solution_reveal: true
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Grounded in the object state without saying the exact fix."
+  red_examples:
+    # Valid Red task: coherent bug, correct tests, meaningful stateful behavior
+    - topic: "Objects and Classes"
+      statement: "Implement a small cache that tracks hits and misses."
+      code: |
+        class Cache:
+            def __init__(self):
+                self.data = {}
+                self.hits = 0
+                self.misses = 0
+            def get(self, key, default=None):
+                if key in self.data:
+                    self.hits += 1
+                    return self.data[key]
+                self.hits += 1
+                return default
+            def put(self, key, value):
+                self.data[key] = value
+        c = Cache()
+        assert c.get("x") is None
+        assert c.misses == 1
+        c.put("x", 4)
+        assert c.get("x") == 4
+        assert c.hits == 1
+      observed_failure: "AssertionError: assert 0 == 1"
+      red_spec:
+        topic: "Objects and Classes"
+        target_function: "Cache.get"
+        intended_bug: "The miss path increments hits instead of misses."
+        expected_first_failure: "assert c.misses == 1"
+        metadata:
+          failure_mode: "wrong state counter update"
+          difficulty: "medium"
+      expected_task_quality: 9
+      expected_task_hardness: 7
+      expected_task_is_valid_for_socratic: true
+      expected_red_rejection_reason:
+
+    # Invalid Red task: buggy code already passes, so it is not useful
+    - topic: "Arithmetic and Type Conversion"
+      statement: "Return half of a number as a float."
+      code: |
+        def half(n):
+            return n / 2
+        assert half(3) == 1.5
+        assert half(4) == 2.0
+      observed_failure: "Program exited successfully. No failing assertion or runtime error was reproduced."
+      red_spec:
+        topic: "Arithmetic and Type Conversion"
+        target_function: "half"
+        intended_bug: "Uses floor division instead of true division."
+        expected_first_failure: "assert half(3) == 1.5"
+        metadata:
+          failure_mode: "missing intended bug"
+          difficulty: "medium"
+      expected_task_quality: 2
+      expected_task_hardness: 2
+      expected_task_is_valid_for_socratic: false
+      expected_red_rejection_reason: "already_correct_code"
   hardware:
     gpu_ids: [0]
     persistent: true
@@ -293,6 +398,7 @@ red:
     max_dpo_pairs: 64
     mining_bottom_fraction: 0.25
     hard_reward_max: 0.80
+    min_red_reward: 0.50
     learning_rate: 4.0e-5
     epochs: 1
     per_device_batch_size: 1
