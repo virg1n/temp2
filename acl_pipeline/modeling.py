@@ -658,7 +658,7 @@ def _generate_texts(
                 token_usage = _first_special_token_stop(token_ids, tokenizer.eos_token_id, tokenizer.pad_token_id)
                 before_tokens = prompt_tokens_before[row_index] if row_index < len(prompt_tokens_before) else None
                 after_tokens = prompt_tokens_after[row_index] if row_index < len(prompt_tokens_after) else None
-                self.logger.event(
+                logger.event(
                     "generation_token_usage",
                     role=role_name,
                     sample_index=start + row_index,
