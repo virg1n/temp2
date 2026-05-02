@@ -15,6 +15,18 @@ from .config import GenerationSettings, HardwareAllocation, LoRASettings, Pipeli
 from .logging_utils import StructuredLogger
 
 
+LOCAL_PRETRAINED_MARKERS = {
+    "config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+}
+
+
 def clear_cuda_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
@@ -211,11 +223,52 @@ def render_chat_messages(
     return "\n\n".join(rendered)
 
 
+def _has_pretrained_artifacts(path: Path) -> bool:
+    return path.is_dir() and any((path / name).exists() for name in LOCAL_PRETRAINED_MARKERS)
+
+
+def resolve_local_pretrained_path(name_or_path: Optional[str]) -> Optional[str]:
+    if name_or_path is None:
+        return None
+
+    raw = str(name_or_path).strip()
+    if not raw:
+        return None
+
+    path = Path(os.path.expanduser(raw))
+    if not path.exists() or not path.is_dir() or _has_pretrained_artifacts(path):
+        return raw
+
+    snapshots_dir = path / "snapshots"
+    if not snapshots_dir.is_dir():
+        return raw
+
+    refs_dir = path / "refs"
+    for ref_name in ("main", "master"):
+        ref_path = refs_dir / ref_name
+        if not ref_path.is_file():
+            continue
+        revision = ref_path.read_text(encoding="utf-8").strip()
+        snapshot_path = snapshots_dir / revision
+        if _has_pretrained_artifacts(snapshot_path):
+            return str(snapshot_path)
+
+    snapshots = [item for item in snapshots_dir.iterdir() if _has_pretrained_artifacts(item)]
+    if not snapshots:
+        return raw
+    snapshots.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return str(snapshots[0])
+
+
 def load_tokenizer(model_name_or_path: str, tokenizer_name_or_path: Optional[str] = None) -> Any:
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name_or_path or model_name_or_path,
-        trust_remote_code=True,
-    )
+    target = resolve_local_pretrained_path(tokenizer_name_or_path) or resolve_local_pretrained_path(model_name_or_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(target, trust_remote_code=True)
+    except Exception:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(target, trust_remote_code=True, use_fast=False)
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(target, use_fast=False)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -544,10 +597,12 @@ def load_role_session(
     gradient_checkpointing: bool = False,
 ) -> RoleSession:
     clear_cuda_memory()
+    resolved_model_name_or_path = resolve_local_pretrained_path(model_name_or_path) or model_name_or_path
+    resolved_tokenizer_name_or_path = resolve_local_pretrained_path(tokenizer_name_or_path)
     local_gpu_ids = _local_cuda_ids(hardware.gpu_ids)
     _validate_local_cuda_ids(role_name, local_gpu_ids)
     set_preferred_cuda_device(hardware)
-    tokenizer = load_tokenizer(model_name_or_path, tokenizer_name_or_path)
+    tokenizer = load_tokenizer(resolved_model_name_or_path, resolved_tokenizer_name_or_path)
     quant_cfg = build_quantization_config(quantization)
     max_memory = build_max_memory(hardware)
     device_map = build_device_map(hardware, leave_room_on_zero=trainable)
@@ -574,7 +629,10 @@ def load_role_session(
     logger.event(
         "model_load_start",
         role=role_name,
-        model_name_or_path=model_name_or_path,
+        model_name_or_path=resolved_model_name_or_path,
+        configured_model_name_or_path=model_name_or_path,
+        configured_tokenizer_name_or_path=tokenizer_name_or_path,
+        tokenizer_name_or_path=resolved_tokenizer_name_or_path,
         adapter_path=adapter_path,
         quantization=quantization,
         load_attempts=load_attempts,
@@ -596,7 +654,7 @@ def load_role_session(
             if local_kwargs["quantization_config"] is None:
                 local_kwargs.pop("quantization_config", None)
                 local_kwargs["torch_dtype"] = _dtype_for_runtime() if torch.cuda.is_available() else torch.float32
-            attempt_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **local_kwargs)
+            attempt_model = AutoModelForCausalLM.from_pretrained(resolved_model_name_or_path, **local_kwargs)
             if adapter_path:
                 try:
                     from peft import PeftModel
@@ -655,7 +713,8 @@ def load_role_session(
     logger.event(
         "model_loaded",
         role=role_name,
-        model_name_or_path=model_name_or_path,
+        model_name_or_path=resolved_model_name_or_path,
+        configured_model_name_or_path=model_name_or_path,
         adapter_path=adapter_path,
         quantization=quantization,
         gpu_ids=hardware.gpu_ids,
@@ -666,7 +725,7 @@ def load_role_session(
     )
     return RoleSession(
         role_name=role_name,
-        model_name_or_path=model_name_or_path,
+        model_name_or_path=resolved_model_name_or_path,
         tokenizer=tokenizer,
         model=model,
         generation=generation,
