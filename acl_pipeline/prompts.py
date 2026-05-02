@@ -20,7 +20,8 @@ RED_SYSTEM_PROMPT = (
     "You are Red, an adversarial curriculum generator for Python debugging tasks. "
     "Generate realistic medium-to-hard Python debugging tasks that expose weaknesses in a Socratic tutor. "
     "Return exactly one strict JSON object only. "
-    "When asked for a spec, include the reference_solution and shared tests but no buggy_solution. "
+    "Follow the requested stage exactly: description-only stages must not include reference_solution or buggy_solution; "
+    "reference stages must include reference_solution and tests but no buggy_solution. "
     "When asked for a buggy solution, keep the already-created spec, statement, reference_solution, and tests fixed. "
     "Only the buggy_solution may introduce the intended bug. "
     "Never emit markdown fences, role labels, or <think> tags. "
@@ -89,6 +90,79 @@ def build_red_spec_prompt(
     )
 
 
+def build_red_task_description_prompt(
+    topic: str,
+    weakness_summary: Optional[str],
+) -> str:
+    focus = weakness_summary or "No prior weakness summary is available yet. Sample broadly within the topic."
+    return (
+        f"Topic: {topic}\n"
+        f"Weakness focus: {focus}\n\n"
+        "Stage 1A: generate only the task description/spec. "
+        "Return exactly one strict JSON object with this schema:\n"
+        "{\n"
+        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
+        '  "target_function": "...",\n'
+        '  "intended_bug": "...",\n'
+        '  "expected_first_failure": "...",\n'
+        '  "statement": "...",\n'
+        '  "metadata": {"failure_mode": "...", "difficulty": "medium|hard"}\n'
+        "}\n\n"
+        "Requirements:\n"
+        "- Keep topic exact.\n"
+        "- Generate one coherent Python debugging task spec, but do not write reference_solution or buggy_solution yet.\n"
+        "- Make intended_bug coherent with the task and with tests that will be generated later.\n"
+        "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
+        "- Prefer semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
+        "- Do not target syntax errors, indentation errors, missing names, missing imports, undefined decorators, or external files unless intended_bug explicitly says that is the target bug.\n"
+        "- The expected_first_failure should name the first likely assertion or runtime failure that a matching buggy_solution should trigger.\n"
+        "- The task should be debuggable from the code and reproduced failure alone.\n"
+        "- Avoid trivial one-function arithmetic exercises.\n"
+        "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
+        "- JSON only."
+    )
+
+
+def build_red_reference_training_prompt(topic: str, spec_payload: Dict[str, Any]) -> str:
+    fixed_spec = {
+        "topic": spec_payload.get("topic", topic),
+        "target_function": spec_payload.get("target_function", ""),
+        "intended_bug": spec_payload.get("intended_bug", ""),
+        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
+        "statement": spec_payload.get("statement", ""),
+        "metadata": dict(spec_payload.get("metadata") or {}),
+    }
+    return (
+        f"Topic: {topic}\n\n"
+        "Stage 1B: generate the correct reference_solution and tests for this fixed task/spec.\n"
+        "Fixed task/spec JSON:\n"
+        + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
+        + "\n\n"
+        "Return exactly one strict JSON object with this schema:\n"
+        "{\n"
+        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
+        '  "target_function": "same as fixed spec",\n'
+        '  "intended_bug": "same as fixed spec",\n'
+        '  "expected_first_failure": "same as fixed spec",\n'
+        '  "statement": "same as fixed spec",\n'
+        '  "reference_solution": "correct full Python program without markdown fences; asserts/tests at the end must pass",\n'
+        '  "metadata": {"failure_mode": "same as fixed spec", "difficulty": "medium|hard"}\n'
+        "}\n\n"
+        "Requirements:\n"
+        "- Do not change topic, target_function, intended_bug, expected_first_failure, statement, metadata.failure_mode, or metadata.difficulty.\n"
+        "- The reference_solution must be valid Python with normal 4-space indentation.\n"
+        "- Put all asserts/tests at the end of reference_solution.\n"
+        "- Every assert in reference_solution must pass exactly when the program is executed.\n"
+        "- The tests must describe correct expected behavior for the stated task and must expose the intended_bug once a buggy_solution is written.\n"
+        "- Use the same Python data types in expected values that the function returns.\n"
+        "- Do not include buggy_solution yet.\n"
+        "- The reference program should usually be 25-90 non-empty lines including tests.\n"
+        "- Keep the program deterministic, self-contained, and runnable without network, stdin, or external files.\n"
+        "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
+        "- JSON only."
+    )
+
+
 def build_red_training_prompt(
     topic: str,
     weakness_summary: Optional[str],
@@ -137,6 +211,20 @@ def build_red_buggy_training_prompt(topic: str, spec_payload: Dict[str, Any]) ->
 
 def build_red_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
     return build_red_spec_messages(topic, weakness_summary)
+
+
+def build_red_task_description_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": RED_SYSTEM_PROMPT},
+        {"role": "user", "content": build_red_task_description_prompt(topic, weakness_summary)},
+    ]
+
+
+def build_red_reference_messages(topic: str, spec_payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": RED_SYSTEM_PROMPT},
+        {"role": "user", "content": build_red_reference_training_prompt(topic, spec_payload)},
+    ]
 
 
 def build_red_spec_messages(topic: str, weakness_summary: Optional[str]) -> List[Dict[str, str]]:
@@ -197,6 +285,57 @@ def build_red_spec_repair_message(
     }
 
 
+def build_red_task_description_repair_message(
+    topic: str,
+    rejection_reasons: List[str],
+) -> Dict[str, str]:
+    reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
+    return {
+        "role": "user",
+        "content": (
+            f"Repair only the Stage 1A task description/spec output for topic '{topic}'. "
+            f"Rejection reasons: {reasons}. "
+            "Return a new strict JSON object with the same Stage 1A schema. "
+            "Keep topic exact. Include target_function, intended_bug, expected_first_failure, statement, and metadata only. "
+            "Do not include reference_solution or buggy_solution. JSON only."
+        ),
+    }
+
+
+def build_red_reference_repair_message(
+    topic: str,
+    rejection_reasons: List[str],
+    spec_payload: Dict[str, Any],
+    *,
+    repair_context: Optional[str] = None,
+) -> Dict[str, str]:
+    reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
+    context = ("\n\n" + repair_context.strip()) if repair_context and repair_context.strip() else ""
+    fixed_spec = {
+        "topic": spec_payload.get("topic", topic),
+        "target_function": spec_payload.get("target_function", ""),
+        "intended_bug": spec_payload.get("intended_bug", ""),
+        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
+        "statement": spec_payload.get("statement", ""),
+        "metadata": dict(spec_payload.get("metadata") or {}),
+    }
+    return {
+        "role": "user",
+        "content": (
+            f"Repair only reference_solution for topic '{topic}'. "
+            f"Rejection reasons: {reasons}. "
+            "The task/spec below is fixed and must not change:\n"
+            + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
+            + "\n\n"
+            "Return the final full Stage 1B JSON. Keep topic, target_function, intended_bug, expected_first_failure, statement, "
+            "metadata.failure_mode, and metadata.difficulty unchanged. "
+            "Only modify reference_solution and its tests so the reference program exits successfully. "
+            "Use valid Python with normal 4-space indentation. JSON only."
+            + context
+        ),
+    }
+
+
 def build_red_buggy_repair_message(
     topic: str,
     rejection_reasons: List[str],
@@ -240,6 +379,10 @@ def build_red_response_prefix(topic: str) -> str:
 
 
 def build_red_spec_response_prefix(topic: str) -> str:
+    return build_red_response_prefix(topic)
+
+
+def build_red_reference_response_prefix(topic: str) -> str:
     return build_red_response_prefix(topic)
 
 

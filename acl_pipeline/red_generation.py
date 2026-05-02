@@ -72,15 +72,15 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
 _TASK_FILE_LINE_RE = re.compile(r'File "[^"\n]*task\.py", line (\d+)')
 
 
-def _toplevel_test_lines(program: str) -> List[tuple[int, int]]:
-    """Return (start_line, end_line) for each top-level assert / pytest.raises With in the module."""
+def _assert_spans(program: str) -> List[tuple[int, int]]:
+    """Return (start_line, end_line) for each assert in the module."""
     try:
         tree = ast.parse(program or "")
     except SyntaxError:
         return []
     spans: List[tuple[int, int]] = []
-    for node in tree.body:
-        if isinstance(node, ast.Assert) or _is_pytest_raises_with(node):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
             start = getattr(node, "lineno", None)
             end = getattr(node, "end_lineno", start)
             if start and end:
@@ -105,33 +105,41 @@ def relax_reference_drop_failing_assert(
     *,
     min_remaining_asserts: int = 2,
 ) -> Optional[str]:
-    """If exactly one top-level assert/raises block contains the failing line, return the
-    program with that block commented out. Otherwise return None.
+    """If exactly one assert contains the failing line, return the program with that
+    assert disabled. Otherwise return None.
 
-    The failing line must be inside a top-level test (not inside a `def` body). At least
-    `min_remaining_asserts` top-level tests must remain after the drop.
+    The caller still executes the relaxed program; this helper only creates a
+    candidate when a single assert failure is identifiable.
     """
     program_text = str(program or "")
     failed_line = _failed_line_from_traceback(error_message)
     if failed_line is None:
         return None
-    spans = _toplevel_test_lines(program_text)
+    spans = _assert_spans(program_text)
     if len(spans) < min_remaining_asserts + 1:
         return None
     matching = [(s, e) for s, e in spans if s <= failed_line <= e]
     if len(matching) != 1:
         return None
-    drop_start, drop_end = matching[0]
-    lines = program_text.splitlines()
-    if drop_end > len(lines):
+    drop_start, _ = matching[0]
+    try:
+        tree = ast.parse(program_text)
+    except SyntaxError:
         return None
-    new_lines: List[str] = []
-    for index, line in enumerate(lines, start=1):
-        if drop_start <= index <= drop_end:
-            new_lines.append("# [stage1-relaxed] " + line)
-        else:
-            new_lines.append(line)
-    return "\n".join(new_lines)
+
+    class _DropFailingAssert(ast.NodeTransformer):
+        def visit_Assert(self, node: ast.Assert) -> ast.AST:
+            if int(getattr(node, "lineno", -1)) == drop_start:
+                replacement = ast.Pass()
+                return ast.copy_location(replacement, node)
+            return self.generic_visit(node)
+
+    relaxed = _DropFailingAssert().visit(tree)
+    ast.fix_missing_locations(relaxed)
+    try:
+        return ast.unparse(relaxed)
+    except Exception:
+        return None
 
 
 def _payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -141,7 +149,12 @@ def _payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     return metadata
 
 
-def _required_spec_reasons(payload: Dict[str, Any], requested_topic: str) -> List[str]:
+def _required_spec_reasons(
+    payload: Dict[str, Any],
+    requested_topic: str,
+    *,
+    require_reference: bool = True,
+) -> List[str]:
     topic = str(payload.get("topic") or "").strip()
     metadata = _payload_metadata(payload)
     difficulty = str(metadata.get("difficulty") or "").strip().lower()
@@ -154,7 +167,7 @@ def _required_spec_reasons(payload: Dict[str, Any], requested_topic: str) -> Lis
     for key in ("target_function", "intended_bug", "expected_first_failure", "statement"):
         if not str(payload.get(key) or "").strip():
             reasons.append(f"missing {key}")
-    if not reference_solution:
+    if require_reference and not reference_solution:
         reasons.append("missing reference_solution")
     if not str(metadata.get("failure_mode") or "").strip():
         reasons.append("missing metadata.failure_mode")
@@ -180,6 +193,21 @@ def _normalized_spec_payload(payload: Dict[str, Any], requested_topic: str, raw:
         "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
         "statement": str(payload.get("statement") or "").strip(),
         "reference_solution": str(payload.get("reference_solution") or "").strip(),
+        "metadata": metadata,
+        "raw_response": raw,
+    }
+
+
+def _normalized_description_payload(payload: Dict[str, Any], requested_topic: str, raw: str) -> Dict[str, Any]:
+    metadata = _payload_metadata(payload)
+    difficulty = str(metadata.get("difficulty") or "").strip().lower()
+    metadata["difficulty"] = difficulty
+    return {
+        "topic": str(payload.get("topic") or requested_topic).strip(),
+        "target_function": str(payload.get("target_function") or "").strip(),
+        "intended_bug": str(payload.get("intended_bug") or "").strip(),
+        "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
+        "statement": str(payload.get("statement") or "").strip(),
         "metadata": metadata,
         "raw_response": raw,
     }
@@ -212,6 +240,20 @@ def _locked_spec_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any]) -
         reasons.append("buggy_solution parse error")
     if locked_tests and buggy_tests and locked_tests != buggy_tests:
         reasons.append("changed tests")
+    return list(dict.fromkeys(reasons))
+
+
+def _locked_description_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    for key in ("topic", "target_function", "intended_bug", "expected_first_failure", "statement"):
+        if not _same_text(payload.get(key), locked_spec.get(key)):
+            reasons.append(f"changed {key}")
+
+    locked_metadata = dict(locked_spec.get("metadata") or {})
+    metadata = _payload_metadata(payload)
+    for key in ("failure_mode", "difficulty"):
+        if not _same_text(metadata.get(key), locked_metadata.get(key)):
+            reasons.append(f"changed metadata.{key}")
     return list(dict.fromkeys(reasons))
 
 
@@ -299,6 +341,46 @@ class RedTaskGenerator:
         self.logger.debug_dump("red_task", task=task)
         return task, []
 
+    def parse_task_description_response(
+        self,
+        raw: str,
+        *,
+        requested_topic: str,
+    ) -> tuple[Optional[Dict[str, Any]], List[str]]:
+        payload = _extract_json(raw)
+        if not isinstance(payload, dict):
+            return None, ["non-json response"]
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=False)
+        if str(payload.get("reference_solution") or "").strip():
+            reasons.append("description stage included reference_solution")
+        if str(payload.get("buggy_solution") or "").strip():
+            reasons.append("description stage included buggy_solution")
+        if reasons:
+            return None, list(dict.fromkeys(reasons))
+        spec_payload = _normalized_description_payload(payload, requested_topic, raw)
+        self.logger.debug_dump("red_task_description", spec=spec_payload)
+        return spec_payload, []
+
+    def parse_reference_response(
+        self,
+        raw: str,
+        *,
+        requested_topic: str,
+        locked_spec: Dict[str, Any],
+    ) -> tuple[Optional[Dict[str, Any]], List[str]]:
+        payload = _extract_json(raw)
+        if not isinstance(payload, dict):
+            return None, ["non-json response"]
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True)
+        reasons.extend(_locked_description_reasons(payload, locked_spec))
+        if str(payload.get("buggy_solution") or "").strip():
+            reasons.append("reference stage included buggy_solution")
+        if reasons:
+            return None, list(dict.fromkeys(reasons))
+        spec_payload = _normalized_spec_payload(payload, requested_topic, raw)
+        self.logger.debug_dump("red_reference", spec=spec_payload)
+        return spec_payload, []
+
     def parse_spec_response(
         self,
         raw: str,
@@ -308,7 +390,7 @@ class RedTaskGenerator:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
             return None, ["non-json response"]
-        reasons = _required_spec_reasons(payload, requested_topic)
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True)
         if str(payload.get("buggy_solution") or "").strip():
             reasons.append("spec stage included buggy_solution")
         if reasons:
