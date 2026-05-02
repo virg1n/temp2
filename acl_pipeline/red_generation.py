@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
 from .logging_utils import StructuredLogger
-from .prompts import build_red_buggy_messages, build_red_messages
+from .prompts import build_red_buggy_messages, build_red_reference_messages, build_red_task_description_messages
 from .schemas import PythonTask, RedTaskSpec
 
 if TYPE_CHECKING:
@@ -42,6 +42,78 @@ def _extract_json(text: str) -> Optional[Any]:
     return None
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_LABEL_RE = re.compile(
+    r"(?im)^\s*(TOPIC|TARGET_FUNCTION|DIFFICULTY|FAILURE_MODE|INTENDED_BUG|EXPECTED_FIRST_FAILURE|STATEMENT)\s*:\s*(.*)$"
+)
+
+
+def _clean_code_response(text: str) -> str:
+    raw = _cleanup_chat_artifacts(text)
+    match = _CODE_FENCE_RE.search(raw)
+    if match:
+        raw = match.group(1)
+    raw = raw.replace("```python", "").replace("```py", "").replace("```", "").strip()
+    lines = raw.splitlines()
+    first_code_index: Optional[int] = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^(from\s+\S+\s+import\s+|import\s+|def\s+|class\s+|@)", stripped):
+            first_code_index = index
+            break
+        if stripped.startswith("#") and first_code_index is None:
+            first_code_index = index
+            break
+    if first_code_index is not None and first_code_index > 0:
+        raw = "\n".join(lines[first_code_index:])
+    return raw.strip()
+
+
+def _plain_code_from_response(raw: str, *, preferred_key: str) -> str:
+    payload = _extract_json(raw)
+    if isinstance(payload, dict):
+        for key in (preferred_key, "reference_solution", "buggy_solution", "code", "program"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return _clean_code_response(value)
+    return _clean_code_response(raw)
+
+
+def _extract_labeled_fields(raw: str) -> Dict[str, str]:
+    text = _cleanup_chat_artifacts(raw)
+    matches = list(_LABEL_RE.finditer(text))
+    fields: Dict[str, str] = {}
+    for index, match in enumerate(matches):
+        label = match.group(1).upper()
+        same_line = match.group(2) or ""
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = (same_line + text[start:end]).strip()
+        fields[label] = value
+    return fields
+
+
+def _slug(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", str(text or "").strip().lower()).strip("_")
+    return cleaned[:80] or "semantic_bug"
+
+
+def _infer_target_function(statement: str) -> str:
+    text = str(statement or "")
+    for pattern in (
+        r"`([A-Za-z_][A-Za-z0-9_]*)`",
+        r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        r"\bmethod\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def _is_pytest_raises_with(node: ast.AST) -> bool:
     if not isinstance(node, ast.With):
         return False
@@ -67,6 +139,18 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
         if isinstance(node, ast.Assert) or _is_pytest_raises_with(node):
             signature.append(ast.dump(node, include_attributes=False))
     return signature, None
+
+
+def _test_count_reasons(program: str, *, min_tests: int = 3, max_tests: int = 6) -> List[str]:
+    tests, parse_error = _shared_test_signature(program)
+    if parse_error:
+        return ["reference_solution parse error"]
+    count = len(tests)
+    if count < int(min_tests):
+        return ["too few tests in reference_solution"]
+    if count > int(max_tests):
+        return ["too many tests in reference_solution"]
+    return []
 
 
 _TASK_FILE_LINE_RE = re.compile(r'File "[^"\n]*task\.py", line (\d+)')
@@ -276,15 +360,31 @@ class RedTaskGenerator:
     ) -> tuple[Optional[PythonTask], List[str]]:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
-            return None, ["non-json response"]
+            if locked_spec is None:
+                return None, ["non-json response"]
+            payload = {
+                "topic": locked_spec.get("topic", requested_topic),
+                "target_function": locked_spec.get("target_function", ""),
+                "intended_bug": locked_spec.get("intended_bug", ""),
+                "expected_first_failure": locked_spec.get("expected_first_failure", ""),
+                "statement": locked_spec.get("statement", ""),
+                "reference_solution": locked_spec.get("reference_solution", ""),
+                "buggy_solution": _plain_code_from_response(raw, preferred_key="buggy_solution"),
+                "metadata": dict(locked_spec.get("metadata") or {}),
+            }
+            plain_code_response = True
+        else:
+            plain_code_response = False
 
         topic = str(payload.get("topic") or "").strip()
         target_function = str(payload.get("target_function") or "").strip()
         intended_bug = str(payload.get("intended_bug") or "").strip()
         expected_first_failure = str(payload.get("expected_first_failure") or "").strip()
         statement = str(payload.get("statement") or "").strip()
-        reference_solution = str(payload.get("reference_solution") or "").strip()
-        solution = str(payload.get("buggy_solution") or "").strip()
+        reference_solution = _clean_code_response(str(payload.get("reference_solution") or ""))
+        solution = _clean_code_response(str(payload.get("buggy_solution") or ""))
+        payload["reference_solution"] = reference_solution
+        payload["buggy_solution"] = solution
         failing_asserts = payload.get("failing_asserts") or payload.get("asserts") or []
         if isinstance(failing_asserts, str):
             failing_asserts = [failing_asserts]
@@ -334,7 +434,16 @@ class RedTaskGenerator:
         task.metadata.setdefault("difficulty", difficulty)
         task.metadata.setdefault("observed_failure", "AssertionError")
         task.metadata["raw_response"] = raw
-        task.metadata["red_format"] = "iterative_dual_solution_json_v2" if locked_spec is not None else "dual_solution_json_v1"
+        task.metadata["red_format"] = (
+            "iterative_plain_code_v3"
+            if plain_code_response
+            else "iterative_dual_solution_json_v2"
+            if locked_spec is not None
+            else "dual_solution_json_v1"
+        )
+        task.metadata["red_chosen_completion"] = solution
+        task.metadata["red_buggy_chosen_completion"] = solution
+        task.metadata["red_buggy_raw_response"] = raw
         if locked_spec is not None:
             task.metadata["red_locked_spec"] = {
                 key: value
@@ -352,7 +461,28 @@ class RedTaskGenerator:
     ) -> tuple[Optional[Dict[str, Any]], List[str]]:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
-            return None, ["non-json response"]
+            fields = _extract_labeled_fields(raw)
+            statement = fields.get("STATEMENT", "").strip()
+            target_function = fields.get("TARGET_FUNCTION", "").strip() or _infer_target_function(statement)
+            intended_bug = fields.get("INTENDED_BUG", "").strip()
+            expected_first_failure = fields.get("EXPECTED_FIRST_FAILURE", "").strip()
+            if not expected_first_failure and target_function:
+                expected_first_failure = f"AssertionError in tests for {target_function}"
+            difficulty = fields.get("DIFFICULTY", "").strip().lower()
+            if difficulty not in {"medium", "hard"}:
+                difficulty = "medium"
+            failure_mode = fields.get("FAILURE_MODE", "").strip() or _slug(intended_bug)
+            payload = {
+                "topic": fields.get("TOPIC", requested_topic).strip() or requested_topic,
+                "target_function": target_function,
+                "intended_bug": intended_bug,
+                "expected_first_failure": expected_first_failure,
+                "statement": statement,
+                "metadata": {
+                    "failure_mode": failure_mode,
+                    "difficulty": difficulty,
+                },
+            }
         reasons = _required_spec_reasons(payload, requested_topic, require_reference=False)
         if str(payload.get("reference_solution") or "").strip():
             reasons.append("description stage included reference_solution")
@@ -373,14 +503,33 @@ class RedTaskGenerator:
     ) -> tuple[Optional[Dict[str, Any]], List[str]]:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
-            return None, ["non-json response"]
+            payload = {
+                "topic": locked_spec.get("topic", requested_topic),
+                "target_function": locked_spec.get("target_function", ""),
+                "intended_bug": locked_spec.get("intended_bug", ""),
+                "expected_first_failure": locked_spec.get("expected_first_failure", ""),
+                "statement": locked_spec.get("statement", ""),
+                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution"),
+                "metadata": dict(locked_spec.get("metadata") or {}),
+            }
+        else:
+            payload = {
+                "topic": locked_spec.get("topic", requested_topic),
+                "target_function": locked_spec.get("target_function", payload.get("target_function", "")),
+                "intended_bug": locked_spec.get("intended_bug", payload.get("intended_bug", "")),
+                "expected_first_failure": locked_spec.get("expected_first_failure", payload.get("expected_first_failure", "")),
+                "statement": locked_spec.get("statement", payload.get("statement", "")),
+                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution"),
+                "metadata": dict(locked_spec.get("metadata") or payload.get("metadata") or {}),
+            }
         reasons = _required_spec_reasons(payload, requested_topic, require_reference=True)
-        reasons.extend(_locked_description_reasons(payload, locked_spec))
+        reasons.extend(_test_count_reasons(str(payload.get("reference_solution") or ""), min_tests=3, max_tests=6))
         if str(payload.get("buggy_solution") or "").strip():
             reasons.append("reference stage included buggy_solution")
         if reasons:
             return None, list(dict.fromkeys(reasons))
         spec_payload = _normalized_spec_payload(payload, requested_topic, raw)
+        spec_payload["reference_chosen_completion"] = spec_payload["reference_solution"]
         self.logger.debug_dump("red_reference", spec=spec_payload)
         return spec_payload, []
 
@@ -409,9 +558,24 @@ class RedTaskGenerator:
         topic: str,
         weakness_summary: Optional[str],
     ) -> Optional[PythonTask]:
-        messages = build_red_messages(topic, weakness_summary)
-        raw_spec = self.generate_raw_response(session, messages, topic=topic)
-        spec_payload, reasons = self.parse_spec_response(raw_spec, requested_topic=topic)
+        raw_description = self.generate_raw_response(
+            session,
+            build_red_task_description_messages(topic, weakness_summary),
+            topic=topic,
+        )
+        description_payload, reasons = self.parse_task_description_response(raw_description, requested_topic=topic)
+        if description_payload is None or reasons:
+            return None
+        raw_reference = self.generate_raw_response(
+            session,
+            build_red_reference_messages(topic, description_payload),
+            topic=topic,
+        )
+        spec_payload, reasons = self.parse_reference_response(
+            raw_reference,
+            requested_topic=topic,
+            locked_spec=description_payload,
+        )
         if spec_payload is None or reasons:
             return None
         raw = self.generate_raw_response(session, build_red_buggy_messages(topic, spec_payload), topic=topic)

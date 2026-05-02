@@ -19,14 +19,13 @@ SOCRATIC_SYSTEM_PROMPT = (
 RED_SYSTEM_PROMPT = (
     "You are Red, an adversarial curriculum generator for Python debugging tasks. "
     "Generate realistic medium-to-hard Python debugging tasks that expose weaknesses in a Socratic tutor. "
-    "Return exactly one strict JSON object only. "
-    "Follow the requested stage exactly: description-only stages must not include reference_solution or buggy_solution; "
-    "reference stages must include reference_solution and tests but no buggy_solution. "
-    "When asked for a buggy solution, keep the already-created spec, statement, reference_solution, and tests fixed. "
+    "Follow the requested stage exactly. "
+    "When asked for a task description, return labeled plain text, not JSON. "
+    "When asked for reference or buggy code, return only runnable Python code, not JSON or markdown. "
+    "When asked for a buggy solution, keep the already-created task, reference behavior, and tests fixed. "
     "Only the buggy_solution may introduce the intended bug. "
     "Never emit markdown fences, role labels, or <think> tags. "
-    "If the response is prefilled with the beginning of a JSON object, continue that exact JSON object directly. "
-    "Do not include explanations outside the JSON."
+    "Do not include explanations outside the requested plain-text or code output."
 )
 
 def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
@@ -98,70 +97,52 @@ def build_red_task_description_prompt(
     return (
         f"Topic: {topic}\n"
         f"Weakness focus: {focus}\n\n"
-        "Stage 1A: generate only the task description/spec. "
-        "Return exactly one strict JSON object with this schema:\n"
-        "{\n"
-        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
-        '  "target_function": "...",\n'
-        '  "intended_bug": "...",\n'
-        '  "expected_first_failure": "...",\n'
-        '  "statement": "...",\n'
-        '  "metadata": {"failure_mode": "...", "difficulty": "medium|hard"}\n'
-        "}\n\n"
+        "Stage 1A: generate only the task description/spec as labeled plain text. Do not output JSON or code.\n\n"
+        "Use exactly these labels:\n"
+        f"TOPIC: {topic}\n"
+        "TARGET_FUNCTION: function_or_method_name\n"
+        "DIFFICULTY: medium|hard\n"
+        "FAILURE_MODE: short_snake_case_name\n"
+        "INTENDED_BUG: one concrete implementation bug the buggy solution will contain\n"
+        "EXPECTED_FIRST_FAILURE: the first likely assertion/runtime failure the buggy solution should produce\n"
+        "STATEMENT:\n"
+        "A concise student-facing Python debugging task statement.\n\n"
         "Requirements:\n"
         "- Keep topic exact.\n"
-        "- Generate one coherent Python debugging task spec, but do not write reference_solution or buggy_solution yet.\n"
+        "- Do not write reference_solution, buggy_solution, tests, JSON, markdown, or prose outside the labeled fields.\n"
         "- Make intended_bug coherent with the task and with tests that will be generated later.\n"
         "- Prefer multiple functions or a class with helpers, state, or non-trivial control flow.\n"
         "- Prefer semantic, edge-case, state, indexing, data-structure, or control-flow bugs over toy syntax mistakes.\n"
         "- Do not target syntax errors, indentation errors, missing names, missing imports, undefined decorators, or external files unless intended_bug explicitly says that is the target bug.\n"
         "- The expected_first_failure should name the first likely assertion or runtime failure that a matching buggy_solution should trigger.\n"
         "- The task should be debuggable from the code and reproduced failure alone.\n"
-        "- Avoid trivial one-function arithmetic exercises.\n"
-        "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
-        "- JSON only."
+        "- Avoid trivial one-function arithmetic exercises."
     )
 
 
 def build_red_reference_training_prompt(topic: str, spec_payload: Dict[str, Any]) -> str:
-    fixed_spec = {
-        "topic": spec_payload.get("topic", topic),
-        "target_function": spec_payload.get("target_function", ""),
-        "intended_bug": spec_payload.get("intended_bug", ""),
-        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
-        "statement": spec_payload.get("statement", ""),
-        "metadata": dict(spec_payload.get("metadata") or {}),
-    }
+    metadata = dict(spec_payload.get("metadata") or {})
     return (
         f"Topic: {topic}\n\n"
-        "Stage 1B: generate the correct reference_solution and tests for this fixed task/spec.\n"
-        "Fixed task/spec JSON:\n"
-        + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
-        + "\n\n"
-        "Return exactly one strict JSON object with this schema:\n"
-        "{\n"
-        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
-        '  "target_function": "same as fixed spec",\n'
-        '  "intended_bug": "same as fixed spec",\n'
-        '  "expected_first_failure": "same as fixed spec",\n'
-        '  "statement": "same as fixed spec",\n'
-        '  "reference_solution": "correct full Python program without markdown fences; asserts/tests at the end must pass",\n'
-        '  "metadata": {"failure_mode": "same as fixed spec", "difficulty": "medium|hard"}\n'
-        "}\n\n"
+        "Stage 1B: generate the correct reference solution and tests for this fixed task.\n"
+        "Return only a full runnable Python program. Do not output JSON, markdown fences, or explanations.\n\n"
+        f"TARGET_FUNCTION: {spec_payload.get('target_function', '')}\n"
+        f"DIFFICULTY: {metadata.get('difficulty', '')}\n"
+        f"FAILURE_MODE: {metadata.get('failure_mode', '')}\n"
+        f"INTENDED_BUG_TO_EXPOSE_LATER: {spec_payload.get('intended_bug', '')}\n"
+        f"EXPECTED_FIRST_FAILURE_LATER: {spec_payload.get('expected_first_failure', '')}\n"
+        "STATEMENT:\n"
+        f"{spec_payload.get('statement', '')}\n\n"
         "Requirements:\n"
-        "- Do not change topic, target_function, intended_bug, expected_first_failure, statement, metadata.failure_mode, or metadata.difficulty.\n"
-        "- The reference_solution must be valid Python with normal 4-space indentation.\n"
-        "- Put all asserts/tests at the end of reference_solution.\n"
-        "- Every assert in reference_solution must pass exactly when the program is executed.\n"
-        "- Use 3-5 short asserts with expected values that are easy to verify by inspection.\n"
+        "- Output Python code only.\n"
+        "- Implement the correct behavior for the statement.\n"
+        "- Put 3-4 short assert tests at the end of the same program.\n"
+        "- Every assert must pass exactly when this reference program is executed.\n"
+        "- The asserts must describe correct expected behavior and expose the intended bug once a buggy solution is written.\n"
         "- Avoid long hand-computed expected lists, large dictionaries, fragile floating-point equality, and ambiguous rounding behavior.\n"
-        "- The tests must describe correct expected behavior for the stated task and must expose the intended_bug once a buggy_solution is written.\n"
-        "- Use the same Python data types in expected values that the function returns.\n"
-        "- Do not include buggy_solution yet.\n"
-        "- The reference program should usually be 25-90 non-empty lines including tests.\n"
-        "- Keep the program deterministic, self-contained, and runnable without network, stdin, or external files.\n"
-        "- If generation is prefilled with the opening of the JSON object, continue it directly instead of restarting it.\n"
-        "- JSON only."
+        "- Keep expected values the same Python data types that the function returns.\n"
+        "- Keep the program deterministic and self-contained: no network, stdin, or external files.\n"
+        "- Use normal 4-space indentation."
     )
 
 
@@ -173,41 +154,30 @@ def build_red_training_prompt(
 
 
 def build_red_buggy_training_prompt(topic: str, spec_payload: Dict[str, Any]) -> str:
-    fixed_spec = {
-        "topic": spec_payload.get("topic", topic),
-        "target_function": spec_payload.get("target_function", ""),
-        "intended_bug": spec_payload.get("intended_bug", ""),
-        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
-        "statement": spec_payload.get("statement", ""),
-        "reference_solution": spec_payload.get("reference_solution", ""),
-        "metadata": dict(spec_payload.get("metadata") or {}),
-    }
+    metadata = dict(spec_payload.get("metadata") or {})
     return (
         f"Topic: {topic}\n\n"
-        "Stage 2: generate only the buggy implementation for this fixed task/spec/reference/tests.\n"
-        "Fixed task/spec/reference JSON:\n"
-        + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
-        + "\n\n"
-        "Return exactly one strict JSON object with this schema:\n"
-        "{\n"
-        f'  "topic": {json.dumps(topic, ensure_ascii=False)},\n'
-        '  "target_function": "same as fixed spec",\n'
-        '  "intended_bug": "same as fixed spec",\n'
-        '  "expected_first_failure": "same as fixed spec",\n'
-        '  "statement": "same as fixed spec",\n'
-        '  "reference_solution": "byte-for-byte same as fixed spec",\n'
-        '  "buggy_solution": "broken full Python program without markdown fences; same tests at the end must fail",\n'
-        '  "metadata": {"failure_mode": "same as fixed spec", "difficulty": "medium|hard"}\n'
-        "}\n\n"
+        "Stage 2: generate the buggy implementation for this fixed task/reference/tests.\n"
+        "Return only a full runnable Python program. Do not output JSON, markdown fences, or explanations.\n\n"
+        f"TARGET_FUNCTION: {spec_payload.get('target_function', '')}\n"
+        f"DIFFICULTY: {metadata.get('difficulty', '')}\n"
+        f"FAILURE_MODE: {metadata.get('failure_mode', '')}\n"
+        f"INTENDED_BUG: {spec_payload.get('intended_bug', '')}\n"
+        f"EXPECTED_FIRST_FAILURE: {spec_payload.get('expected_first_failure', '')}\n"
+        "STATEMENT:\n"
+        f"{spec_payload.get('statement', '')}\n\n"
+        "REFERENCE_PROGRAM_WITH_TESTS:\n"
+        "```python\n"
+        f"{spec_payload.get('reference_solution', '')}\n"
+        "```\n\n"
         "Requirements:\n"
-        "- Do not change topic, target_function, intended_bug, expected_first_failure, statement, reference_solution, metadata.failure_mode, or metadata.difficulty.\n"
-        "- Do not change the tests. The assert/test block at the end of buggy_solution must be identical to the tests in reference_solution.\n"
-        "- The buggy_solution must fail at least one shared test because of intended_bug.\n"
-        "- The buggy_solution should differ from reference_solution in behavior on at least 2 distinct inputs when possible.\n"
+        "- Output Python code only.\n"
+        "- Include the exact same assert tests from the reference program at the end.\n"
+        "- Change the implementation so at least one existing assert fails because of INTENDED_BUG.\n"
+        "- The code must run until it reaches the intended failing assertion; avoid syntax errors, indentation errors, missing imports, and unrelated NameError.\n"
         "- The bug must be in the implementation, not in incorrect asserts or tests.\n"
-        "- Add an explicit metadata field \"bug_failure_explanation\" with one short sentence of the form: \"This assert WILL fail because ...\".\n"
-        "- Keep the program deterministic, self-contained, and runnable without network, stdin, or external files.\n"
-        "- JSON only."
+        "- Keep the program deterministic and self-contained: no network, stdin, or external files.\n"
+        "- Use normal 4-space indentation."
     )
 
 
@@ -297,9 +267,9 @@ def build_red_task_description_repair_message(
         "content": (
             f"Repair only the Stage 1A task description/spec output for topic '{topic}'. "
             f"Rejection reasons: {reasons}. "
-            "Return a new strict JSON object with the same Stage 1A schema. "
-            "Keep topic exact. Include target_function, intended_bug, expected_first_failure, statement, and metadata only. "
-            "Do not include reference_solution or buggy_solution. JSON only."
+            "Return labeled plain text only with these labels: TOPIC, TARGET_FUNCTION, DIFFICULTY, FAILURE_MODE, "
+            "INTENDED_BUG, EXPECTED_FIRST_FAILURE, STATEMENT. "
+            "Keep topic exact. Do not include code, tests, JSON, markdown, reference_solution, or buggy_solution."
         ),
     }
 
@@ -313,27 +283,22 @@ def build_red_reference_repair_message(
 ) -> Dict[str, str]:
     reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
     context = ("\n\n" + repair_context.strip()) if repair_context and repair_context.strip() else ""
-    fixed_spec = {
-        "topic": spec_payload.get("topic", topic),
-        "target_function": spec_payload.get("target_function", ""),
-        "intended_bug": spec_payload.get("intended_bug", ""),
-        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
-        "statement": spec_payload.get("statement", ""),
-        "metadata": dict(spec_payload.get("metadata") or {}),
-    }
+    metadata = dict(spec_payload.get("metadata") or {})
     return {
         "role": "user",
         "content": (
             f"Repair only reference_solution for topic '{topic}'. "
             f"Rejection reasons: {reasons}. "
-            "The task/spec below is fixed and must not change:\n"
-            + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
-            + "\n\n"
-            "Return the final full Stage 1B JSON. Keep topic, target_function, intended_bug, expected_first_failure, statement, "
-            "metadata.failure_mode, and metadata.difficulty unchanged. "
-            "Only modify reference_solution and its tests so the reference program exits successfully. "
-            "Use 3-5 short asserts with simple expected values; remove or replace any brittle hand-computed assertion that caused the failure. "
-            "Use valid Python with normal 4-space indentation. JSON only."
+            "Return only the corrected full Python program, not JSON or markdown.\n\n"
+            f"TARGET_FUNCTION: {spec_payload.get('target_function', '')}\n"
+            f"DIFFICULTY: {metadata.get('difficulty', '')}\n"
+            f"FAILURE_MODE: {metadata.get('failure_mode', '')}\n"
+            f"INTENDED_BUG_TO_EXPOSE_LATER: {spec_payload.get('intended_bug', '')}\n"
+            "STATEMENT:\n"
+            f"{spec_payload.get('statement', '')}\n\n"
+            "Only modify the reference implementation and its tests so the reference program exits successfully. "
+            "Use 3-4 short asserts with simple expected values; remove or replace any brittle hand-computed assertion that caused the failure. "
+            "Use valid Python with normal 4-space indentation."
             + context
         ),
     }
@@ -348,27 +313,25 @@ def build_red_buggy_repair_message(
 ) -> Dict[str, str]:
     reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
     context = ("\n\n" + repair_context.strip()) if repair_context and repair_context.strip() else ""
-    fixed_spec = {
-        "topic": spec_payload.get("topic", topic),
-        "target_function": spec_payload.get("target_function", ""),
-        "intended_bug": spec_payload.get("intended_bug", ""),
-        "expected_first_failure": spec_payload.get("expected_first_failure", ""),
-        "statement": spec_payload.get("statement", ""),
-        "reference_solution": spec_payload.get("reference_solution", ""),
-        "metadata": dict(spec_payload.get("metadata") or {}),
-    }
+    metadata = dict(spec_payload.get("metadata") or {})
     return {
         "role": "user",
         "content": (
             f"Repair only buggy_solution for topic '{topic}'. "
             f"Rejection reasons: {reasons}. "
-            "The task/spec/reference/tests below are fixed and must not change:\n"
-            + json.dumps(fixed_spec, ensure_ascii=False, indent=2)
-            + "\n\n"
-            "Return the final full task JSON. Keep topic, target_function, intended_bug, expected_first_failure, statement, reference_solution, "
-            "metadata.failure_mode, metadata.difficulty, and every assert/test unchanged. "
-            "Only modify buggy_solution so it fails at least one existing test because of intended_bug. "
-            "Do not invent a new task or new tests. JSON only."
+            "Return only the repaired full buggy Python program, not JSON or markdown.\n\n"
+            f"TARGET_FUNCTION: {spec_payload.get('target_function', '')}\n"
+            f"DIFFICULTY: {metadata.get('difficulty', '')}\n"
+            f"FAILURE_MODE: {metadata.get('failure_mode', '')}\n"
+            f"INTENDED_BUG: {spec_payload.get('intended_bug', '')}\n"
+            "STATEMENT:\n"
+            f"{spec_payload.get('statement', '')}\n\n"
+            "REFERENCE_PROGRAM_WITH_TESTS:\n"
+            "```python\n"
+            f"{spec_payload.get('reference_solution', '')}\n"
+            "```\n\n"
+            "Keep every assert/test unchanged. Only modify the implementation so at least one existing test fails because of INTENDED_BUG. "
+            "Do not invent a new task or new tests."
             + context
         ),
     }

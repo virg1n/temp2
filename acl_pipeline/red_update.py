@@ -94,6 +94,18 @@ def serialize_task_json(task: PythonTask) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def serialize_red_completion(task: PythonTask) -> str:
+    """Return the assistant completion matching the stored Red prompt format."""
+    metadata = dict(task.metadata or {})
+    for key in ("red_chosen_completion", "red_buggy_chosen_completion", "red_buggy_raw_response"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    if str(metadata.get("red_format") or "").startswith("iterative_plain_code"):
+        return task.combined_program()
+    return serialize_task_json(task)
+
+
 def _allowed_init_params(cls: Any) -> Optional[set[str]]:
     try:
         sig = inspect.signature(cls.__init__)
@@ -168,6 +180,14 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
             "changed_target_function",
             "changed_intended_bug",
             "missing_buggy_solution",
+            "buggy_solution_parse_error",
+            "missing_shared_tests_in_buggy_solution",
+            "solutions_do_not_share_identical_tests",
+            "reference_solution_failed",
+            "reference_solution_parse_error",
+            "missing_tests_in_reference_solution",
+            "too_few_tests_in_reference_solution",
+            "too_many_tests_in_reference_solution",
         )
     )
 
@@ -227,6 +247,17 @@ def _red_reward_from_episode(episode: EpisodeRecord) -> float:
         except Exception:
             continue
     return 0.0
+
+
+def _is_current_plain_red_example(example: RedTrainingExample) -> bool:
+    metadata = dict(example.metadata or {})
+    if str(metadata.get("red_training_stage") or "") in {"task_reference", "task_buggy"}:
+        return True
+    prompt = str(example.prompt or "").lower()
+    chosen = str(example.chosen_completion or "").lstrip()
+    if not chosen or chosen.startswith(("{", "[")):
+        return False
+    return "strict json object" not in prompt and "json only" not in prompt
 
 
 def _passes_red_reward_gate(value: float, min_red_reward: float) -> bool:
@@ -315,13 +346,18 @@ def _hard_or_low_reward_episode_examples(
                 example_id=f"low_reward_recent_{episode.episode_id}",
                 topic=episode.topic,
                 prompt=str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary)),
-                chosen_completion=serialize_task_json(episode.task),
+                chosen_completion=serialize_red_completion(episode.task),
                 rejected_completion=None,
                 reward=episode.judge.normalized_reward,
                 task=episode.task,
                 metadata={
                     "episode_id": episode.episode_id,
                     "source": "low_reward_recent_episode",
+                    "red_training_stage": (
+                        "task_buggy"
+                        if str(episode.task.metadata.get("red_format") or "").startswith("iterative_plain_code")
+                        else ""
+                    ),
                     "red_task_quality": episode.task.metadata.get("red_task_quality") or episode.judge.metadata.get("task_quality"),
                     "red_task_hardness": episode.task.metadata.get("red_task_hardness") or episode.judge.metadata.get("task_hardness"),
                     "red_reward": red_reward,
@@ -369,12 +405,15 @@ class RedUpdater:
                     chosen_examples.append(item)
                     existing_ids.add(item.task.task_id)
 
+        unfiltered_chosen_count = len(chosen_examples)
+        chosen_examples = [example for example in chosen_examples if _is_current_plain_red_example(example)]
         if len(chosen_examples) < settings.min_hard_examples:
             reason = f"need_{settings.min_hard_examples}_chosen_examples_have_{len(chosen_examples)}"
             self.logger.event(
                 "red_update_skip",
                 reason=reason,
                 hard_examples=len(hard_examples),
+                eligible_before_format_filter=unfiltered_chosen_count,
                 eligible_chosen_examples=len(chosen_examples),
                 hard_reward_max=hard_reward_max,
                 min_red_reward=min_red_reward,
