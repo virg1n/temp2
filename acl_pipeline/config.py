@@ -217,7 +217,9 @@ class RedConfig(RoleConfig):
     generation_quantization: Optional[str] = "8bit"
     update_quantization: Optional[str] = "4bit"
     force_base_generation_after_iteration: int = 150
-    reference_temperature: float = 0.2
+    reference_temperature: float = 0.0
+    reference_top_p: float = 1.0
+    reference_do_sample: bool = False
     update: RedUpdateSettings = field(default_factory=RedUpdateSettings)
 
 
@@ -501,7 +503,9 @@ def _red_role(payload: Dict[str, Any]) -> RedConfig:
         generation_quantization=payload.get("generation_quantization", "8bit"),
         update_quantization=payload.get("update_quantization", "4bit"),
         force_base_generation_after_iteration=int(payload.get("force_base_generation_after_iteration", 150)),
-        reference_temperature=float(payload.get("reference_temperature", 0.2)),
+        reference_temperature=float(payload.get("reference_temperature", 0.0)),
+        reference_top_p=float(payload.get("reference_top_p", 1.0)),
+        reference_do_sample=bool(payload.get("reference_do_sample", False)),
         update=_red_update(payload.get("update")),
     )
 

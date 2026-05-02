@@ -438,6 +438,8 @@ class AdversarialCurriculumPipeline:
         stage: str,
         response_prefixes: Optional[List[str]] = None,
         temperature_override: Optional[float] = None,
+        top_p_override: Optional[float] = None,
+        do_sample_override: Optional[bool] = None,
     ) -> List[str]:
         if not messages_batch:
             return []
@@ -446,13 +448,23 @@ class AdversarialCurriculumPipeline:
             if temperature_override is not None
             else float(self.config.red.generation.temperature)
         )
+        top_p = (
+            float(top_p_override)
+            if top_p_override is not None
+            else float(self.config.red.generation.top_p)
+        )
+        do_sample = (
+            bool(do_sample_override)
+            if do_sample_override is not None
+            else bool(self.config.red.generation.do_sample)
+        )
         generation = GenerationSettings(
             batch_size=self._red_effective_batch_size(len(messages_batch)),
             max_new_tokens=int(self.config.red.generation.max_new_tokens),
             max_context_tokens=int(self.config.red.generation.max_context_tokens),
             temperature=temperature,
-            top_p=float(self.config.red.generation.top_p),
-            do_sample=bool(self.config.red.generation.do_sample),
+            top_p=top_p,
+            do_sample=do_sample,
             repetition_penalty=float(self.config.red.generation.repetition_penalty),
         )
         self.logger.debug_dump(
@@ -462,6 +474,8 @@ class AdversarialCurriculumPipeline:
             effective_batch_size=generation.batch_size,
             max_new_tokens=generation.max_new_tokens,
             temperature=generation.temperature,
+            top_p=generation.top_p,
+            do_sample=generation.do_sample,
         )
         return red_session.generate(
             messages_batch,
@@ -554,7 +568,9 @@ class AdversarialCurriculumPipeline:
                     build_red_task_description_repair_message(topic, item["last_rejection_reasons"])
                 )
 
-        reference_temperature = float(getattr(self.config.red, "reference_temperature", 0.2))
+        reference_temperature = float(getattr(self.config.red, "reference_temperature", 0.0))
+        reference_top_p = float(getattr(self.config.red, "reference_top_p", 1.0))
+        reference_do_sample = bool(getattr(self.config.red, "reference_do_sample", False))
         for attempt in range(1, max_attempts + 1):
             pending_references = [
                 item
@@ -569,6 +585,8 @@ class AdversarialCurriculumPipeline:
                 stage="task_reference",
                 response_prefixes=[build_red_reference_response_prefix(str(item["topic"])) for item in pending_references],
                 temperature_override=reference_temperature,
+                top_p_override=reference_top_p,
+                do_sample_override=reference_do_sample,
             )
             for item, raw in zip(pending_references, raw_batch):
                 topic = str(item["topic"])
@@ -633,6 +651,9 @@ class AdversarialCurriculumPipeline:
                                     reference_status=reference_execution.status,
                                     relaxation_attempted=relaxed_program is not None,
                                     relaxation_status=relaxed_execution.status if relaxed_execution is not None else None,
+                                    reference_temperature=reference_temperature,
+                                    reference_top_p=reference_top_p,
+                                    reference_do_sample=reference_do_sample,
                                 )
                                 item["reference_messages"].append({"role": "assistant", "content": raw})
                                 item["reference_messages"].append(
@@ -655,6 +676,8 @@ class AdversarialCurriculumPipeline:
                         attempt=attempt,
                         weakness_summary=weakness_summary,
                         reference_temperature=reference_temperature,
+                        reference_top_p=reference_top_p,
+                        reference_do_sample=reference_do_sample,
                     )
                     continue
 

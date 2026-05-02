@@ -72,6 +72,16 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
 _TASK_FILE_LINE_RE = re.compile(r'File "[^"\n]*task\.py", line (\d+)')
 
 
+def _task_file_lines_from_traceback(error_message: str) -> List[int]:
+    lines: List[int] = []
+    for match in _TASK_FILE_LINE_RE.finditer(str(error_message or "")):
+        try:
+            lines.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return lines
+
+
 def _assert_spans(program: str) -> List[tuple[int, int]]:
     """Return (start_line, end_line) for each assert in the module."""
     try:
@@ -88,37 +98,30 @@ def _assert_spans(program: str) -> List[tuple[int, int]]:
     return spans
 
 
-def _failed_line_from_traceback(error_message: str) -> Optional[int]:
-    """Extract the LAST 'File task.py, line N' from the traceback (innermost frame)."""
-    matches = _TASK_FILE_LINE_RE.findall(str(error_message or ""))
-    if not matches:
-        return None
-    try:
-        return int(matches[-1])
-    except (TypeError, ValueError):
-        return None
-
-
 def relax_reference_drop_failing_assert(
     program: str,
     error_message: str,
     *,
     min_remaining_asserts: int = 2,
 ) -> Optional[str]:
-    """If exactly one assert contains the failing line, return the program with that
-    assert disabled. Otherwise return None.
+    """If exactly one assert is implicated by the traceback, return the program
+    with that assert disabled. Otherwise return None.
 
     The caller still executes the relaxed program; this helper only creates a
     candidate when a single assert failure is identifiable.
     """
     program_text = str(program or "")
-    failed_line = _failed_line_from_traceback(error_message)
-    if failed_line is None:
+    traceback_lines = _task_file_lines_from_traceback(error_message)
+    if not traceback_lines:
         return None
     spans = _assert_spans(program_text)
     if len(spans) < min_remaining_asserts + 1:
         return None
-    matching = [(s, e) for s, e in spans if s <= failed_line <= e]
+    matching = [
+        (start, end)
+        for start, end in spans
+        if any(start <= line <= end for line in traceback_lines)
+    ]
     if len(matching) != 1:
         return None
     drop_start, _ = matching[0]

@@ -153,6 +153,8 @@ def build_red_reference_training_prompt(topic: str, spec_payload: Dict[str, Any]
         "- The reference_solution must be valid Python with normal 4-space indentation.\n"
         "- Put all asserts/tests at the end of reference_solution.\n"
         "- Every assert in reference_solution must pass exactly when the program is executed.\n"
+        "- Use 3-5 short asserts with expected values that are easy to verify by inspection.\n"
+        "- Avoid long hand-computed expected lists, large dictionaries, fragile floating-point equality, and ambiguous rounding behavior.\n"
         "- The tests must describe correct expected behavior for the stated task and must expose the intended_bug once a buggy_solution is written.\n"
         "- Use the same Python data types in expected values that the function returns.\n"
         "- Do not include buggy_solution yet.\n"
@@ -330,6 +332,7 @@ def build_red_reference_repair_message(
             "Return the final full Stage 1B JSON. Keep topic, target_function, intended_bug, expected_first_failure, statement, "
             "metadata.failure_mode, and metadata.difficulty unchanged. "
             "Only modify reference_solution and its tests so the reference program exits successfully. "
+            "Use 3-5 short asserts with simple expected values; remove or replace any brittle hand-computed assertion that caused the failure. "
             "Use valid Python with normal 4-space indentation. JSON only."
             + context
         ),
