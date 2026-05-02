@@ -227,6 +227,80 @@ def _has_pretrained_artifacts(path: Path) -> bool:
     return path.is_dir() and any((path / name).exists() for name in LOCAL_PRETRAINED_MARKERS)
 
 
+def _value_from_mapping_or_object(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _token_lengths(tokenizer: Any, texts: List[str]) -> List[Optional[int]]:
+    if not texts:
+        return []
+    try:
+        encoded = tokenizer(
+            list(texts),
+            padding=False,
+            truncation=False,
+            add_special_tokens=True,
+        )
+        input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else getattr(encoded, "input_ids", None)
+        if not isinstance(input_ids, list):
+            return [None for _ in texts]
+        return [len(item) if isinstance(item, list) else None for item in input_ids]
+    except Exception:
+        return [None for _ in texts]
+
+
+def _first_special_token_stop(ids: List[int], eos_token_id: Any, pad_token_id: Any) -> Dict[str, Any]:
+    eos_ids: set[int] = set()
+    if isinstance(eos_token_id, (list, tuple, set)):
+        for item in eos_token_id:
+            try:
+                eos_ids.add(int(item))
+            except Exception:
+                continue
+    elif eos_token_id is not None:
+        try:
+            eos_ids.add(int(eos_token_id))
+        except Exception:
+            pass
+
+    pad_id: Optional[int] = None
+    if pad_token_id is not None:
+        try:
+            pad_id = int(pad_token_id)
+        except Exception:
+            pad_id = None
+
+    generated_tokens = 0
+    eos_seen = False
+    pad_seen = False
+    for token_id in ids:
+        token = int(token_id)
+        if token in eos_ids:
+            eos_seen = True
+            break
+        if pad_id is not None and token == pad_id:
+            pad_seen = True
+            break
+        generated_tokens += 1
+    return {
+        "generated_tokens": generated_tokens,
+        "generated_tokens_raw": len(ids),
+        "eos_seen": eos_seen,
+        "pad_seen": pad_seen,
+    }
+
+
 def resolve_local_pretrained_path(name_or_path: Optional[str]) -> Optional[str]:
     if name_or_path is None:
         return None
@@ -429,7 +503,7 @@ class ServerRoleSession:
         effective = generation or self.generation
         client = self._client_instance()
         outputs: List[str] = []
-        for messages in messages_batch:
+        for sample_index, messages in enumerate(messages_batch):
             text = ""
             last_err: Optional[Exception] = None
             max_tokens = max(1, int(effective.max_new_tokens))
@@ -448,7 +522,34 @@ class ServerRoleSession:
                         max_tokens=max_tokens,
                         extra_body=request_extra_body,
                     )
-                    text = str(response.choices[0].message.content or "").strip()
+                    choice = response.choices[0]
+                    text = str(choice.message.content or "").strip()
+                    usage = getattr(response, "usage", None)
+                    prompt_tokens = _value_from_mapping_or_object(usage, "prompt_tokens")
+                    completion_tokens = _value_from_mapping_or_object(usage, "completion_tokens")
+                    total_tokens = _value_from_mapping_or_object(usage, "total_tokens")
+                    completion_token_count = _safe_int(completion_tokens)
+                    finish_reason = _value_from_mapping_or_object(choice, "finish_reason", "")
+                    self.logger.event(
+                        "server_generation_token_usage",
+                        role=self.role_name,
+                        model_name_or_path=self.model_name_or_path,
+                        sample_index=sample_index,
+                        prompt_tokens=prompt_tokens,
+                        generated_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        max_new_tokens=max_tokens,
+                        hit_max_new_tokens=(
+                            str(finish_reason).lower() == "length"
+                            or (
+                                completion_token_count is not None
+                                and completion_token_count >= int(max_tokens)
+                                and str(finish_reason).lower() not in {"stop", "eos_token"}
+                            )
+                        ),
+                        finish_reason=finish_reason,
+                        output_chars=len(text),
+                    )
                     last_err = None
                     break
                 except Exception as exc:  # noqa: BLE001
@@ -513,11 +614,13 @@ def _generate_texts(
         chunk = prompts[start : start + batch_size]
         try:
             context_tokens = max(0, int(getattr(generation, "max_context_tokens", 0) or 0))
+            prompt_tokens_before = _token_lengths(tokenizer, chunk)
             tokenizer_kwargs: Dict[str, Any] = {
                 "return_tensors": "pt",
                 "padding": True,
                 "truncation": True,
             }
+            prompt_budget: Optional[int] = None
             if context_tokens > 0:
                 prompt_budget = max(1, context_tokens - max(1, int(generation.max_new_tokens)))
                 tokenizer_kwargs["max_length"] = prompt_budget
@@ -525,6 +628,10 @@ def _generate_texts(
                 chunk,
                 **tokenizer_kwargs,
             )
+            prompt_tokens_after = [
+                int(value)
+                for value in encoded["attention_mask"].sum(dim=1).detach().cpu().tolist()
+            ]
             encoded = {key: value.to(input_device) for key, value in encoded.items()}
             do_sample = bool(generation.do_sample and generation.temperature > 0)
             gen_kwargs: Dict[str, Any] = {
@@ -546,7 +653,41 @@ def _generate_texts(
             prompt_width = int(encoded["input_ids"].shape[1])
             for row_index in range(result.size(0)):
                 new_tokens = result[row_index, prompt_width:]
-                outputs.append(tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
+                output_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+                token_ids = [int(token) for token in new_tokens.detach().cpu().tolist()]
+                token_usage = _first_special_token_stop(token_ids, tokenizer.eos_token_id, tokenizer.pad_token_id)
+                before_tokens = prompt_tokens_before[row_index] if row_index < len(prompt_tokens_before) else None
+                after_tokens = prompt_tokens_after[row_index] if row_index < len(prompt_tokens_after) else None
+                self.logger.event(
+                    "generation_token_usage",
+                    role=role_name,
+                    sample_index=start + row_index,
+                    batch_size=len(chunk),
+                    prompt_tokens=after_tokens,
+                    prompt_tokens_before_truncation=before_tokens,
+                    prompt_truncated=(
+                        before_tokens is not None
+                        and after_tokens is not None
+                        and int(before_tokens) > int(after_tokens)
+                    ),
+                    max_context_tokens=context_tokens,
+                    prompt_token_budget=prompt_budget,
+                    max_new_tokens=int(generation.max_new_tokens),
+                    generated_tokens=token_usage["generated_tokens"],
+                    generated_tokens_raw=token_usage["generated_tokens_raw"],
+                    hit_max_new_tokens=(
+                        int(token_usage["generated_tokens_raw"]) >= int(generation.max_new_tokens)
+                        and not bool(token_usage["eos_seen"])
+                        and not bool(token_usage["pad_seen"])
+                    ),
+                    eos_seen=bool(token_usage["eos_seen"]),
+                    pad_seen=bool(token_usage["pad_seen"]),
+                    output_chars=len(output_text),
+                    do_sample=do_sample,
+                    temperature=float(generation.temperature),
+                    top_p=float(generation.top_p),
+                )
+                outputs.append(output_text)
             start += len(chunk)
         except RuntimeError as exc:
             if not is_oom_error(exc):

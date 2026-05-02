@@ -66,6 +66,7 @@ class AdversarialCurriculumPipeline:
         self.current_socratic_model = str(pointers.get("socratic_model_path") or config.socratic.model_name_or_path)
         self.current_socratic_adapter = pointers.get("socratic_adapter_path") or config.socratic.base_adapter_path
         self.current_red_adapter = pointers.get("red_adapter_path") or config.red.base_adapter_path
+        self.last_red_update_step = int(pointers.get("last_red_update_step") or 0)
         if self._using_uniform_curriculum(self.completed_iterations + 1):
             self.storage.save_curriculum_state(self.curriculum.uniformize_weights())
 
@@ -1780,6 +1781,10 @@ class AdversarialCurriculumPipeline:
             self.current_socratic_adapter = socratic_result.adapter_path
             self.storage.save_pointer("socratic_model_path", self.current_socratic_model)
             self.storage.save_pointer("socratic_adapter_path", self.current_socratic_adapter)
+            self.storage.increment_socratic_preference_use_counts(
+                list(getattr(socratic_result, "preference_example_ids", None) or []),
+                "socratic_dpo_use_count",
+            )
 
         self.model_pool.release_socratic()
         clear_cuda_memory()
@@ -1788,12 +1793,27 @@ class AdversarialCurriculumPipeline:
             max(self.config.red.update.max_dpo_pairs * 4, self.config.red.update.max_dpo_pairs)
         )
         recent_for_red = self.storage.load_recent_episodes(max(self.config.red.update.max_sft_examples, 256))
+        red_update_every = max(1, int(self.config.red.update.update_every_episodes))
+        red_update_elapsed = max(0, step - int(self.last_red_update_step))
         if self._using_base_red_generation(iteration_index):
             self.logger.event(
                 "red_update_skipped",
                 iteration=iteration_index,
                 step=step,
                 reason="base_red_generation_mode_after_cutoff",
+                red_generation_adapter=self._effective_red_generation_adapter(iteration_index),
+                red_training_adapter=self.current_red_adapter,
+            )
+        elif red_update_elapsed < red_update_every:
+            self.logger.event(
+                "red_update_skipped",
+                iteration=iteration_index,
+                step=step,
+                reason="update_cadence",
+                update_every_episodes=red_update_every,
+                last_red_update_step=self.last_red_update_step,
+                episodes_since_last_red_update=red_update_elapsed,
+                next_eligible_step=int(self.last_red_update_step) + red_update_every,
                 red_generation_adapter=self._effective_red_generation_adapter(iteration_index),
                 red_training_adapter=self.current_red_adapter,
             )
@@ -1804,6 +1824,20 @@ class AdversarialCurriculumPipeline:
                 recent_episodes=recent_for_red,
                 step=step,
                 adapter_path=self.current_red_adapter,
+            )
+            self.last_red_update_step = step
+            self.storage.save_pointer("last_red_update_step", self.last_red_update_step)
+            self.storage.increment_hard_example_use_counts(
+                list(getattr(red_result, "sft_example_ids", None) or []),
+                "red_sft_use_count",
+            )
+            self.storage.increment_hard_example_use_counts(
+                list(getattr(red_result, "dpo_chosen_example_ids", None) or []),
+                "red_dpo_use_count",
+            )
+            self.storage.increment_red_rejection_use_counts(
+                list(getattr(red_result, "dpo_rejected_example_ids", None) or []),
+                "red_dpo_use_count",
             )
             if red_result.adapter_path:
                 self.current_red_adapter = red_result.adapter_path

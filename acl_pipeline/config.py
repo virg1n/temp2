@@ -148,6 +148,7 @@ class SocraticDpoSettings:
     fp16: bool = False
     gradient_checkpointing: bool = True
     full_ft: bool = False
+    max_uses_per_preference: int = 3
 
 
 @dataclass
@@ -167,6 +168,8 @@ class RedUpdateSettings:
     logging_steps: int = 10
     dpo_enabled: bool = True
     dpo_beta: float = 0.1
+    max_sft_uses_per_example: int = 2
+    max_dpo_uses_per_example: int = 3
 
 
 @dataclass
@@ -344,6 +347,7 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
         fp16=bool(payload.get("fp16", False)),
         gradient_checkpointing=bool(payload.get("gradient_checkpointing", True)),
         full_ft=bool(payload.get("full_ft", False)),
+        max_uses_per_preference=int(payload.get("max_uses_per_preference", 3)),
     )
 
 
@@ -365,6 +369,8 @@ def _red_update(payload: Optional[Dict[str, Any]]) -> RedUpdateSettings:
         logging_steps=int(payload.get("logging_steps", 10)),
         dpo_enabled=bool(payload.get("dpo_enabled", True)),
         dpo_beta=float(payload.get("dpo_beta", 0.1)),
+        max_sft_uses_per_example=int(payload.get("max_sft_uses_per_example", 2)),
+        max_dpo_uses_per_example=int(payload.get("max_dpo_uses_per_example", 3)),
     )
 
 

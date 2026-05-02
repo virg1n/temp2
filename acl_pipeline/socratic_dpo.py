@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
@@ -42,6 +42,7 @@ except Exception:  # noqa: BLE001
 class SocraticDpoUpdateResult:
     model_source: str
     adapter_path: Optional[str]
+    preference_example_ids: Optional[List[str]] = None
 
 
 def _allowed_init_params(cls: Any) -> Optional[set[str]]:
@@ -65,21 +66,106 @@ def _filter_kwargs_for_init(cls: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in kwargs.items() if key in allowed}
 
 
+def _metadata_count(metadata: Dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(dict(metadata or {}).get(key) or 0))
+    except Exception:
+        return 0
+
+
+def _under_use_cap(metadata: Dict[str, Any], key: str, max_uses: int) -> bool:
+    cap = int(max_uses)
+    if cap <= 0:
+        return True
+    return _metadata_count(metadata, key) < cap
+
+
+def _safe_token_count(tokenizer: Any, text: str) -> Optional[int]:
+    try:
+        encoded = tokenizer(
+            str(text or ""),
+            add_special_tokens=True,
+            truncation=False,
+        )
+        input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else getattr(encoded, "input_ids", None)
+        if isinstance(input_ids, list):
+            return len(input_ids)
+    except Exception:
+        return None
+    return None
+
+
+def _token_stats(values: List[Optional[int]]) -> Dict[str, Any]:
+    known = [int(value) for value in values if value is not None]
+    if not known:
+        return {
+            "count": len(values),
+            "known": 0,
+            "min": None,
+            "max": None,
+            "avg": None,
+        }
+    return {
+        "count": len(values),
+        "known": len(known),
+        "min": min(known),
+        "max": max(known),
+        "avg": sum(known) / len(known),
+    }
+
+
 def _build_dataset(
     examples: List[SocraticPreferenceExample],
     *,
     tokenizer: Any,
     enable_thinking: bool,
     max_pairs: int,
-) -> Dataset:
+    max_length: int,
+    max_prompt_length: int,
+) -> Tuple[Dataset, Dict[str, Any]]:
     rows: List[Dict[str, str]] = []
+    used_example_ids: List[str] = []
     limit = max(0, int(max_pairs))
+    drop_counts: Dict[str, int] = {
+        "missing_chosen": 0,
+        "missing_rejected": 0,
+        "chosen_same_as_rejected": 0,
+    }
+    prompt_token_counts: List[Optional[int]] = []
+    chosen_total_token_counts: List[Optional[int]] = []
+    rejected_total_token_counts: List[Optional[int]] = []
+    truncated_examples: List[Dict[str, Any]] = []
+
+    def stats() -> Dict[str, Any]:
+        return {
+            "examples": len(examples),
+            "limit": limit,
+            "rows": len(rows),
+            "max_length": max_length,
+            "max_prompt_length": max_prompt_length,
+            "drop_counts": dict(drop_counts),
+            "dropped_by_max_length": 0,
+            "would_truncate_by_max_length": len(truncated_examples),
+            "prompt_token_counts": _token_stats(prompt_token_counts),
+            "chosen_total_token_counts": _token_stats(chosen_total_token_counts),
+            "rejected_total_token_counts": _token_stats(rejected_total_token_counts),
+            "truncated_examples": truncated_examples[:10],
+            "used_example_ids": list(used_example_ids),
+        }
+
     if limit <= 0:
-        return Dataset.from_list(rows)
+        return Dataset.from_list(rows), stats()
     for example in examples[-limit:]:
         chosen = str(example.chosen_hint or "").strip()
         rejected = str(example.rejected_hint or "").strip()
-        if not chosen or not rejected or chosen == rejected:
+        if not chosen:
+            drop_counts["missing_chosen"] += 1
+            continue
+        if not rejected:
+            drop_counts["missing_rejected"] += 1
+            continue
+        if chosen == rejected:
+            drop_counts["chosen_same_as_rejected"] += 1
             continue
         prompt = render_chat_messages(
             tokenizer,
@@ -87,6 +173,35 @@ def _build_dataset(
             enable_thinking=enable_thinking,
             add_generation_prompt=True,
         )
+        prompt_tokens = _safe_token_count(tokenizer, prompt)
+        chosen_tokens = _safe_token_count(tokenizer, chosen)
+        rejected_tokens = _safe_token_count(tokenizer, rejected)
+        chosen_total = prompt_tokens + chosen_tokens if prompt_tokens is not None and chosen_tokens is not None else None
+        rejected_total = prompt_tokens + rejected_tokens if prompt_tokens is not None and rejected_tokens is not None else None
+        prompt_token_counts.append(prompt_tokens)
+        chosen_total_token_counts.append(chosen_total)
+        rejected_total_token_counts.append(rejected_total)
+        would_truncate = (
+            (max_prompt_length > 0 and prompt_tokens is not None and prompt_tokens > max_prompt_length)
+            or (max_length > 0 and chosen_total is not None and chosen_total > max_length)
+            or (max_length > 0 and rejected_total is not None and rejected_total > max_length)
+        )
+        if would_truncate:
+            truncated_examples.append(
+                {
+                    "example_id": example.example_id,
+                    "topic": example.topic,
+                    "episode_id": dict(example.metadata or {}).get("episode_id"),
+                    "task_id": example.task.task_id,
+                    "chosen_score": example.chosen_score,
+                    "rejected_score": example.rejected_score,
+                    "prompt_tokens": prompt_tokens,
+                    "chosen_total_tokens": chosen_total,
+                    "rejected_total_tokens": rejected_total,
+                    "max_length": max_length,
+                    "max_prompt_length": max_prompt_length,
+                }
+            )
         rows.append(
             {
                 "prompt": prompt,
@@ -94,7 +209,8 @@ def _build_dataset(
                 "rejected": rejected,
             }
         )
-    return Dataset.from_list(rows)
+        used_example_ids.append(str(example.example_id))
+    return Dataset.from_list(rows), stats()
 
 
 def _compat_dpo_config(config: PipelineConfig, output_dir: str) -> Any:
@@ -149,12 +265,22 @@ class SocraticDpoUpdater:
             raise RuntimeError("TRL with DPO support is required when socratic.training_method is 'dpo'.")
 
         settings = self.config.socratic.dpo
-        if len(preferences) < settings.min_preference_pairs_before_update:
+        max_uses = int(getattr(settings, "max_uses_per_preference", 3))
+        eligible_preferences = [
+            example
+            for example in preferences
+            if _under_use_cap(dict(example.metadata or {}), "socratic_dpo_use_count", max_uses)
+        ]
+        preference_use_cap_excluded = len(preferences) - len(eligible_preferences)
+        if len(eligible_preferences) < settings.min_preference_pairs_before_update:
             self.logger.event(
                 "socratic_dpo_skip",
                 reason="not_enough_preference_pairs",
-                have=len(preferences),
+                have=len(eligible_preferences),
                 need=settings.min_preference_pairs_before_update,
+                total_preferences=len(preferences),
+                preference_use_cap_excluded=preference_use_cap_excluded,
+                max_uses_per_preference=max_uses,
             )
             return None
 
@@ -177,17 +303,29 @@ class SocraticDpoUpdater:
                 model = attach_lora_adapter(model, self.config.socratic.lora)
                 session.model = model
 
-            dataset = _build_dataset(
-                preferences,
+            dataset, dataset_stats = _build_dataset(
+                eligible_preferences,
                 tokenizer=session.tokenizer,
                 enable_thinking=False,
                 max_pairs=settings.max_training_pairs,
+                max_length=int(settings.max_length),
+                max_prompt_length=int(settings.max_prompt_length),
+            )
+            self.logger.event(
+                "socratic_dpo_dataset_built",
+                step=step,
+                max_length=settings.max_length,
+                max_prompt_length=settings.max_prompt_length,
+                max_uses_per_preference=max_uses,
+                preference_use_cap_excluded=preference_use_cap_excluded,
+                stats=dataset_stats,
             )
             if len(dataset) <= 0:
                 self.logger.event(
                     "socratic_dpo_skip",
                     reason="empty_preference_dataset_after_filtering",
-                    preferences=len(preferences),
+                    preferences=len(eligible_preferences),
+                    preference_use_cap_excluded=preference_use_cap_excluded,
                 )
                 return None
 
@@ -217,12 +355,20 @@ class SocraticDpoUpdater:
                 model_dir = save_root / "model"
                 trainer.save_model(str(model_dir))
                 session.tokenizer.save_pretrained(str(model_dir))
-                result = SocraticDpoUpdateResult(model_source=str(model_dir), adapter_path=None)
+                result = SocraticDpoUpdateResult(
+                    model_source=str(model_dir),
+                    adapter_path=None,
+                    preference_example_ids=list(dataset_stats.get("used_example_ids") or []),
+                )
             else:
                 adapter_dir = save_root / "adapter"
                 trainer.model.save_pretrained(str(adapter_dir))
                 session.tokenizer.save_pretrained(str(adapter_dir))
-                result = SocraticDpoUpdateResult(model_source=model_source, adapter_path=str(adapter_dir))
+                result = SocraticDpoUpdateResult(
+                    model_source=model_source,
+                    adapter_path=str(adapter_dir),
+                    preference_example_ids=list(dataset_stats.get("used_example_ids") or []),
+                )
 
             preference_pairs_used = len(dataset)
             release_trainer_memory(trainer)
@@ -237,6 +383,9 @@ class SocraticDpoUpdater:
                 model_source=result.model_source,
                 adapter_path=result.adapter_path,
                 preference_pairs_used=preference_pairs_used,
+                preference_example_ids=result.preference_example_ids,
+                max_uses_per_preference=max_uses,
+                preference_use_cap_excluded=preference_use_cap_excluded,
             )
             return result
         except RuntimeError as exc:

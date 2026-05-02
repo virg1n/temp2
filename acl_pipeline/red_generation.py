@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import ast
+import io
+import tokenize
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -48,6 +50,49 @@ _LABEL_RE = re.compile(
 )
 
 
+def _strip_python_comments(source: str) -> str:
+    code = str(source or "")
+    if "#" not in code:
+        return code.strip()
+
+    output: List[str] = []
+    last_line = 1
+    last_col = 0
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+        for token in tokens:
+            token_type = token.type
+            token_text = token.string
+            start_line, start_col = token.start
+            end_line, end_col = token.end
+            line_text = token.line
+
+            if token_type == tokenize.COMMENT:
+                last_line = end_line
+                last_col = end_col
+                continue
+            if token_type == tokenize.ENDMARKER:
+                break
+
+            if start_line > last_line:
+                output.append("\n" * (start_line - last_line))
+                last_col = 0
+            if start_col > last_col:
+                output.append(line_text[last_col:start_col])
+            output.append(token_text)
+            if token_type in {tokenize.NEWLINE, tokenize.NL}:
+                last_line = start_line + 1
+                last_col = 0
+            else:
+                last_line = end_line
+                last_col = end_col
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return code.strip()
+
+    cleaned = "".join(output)
+    return "\n".join(line.rstrip() for line in cleaned.splitlines()).strip()
+
+
 def _clean_code_response(text: str) -> str:
     raw = _cleanup_chat_artifacts(text)
     match = _CODE_FENCE_RE.search(raw)
@@ -68,7 +113,7 @@ def _clean_code_response(text: str) -> str:
             break
     if first_code_index is not None and first_code_index > 0:
         raw = "\n".join(lines[first_code_index:])
-    return raw.strip()
+    return _strip_python_comments(raw)
 
 
 def _plain_code_from_response(raw: str, *, preferred_key: str) -> str:
@@ -279,7 +324,7 @@ def _normalized_spec_payload(payload: Dict[str, Any], requested_topic: str, raw:
         "intended_bug": str(payload.get("intended_bug") or "").strip(),
         "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
         "statement": str(payload.get("statement") or "").strip(),
-        "reference_solution": str(payload.get("reference_solution") or "").strip(),
+        "reference_solution": _clean_code_response(str(payload.get("reference_solution") or "")),
         "metadata": metadata,
         "raw_response": raw,
     }

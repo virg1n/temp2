@@ -46,6 +46,16 @@ def _load_jsonl_payloads(path: Path, limit: Optional[int] = None) -> List[Dict[s
     return payloads
 
 
+def _counts_by_id(example_ids: List[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for value in example_ids:
+        key = str(value or "").strip()
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 class SimpleStorage:
     def __init__(self, root_dir: str, *, keep_last_n_checkpoints: int = 3, hard_buffer_max_size: int = 2048) -> None:
         self.root_dir = Path(root_dir)
@@ -78,6 +88,9 @@ class SimpleStorage:
     def append_hard_example(self, example: RedTrainingExample) -> None:
         rows = self.load_hard_examples(limit=self.hard_buffer_max_size - 1)
         rows.append(example)
+        self.save_hard_examples(rows[-self.hard_buffer_max_size :])
+
+    def save_hard_examples(self, rows: List[RedTrainingExample]) -> None:
         with self.hard_examples_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
                 fh.write(_jsonl_line(row.to_dict()))
@@ -92,6 +105,9 @@ class SimpleStorage:
     def append_red_rejected_example(self, example: RedRejectedExample) -> None:
         rows = self.load_red_rejected_examples(limit=self.hard_buffer_max_size - 1)
         rows.append(example)
+        self.save_red_rejected_examples(rows[-self.hard_buffer_max_size :])
+
+    def save_red_rejected_examples(self, rows: List[RedRejectedExample]) -> None:
         with self.red_rejections_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
                 fh.write(_jsonl_line(row.to_dict()))
@@ -102,6 +118,9 @@ class SimpleStorage:
     def append_socratic_preference(self, example: SocraticPreferenceExample) -> None:
         rows = self.load_socratic_preferences(limit=self.hard_buffer_max_size - 1)
         rows.append(example)
+        self.save_socratic_preferences(rows[-self.hard_buffer_max_size :])
+
+    def save_socratic_preferences(self, rows: List[SocraticPreferenceExample]) -> None:
         with self.socratic_preferences_path.open("w", encoding="utf-8") as fh:
             for row in rows[-self.hard_buffer_max_size :]:
                 fh.write(_jsonl_line(row.to_dict()))
@@ -111,6 +130,48 @@ class SimpleStorage:
             SocraticPreferenceExample.from_dict(payload)
             for payload in _load_jsonl_payloads(self.socratic_preferences_path, limit)
         ]
+
+    def increment_hard_example_use_counts(self, example_ids: List[str], metadata_key: str) -> None:
+        counts = _counts_by_id(example_ids)
+        if not counts:
+            return
+        rows = self.load_hard_examples()
+        for row in rows:
+            increment = counts.get(str(row.example_id))
+            if not increment:
+                continue
+            metadata = dict(row.metadata or {})
+            metadata[metadata_key] = int(metadata.get(metadata_key) or 0) + increment
+            row.metadata = metadata
+        self.save_hard_examples(rows)
+
+    def increment_red_rejection_use_counts(self, example_ids: List[str], metadata_key: str) -> None:
+        counts = _counts_by_id(example_ids)
+        if not counts:
+            return
+        rows = self.load_red_rejected_examples()
+        for row in rows:
+            increment = counts.get(str(row.example_id))
+            if not increment:
+                continue
+            metadata = dict(row.metadata or {})
+            metadata[metadata_key] = int(metadata.get(metadata_key) or 0) + increment
+            row.metadata = metadata
+        self.save_red_rejected_examples(rows)
+
+    def increment_socratic_preference_use_counts(self, example_ids: List[str], metadata_key: str) -> None:
+        counts = _counts_by_id(example_ids)
+        if not counts:
+            return
+        rows = self.load_socratic_preferences()
+        for row in rows:
+            increment = counts.get(str(row.example_id))
+            if not increment:
+                continue
+            metadata = dict(row.metadata or {})
+            metadata[metadata_key] = int(metadata.get(metadata_key) or 0) + increment
+            row.metadata = metadata
+        self.save_socratic_preferences(rows)
 
     def save_curriculum_state(self, state: CurriculumState) -> None:
         self.curriculum_path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
