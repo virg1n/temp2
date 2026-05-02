@@ -179,8 +179,11 @@ def build_red_repair_message(
 def build_red_spec_repair_message(
     topic: str,
     rejection_reasons: List[str],
+    *,
+    repair_context: Optional[str] = None,
 ) -> Dict[str, str]:
     reasons = ", ".join(rejection_reasons) if rejection_reasons else "unspecified issue"
+    context = ("\n\n" + repair_context.strip()) if repair_context and repair_context.strip() else ""
     return {
         "role": "user",
         "content": (
@@ -189,6 +192,7 @@ def build_red_spec_repair_message(
             "Return a new strict JSON object with the same Stage 1 schema. "
             "Keep topic exact. Include a correct reference_solution with asserts/tests at the end. "
             "Do not include buggy_solution. JSON only."
+            + context
         ),
     }
 

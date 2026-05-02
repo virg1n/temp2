@@ -289,6 +289,32 @@ class AdversarialCurriculumPipeline:
         )
         return "\n".join(lines)
 
+    def _format_reference_repair_context(self, reference_execution: Any) -> str:
+        payload = reference_execution.to_dict() if hasattr(reference_execution, "to_dict") else dict(reference_execution or {})
+        error = str(payload.get("error_message") or "").strip()
+        stdout = str(payload.get("stdout") or "").strip()
+        stderr = str(payload.get("stderr") or "").strip()
+        lines = [
+            "Your previous reference_solution did not pass its own tests.",
+            f"Execution status: {payload.get('status') or 'unknown'}",
+        ]
+        if error:
+            lines.append("Traceback/error:")
+            lines.append(error[-1200:])
+        if stdout:
+            lines.append("Stdout:")
+            lines.append(stdout[-600:])
+        if stderr and stderr != error:
+            lines.append("Stderr:")
+            lines.append(stderr[-600:])
+        lines.extend(
+            [
+                "Fix reference_solution and its tests so the reference program exits successfully.",
+                "The tests must still describe correct expected behavior and expose the intended bug later.",
+            ]
+        )
+        return "\n".join(lines)
+
     def _red_repair_message_for_item(self, item: Dict[str, Any], rejection_reasons: List[str]) -> Dict[str, str]:
         task = item.get("task")
         repair_context = None
@@ -540,7 +566,13 @@ class AdversarialCurriculumPipeline:
                                     relaxation_status=relaxed_execution.status if relaxed_execution is not None else None,
                                 )
                                 item["spec_messages"].append({"role": "assistant", "content": raw})
-                                item["spec_messages"].append(build_red_spec_repair_message(topic, rejection_reasons))
+                                item["spec_messages"].append(
+                                    build_red_spec_repair_message(
+                                        topic,
+                                        rejection_reasons,
+                                        repair_context=self._format_reference_repair_context(reference_execution),
+                                    )
+                                )
                                 continue
                     item["spec_payload"] = spec_payload
                     item["spec_raw_response"] = raw
