@@ -594,6 +594,8 @@ class JudgeService:
     def _coerce_no_solution_reveal(self, item: Any, gate: Dict[str, Any]) -> bool:
         if gate.get("contains_direct_fix") or gate.get("contains_code_output"):
             return False
+        if gate.get("hint_paraphrases_solution"):
+            return False
         if not isinstance(item, dict) or "no_solution_reveal" not in item:
             return True
         raw = item.get("no_solution_reveal")
@@ -608,6 +610,19 @@ class JudgeService:
             return False
         return True
 
+    def _coerce_paraphrases_solution(self, item: Any) -> bool:
+        if not isinstance(item, dict) or "hint_paraphrases_solution" not in item:
+            return False
+        raw = item.get("hint_paraphrases_solution")
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return float(raw) >= 0.5
+        text = str(raw or "").strip().lower()
+        if text in {"true", "yes", "leak", "leaked", "paraphrase", "paraphrased"}:
+            return True
+        return False
+
     def _weighted_score(self, criteria_scores: Dict[str, float]) -> float:
         weights = self._weights()
         total_weight = sum(max(0.0, float(value)) for value in weights.values())
@@ -619,28 +634,49 @@ class JudgeService:
         return max(0.0, total / total_weight)
 
     def _normalize_post_scores(self, pre_normalize_scores: List[float]) -> List[float]:
+        # Percentile rescaling against a rolling window of recent raw scores.
+        # When Judge saturates near 8-10 the raw scores carry almost no
+        # gradient signal; this stretches the recent p10..p90 range into
+        # roughly 1..9, restoring discrimination between hints. The previous
+        # implementation was a no-op because (max/max) always equalled 1.
         window_size = max(1, int(getattr(self.model_pool.config.judge, "normalize_across_batches", 8)))
+        # `normalize_across_batches` is in batches; the window in scores is
+        # batches * batch_size so a few episodes always populate it.
         episode_batch_size = max(1, int(getattr(self.model_pool.config.judge, "episode_batch_size", 1)))
-        if self._normalization_window.maxlen != window_size:
-            self._normalization_window = deque(self._normalization_window, maxlen=window_size)
-        active_window: Deque[float]
-        if window_size <= episode_batch_size:
-            active_window = deque(maxlen=window_size)
-        else:
-            active_window = self._normalization_window
+        score_window_size = max(8, window_size * episode_batch_size)
+        if self._normalization_window.maxlen != score_window_size:
+            self._normalization_window = deque(self._normalization_window, maxlen=score_window_size)
+
+        for pre_normalize in pre_normalize_scores:
+            self._normalization_window.append(float(pre_normalize))
+
+        window = sorted(self._normalization_window)
+        n = len(window)
+        if n < 4:
+            return [max(0.0, min(10.0, float(score))) for score in pre_normalize_scores]
+
+        def _percentile(p: float) -> float:
+            if n == 1:
+                return window[0]
+            idx = p * (n - 1)
+            lo = int(idx)
+            hi = min(n - 1, lo + 1)
+            frac = idx - lo
+            return window[lo] * (1.0 - frac) + window[hi] * frac
+
+        p10 = _percentile(0.10)
+        p90 = _percentile(0.90)
+        spread = p90 - p10
+        if spread <= 1e-3:
+            # Nothing to stretch yet; pass raw scores through clamped.
+            return [max(0.0, min(10.0, float(score))) for score in pre_normalize_scores]
 
         post_scores: List[float] = []
         for pre_normalize in pre_normalize_scores:
-            pre = float(pre_normalize)
-            active_window.append(pre)
-            window = list(active_window)
-            if not window:
-                post_scores.append(max(0.0, min(10.0, pre)))
-                continue
-            observed_max = max(window) if window else pre
-            max_norm = min(10.0, observed_max)
-            scale = (max_norm / observed_max) if observed_max > 0 else 1.0
-            post_scores.append(max(0.0, min(10.0, pre * scale)))
+            value = float(pre_normalize)
+            # Map p10 -> 1.0 and p90 -> 9.0 so true 0s/10s remain reachable.
+            stretched = 1.0 + 8.0 * (value - p10) / spread
+            post_scores.append(max(0.0, min(10.0, stretched)))
         return post_scores
 
     def _hard_rule_gate(
@@ -1028,6 +1064,21 @@ class JudgeService:
             else:
                 criteria_list.append(self._coerce_criteria_scores(item))
 
+        # Stamp paraphrase verdict on each gate before scoring so style is
+        # capped and no_solution_reveal flips to False when the Judge said
+        # the hint paraphrases the fix. This is what catches the 9/10 leaks
+        # the regex list can't see.
+        paraphrase_flags: List[bool] = []
+        for index, (item, gate) in enumerate(zip(raw_items, hard_gates)):
+            paraphrases = self._coerce_paraphrases_solution(item)
+            paraphrase_flags.append(paraphrases)
+            gate["hint_paraphrases_solution"] = paraphrases
+            if paraphrases:
+                gate["reasons"].append("hint_paraphrases_solution")
+                gate["force_hint_valid"] = False
+                if not gate.get("hint_rejection_reason"):
+                    gate["hint_rejection_reason"] = "paraphrased_solution_leak"
+
         raw_unclamped_scores: List[float] = []
         pre_normalize_scores: List[float] = []
         no_solution_reveals: List[bool] = []
@@ -1039,6 +1090,10 @@ class JudgeService:
             forced_score = gate.get("forced_score")
             if zero_out and forced_score is None:
                 criteria = dict(zero_criteria)
+                criteria_list[index] = criteria
+            if gate.get("hint_paraphrases_solution") and forced_score is None and not zero_out:
+                if "socratic_style" in criteria:
+                    criteria["socratic_style"] = min(float(criteria["socratic_style"]), 3.0)
                 criteria_list[index] = criteria
             no_solution_reveal = self._coerce_no_solution_reveal(item, gate)
             no_solution_multiplier = 1.0 if no_solution_reveal else 0.1
@@ -1066,6 +1121,7 @@ class JudgeService:
                 "forced_score": gate["forced_score"],
                 "contains_code_output": gate["contains_code_output"],
                 "contains_direct_fix": gate["contains_direct_fix"],
+                "hint_paraphrases_solution": bool(gate.get("hint_paraphrases_solution")),
             }
             raw_unclamped_scores.append(raw_unclamped)
             pre_normalize_scores.append(pre_normalize)
@@ -1093,6 +1149,7 @@ class JudgeService:
                 "adjusted_score": adjusted_score,
                 "no_solution_reveal": no_solution_reveal,
                 "no_solution_reveal_multiplier": no_solution_multiplier,
+                "hint_paraphrases_solution": paraphrase,
                 "raw_response": raw_response,
                 "task_quality": assessment["task_quality"],
                 "task_is_valid_for_socratic": assessment["task_is_valid_for_socratic"],
@@ -1103,7 +1160,7 @@ class JudgeService:
                 "hint_corruption": corruption,
                 "local_tiebreak": features,
             }
-            for criteria, raw_unclamped, pre_normalize, post_normalize, adjusted_score, no_solution_reveal, no_solution_multiplier, raw_response, assessment, corruption, features in zip(
+            for criteria, raw_unclamped, pre_normalize, post_normalize, adjusted_score, no_solution_reveal, no_solution_multiplier, paraphrase, raw_response, assessment, corruption, features in zip(
                 criteria_list,
                 raw_unclamped_scores,
                 pre_normalize_scores,
@@ -1111,6 +1168,7 @@ class JudgeService:
                 adjusted_scores,
                 no_solution_reveals,
                 no_solution_multipliers,
+                paraphrase_flags,
                 raw_responses,
                 assessments,
                 corruption_flags,
@@ -1153,6 +1211,7 @@ class JudgeService:
                 "adjusted_score": adjusted_score,
                 "no_solution_reveal": bool(details["no_solution_reveal"]),
                 "no_solution_reveal_multiplier": float(details["no_solution_reveal_multiplier"]),
+                "hint_paraphrases_solution": bool(details.get("hint_paraphrases_solution", False)),
                 "task_quality": float(details["task_quality"]),
                 "task_is_valid_for_socratic": bool(details["task_is_valid_for_socratic"]),
                 "hint_is_valid_for_socratic": bool(details["hint_is_valid_for_socratic"]),

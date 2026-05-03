@@ -38,14 +38,14 @@ except Exception:  # noqa: BLE001
         raise RuntimeError("TRL with SFT support is required for Red updates.") from exc
 
 try:
-    from trl import DPOConfig, DPOTrainer
+    from trl import KTOConfig, KTOTrainer
 except Exception:  # noqa: BLE001
     try:
-        from trl.trainer.dpo_config import DPOConfig
-        from trl.trainer.dpo_trainer import DPOTrainer
+        from trl.trainer.kto_config import KTOConfig
+        from trl.trainer.kto_trainer import KTOTrainer
     except Exception:  # noqa: BLE001
-        DPOConfig = None
-        DPOTrainer = None
+        KTOConfig = None
+        KTOTrainer = None
 
 
 @dataclass
@@ -348,7 +348,7 @@ def _under_use_cap(metadata: Dict[str, Any], key: str, max_uses: int, *, extra_u
     return _metadata_count(metadata, key) + int(extra_uses) < cap
 
 
-def _build_dpo_dataset(
+def _build_kto_dataset(
     chosen_examples: List[RedTrainingExample],
     rejected_examples: List[RedRejectedExample],
     *,
@@ -356,50 +356,52 @@ def _build_dpo_dataset(
     tokenizer: Any,
     max_length: int,
     max_prompt_length: int,
-    max_dpo_uses: int,
+    max_pref_uses: int,
 ) -> Tuple[Dataset, Dict[str, Any]]:
-    rows: List[Dict[str, str]] = []
+    """Build a KTO dataset of (prompt, completion, label) rows.
+
+    Unlike DPO this does not require a paired (chosen, rejected) for the same
+    prompt. Each chosen example contributes a desirable row and each
+    trainable rejection contributes an undesirable row, so the full rejection
+    buffer (incl. buggy_too_correct, reference_solution_failed, etc.) gets
+    used instead of being dropped for lack of an exact-prompt-string match.
+    """
+    rows: List[Dict[str, Any]] = []
     chosen_example_ids: List[str] = []
     rejected_example_ids: List[str] = []
     chosen_local_uses: Dict[str, int] = {}
     rejected_local_uses: Dict[str, int] = {}
-    rejected_by_id = {str(item.example_id): item for item in rejected_examples}
     limit = max(0, int(limit))
     drop_counts: Dict[str, int] = {
         "missing_prompt": 0,
-        "missing_chosen": 0,
-        "missing_rejected": 0,
-        "rejected_same_as_chosen": 0,
-        "no_direct_trainable_rejection": 0,
-        "chosen_dpo_use_cap": 0,
-        "rejected_dpo_use_cap": 0,
-        "missing_rejected_usage_record": 0,
+        "missing_completion": 0,
+        "chosen_pref_use_cap": 0,
+        "rejected_pref_use_cap": 0,
+        "rejected_not_trainable": 0,
+        "rejected_already_correct": 0,
     }
     prompt_token_counts: List[Optional[int]] = []
-    chosen_total_token_counts: List[Optional[int]] = []
-    rejected_total_token_counts: List[Optional[int]] = []
-    truncated_pairs: List[Dict[str, Any]] = []
+    completion_token_counts: List[Optional[int]] = []
+    truncated_examples: List[Dict[str, Any]] = []
 
     def base_stats() -> Dict[str, Any]:
+        positive = sum(1 for row in rows if row.get("label"))
         return {
-            "pairs": len(rows),
-            "direct_pairs": len(rows),
-            "topic_pairs": 0,
+            "rows": len(rows),
+            "desirable_rows": positive,
+            "undesirable_rows": len(rows) - positive,
             "already_correct_rejections": sum(1 for item in rejected_examples if _rejected_example_is_already_correct(item)),
             "trainable_rejections": sum(1 for item in rejected_examples if _rejected_example_is_trainable_for_red_dpo(item)),
-            "topic_matches": {},
             "candidate_chosen_examples": len(chosen_examples),
             "rejected_pool_examples": len(rejected_examples),
             "limit": limit,
             "max_length": max_length,
             "max_prompt_length": max_prompt_length,
             "drop_counts": dict(drop_counts),
-            "dropped_by_max_length": 0,
-            "would_truncate_by_max_length": len(truncated_pairs),
+            "would_truncate_by_max_length": len(truncated_examples),
             "prompt_token_counts": _token_stats(prompt_token_counts),
-            "chosen_total_token_counts": _token_stats(chosen_total_token_counts),
-            "rejected_total_token_counts": _token_stats(rejected_total_token_counts),
-            "truncated_pairs": truncated_pairs[:10],
+            "completion_token_counts": _token_stats(completion_token_counts),
+            "truncated_examples": truncated_examples[:10],
             "chosen_example_ids": list(chosen_example_ids),
             "rejected_example_ids": list(rejected_example_ids),
         }
@@ -407,93 +409,99 @@ def _build_dpo_dataset(
     if limit <= 0:
         return Dataset.from_list(rows), base_stats()
 
-    direct_pairs = 0
+    def _record_truncation(identity: Dict[str, Any], prompt_tokens: Optional[int], total_tokens: Optional[int]) -> None:
+        truncated_examples.append(
+            {
+                **identity,
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": total_tokens,
+                "max_length": max_length,
+                "max_prompt_length": max_prompt_length,
+            }
+        )
+
+    desirable_budget = max(1, limit // 2)
+    undesirable_budget = max(1, limit - desirable_budget)
+
     for example in sorted(chosen_examples, key=lambda entry: entry.reward):
+        if sum(1 for row in rows if row.get("label")) >= desirable_budget:
+            break
         metadata = dict(example.metadata or {})
         chosen_id = str(example.example_id)
-        rejected_id = str(metadata.get("red_dpo_rejection_id") or "").strip()
         chosen_extra_uses = chosen_local_uses.get(chosen_id, 0)
-        if not _under_use_cap(metadata, "red_dpo_use_count", max_dpo_uses, extra_uses=chosen_extra_uses):
-            drop_counts["chosen_dpo_use_cap"] += 1
+        if not _under_use_cap(metadata, "red_dpo_use_count", max_pref_uses, extra_uses=chosen_extra_uses):
+            drop_counts["chosen_pref_use_cap"] += 1
             continue
-        rejected_example = rejected_by_id.get(rejected_id)
-        if rejected_id and rejected_example is None:
-            drop_counts["missing_rejected_usage_record"] += 1
-            continue
-        if rejected_example is not None:
-            rejected_extra_uses = rejected_local_uses.get(rejected_id, 0)
-            if not _under_use_cap(
-                dict(rejected_example.metadata or {}),
-                "red_dpo_use_count",
-                max_dpo_uses,
-                extra_uses=rejected_extra_uses,
-            ):
-                drop_counts["rejected_dpo_use_cap"] += 1
-                continue
-        rejected = str(example.rejected_completion or "").strip()
         prompt = str(example.prompt or example.task.metadata.get("red_prompt") or "").strip()
-        chosen = str(example.chosen_completion or "").strip()
+        completion = str(example.chosen_completion or "").strip()
         if not prompt:
             drop_counts["missing_prompt"] += 1
             continue
-        if not chosen:
-            drop_counts["missing_chosen"] += 1
+        if not completion:
+            drop_counts["missing_completion"] += 1
             continue
-        if not rejected:
-            drop_counts["missing_rejected"] += 1
-            continue
-        if rejected == chosen:
-            drop_counts["rejected_same_as_chosen"] += 1
-            continue
-        if not _chosen_example_has_direct_trainable_rejection(example):
-            drop_counts["no_direct_trainable_rejection"] += 1
-            continue
-
         prompt_tokens = _safe_token_count(tokenizer, prompt)
-        chosen_tokens = _safe_token_count(tokenizer, chosen)
-        rejected_tokens = _safe_token_count(tokenizer, rejected)
-        chosen_total = prompt_tokens + chosen_tokens if prompt_tokens is not None and chosen_tokens is not None else None
-        rejected_total = prompt_tokens + rejected_tokens if prompt_tokens is not None and rejected_tokens is not None else None
+        completion_tokens = _safe_token_count(tokenizer, completion)
+        total = prompt_tokens + completion_tokens if prompt_tokens is not None and completion_tokens is not None else None
         prompt_token_counts.append(prompt_tokens)
-        chosen_total_token_counts.append(chosen_total)
-        rejected_total_token_counts.append(rejected_total)
-        would_truncate = (
-            (max_prompt_length > 0 and prompt_tokens is not None and prompt_tokens > max_prompt_length)
-            or (max_length > 0 and chosen_total is not None and chosen_total > max_length)
-            or (max_length > 0 and rejected_total is not None and rejected_total > max_length)
-        )
-        if would_truncate:
-            truncated_pairs.append(
+        completion_token_counts.append(completion_tokens)
+        if (max_prompt_length > 0 and prompt_tokens is not None and prompt_tokens > max_prompt_length) or (
+            max_length > 0 and total is not None and total > max_length
+        ):
+            _record_truncation(_example_identity(example), prompt_tokens, total)
+        rows.append({"prompt": prompt, "completion": completion, "label": True})
+        chosen_example_ids.append(chosen_id)
+        chosen_local_uses[chosen_id] = chosen_extra_uses + 1
+
+    for rejected in rejected_examples:
+        if sum(1 for row in rows if not row.get("label")) >= undesirable_budget:
+            break
+        if not _rejected_example_is_trainable_for_red_dpo(rejected):
+            drop_counts["rejected_not_trainable"] += 1
+            continue
+        if _rejected_example_is_already_correct(rejected) and not _is_trainable_red_dpo_rejection_reason(rejected.rejection_reason):
+            # already_correct rejections are useful negatives; only drop when
+            # nothing else flagged them trainable.
+            pass
+        rejected_metadata = dict(rejected.metadata or {})
+        rejected_id = str(rejected.example_id)
+        rejected_extra_uses = rejected_local_uses.get(rejected_id, 0)
+        if not _under_use_cap(rejected_metadata, "red_dpo_use_count", max_pref_uses, extra_uses=rejected_extra_uses):
+            drop_counts["rejected_pref_use_cap"] += 1
+            continue
+        prompt = str(rejected.prompt or "").strip()
+        completion = str(rejected.rejected_completion or "").strip()
+        if not prompt:
+            drop_counts["missing_prompt"] += 1
+            continue
+        if not completion:
+            drop_counts["missing_completion"] += 1
+            continue
+        prompt_tokens = _safe_token_count(tokenizer, prompt)
+        completion_tokens = _safe_token_count(tokenizer, completion)
+        total = prompt_tokens + completion_tokens if prompt_tokens is not None and completion_tokens is not None else None
+        prompt_token_counts.append(prompt_tokens)
+        completion_token_counts.append(completion_tokens)
+        if (max_prompt_length > 0 and prompt_tokens is not None and prompt_tokens > max_prompt_length) or (
+            max_length > 0 and total is not None and total > max_length
+        ):
+            truncated_examples.append(
                 {
-                    **_example_identity(example),
+                    "example_id": rejected_id,
+                    "topic": rejected.topic,
+                    "stage": rejected_metadata.get("stage"),
+                    "rejection_reason": rejected.rejection_reason,
                     "prompt_tokens": prompt_tokens,
-                    "chosen_total_tokens": chosen_total,
-                    "rejected_total_tokens": rejected_total,
+                    "total_tokens": total,
                     "max_length": max_length,
                     "max_prompt_length": max_prompt_length,
                 }
             )
-        rows.append(
-            {
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected,
-            }
-        )
-        chosen_example_ids.append(chosen_id)
-        if rejected_id:
-            rejected_example_ids.append(rejected_id)
-            rejected_local_uses[rejected_id] = rejected_local_uses.get(rejected_id, 0) + 1
-        chosen_local_uses[chosen_id] = chosen_extra_uses + 1
-        direct_pairs += 1
-        if len(rows) >= limit:
-            stats = base_stats()
-            stats["direct_pairs"] = direct_pairs
-            return Dataset.from_list(rows), stats
+        rows.append({"prompt": prompt, "completion": completion, "label": False})
+        rejected_example_ids.append(rejected_id)
+        rejected_local_uses[rejected_id] = rejected_extra_uses + 1
 
-    stats = base_stats()
-    stats["direct_pairs"] = direct_pairs
-    return Dataset.from_list(rows), stats
+    return Dataset.from_list(rows), base_stats()
 
 
 def _hard_or_low_reward_episode_examples(
@@ -608,21 +616,21 @@ class RedUpdater:
             {
                 "max_length": full_context_length,
                 "per_device_batch_size": 1,
-                "dpo_enabled": settings.dpo_enabled,
+                "kto_enabled": settings.dpo_enabled,
             },
             {
                 "max_length": max(768, full_context_length // 2),
                 "per_device_batch_size": 1,
-                "dpo_enabled": False,
+                "kto_enabled": False,
             },
         ]
 
         for attempt_index, attempt in enumerate(attempts, start=1):
             session = None
             sft_trainer = None
-            dpo_trainer = None
+            kto_trainer = None
             sft_dataset = None
-            dpo_dataset = None
+            kto_dataset = None
             model = None
             load_adapter_path = adapter_path
             try:
@@ -705,29 +713,31 @@ class RedUpdater:
                 sft_dataset = None
                 clear_cuda_memory()
 
-                dpo_pair_count = 0
-                dpo_stats: Dict[str, Any] = {}
-                if attempt["dpo_enabled"] and DPOTrainer is not None and DPOConfig is not None:
-                    dpo_dataset, dpo_stats = _build_dpo_dataset(
+                kto_row_count = 0
+                kto_stats: Dict[str, Any] = {}
+                if attempt["kto_enabled"] and KTOTrainer is not None and KTOConfig is not None:
+                    kto_dataset, kto_stats = _build_kto_dataset(
                         chosen_examples,
                         rejected_examples,
                         limit=settings.max_dpo_pairs,
                         tokenizer=session.tokenizer,
                         max_length=int(attempt["max_length"]),
                         max_prompt_length=min(1024, int(attempt["max_length"]) // 2),
-                        max_dpo_uses=max_dpo_uses,
+                        max_pref_uses=max_dpo_uses,
                     )
-                    dpo_pair_count = len(dpo_dataset)
+                    kto_row_count = len(kto_dataset)
                     self.logger.event(
-                        "red_dpo_dataset_built",
+                        "red_kto_dataset_built",
                         step=step,
                         attempt=attempt_index,
                         max_length=attempt["max_length"],
-                        pairs=dpo_pair_count,
-                        stats=dpo_stats,
+                        rows=kto_row_count,
+                        stats=kto_stats,
                     )
-                    if len(dpo_dataset) > 0:
-                        dpo_cfg_kwargs: Dict[str, Any] = {
+                    desirable_rows = int(kto_stats.get("desirable_rows") or 0)
+                    undesirable_rows = int(kto_stats.get("undesirable_rows") or 0)
+                    if kto_row_count > 0 and desirable_rows > 0 and undesirable_rows > 0:
+                        kto_cfg_kwargs: Dict[str, Any] = {
                             "output_dir": output_dir,
                             "learning_rate": float(settings.learning_rate),
                             "num_train_epochs": int(settings.epochs),
@@ -735,7 +745,13 @@ class RedUpdater:
                             "gradient_accumulation_steps": int(settings.gradient_accumulation_steps),
                             "max_length": int(attempt["max_length"]),
                             "max_prompt_length": min(1024, int(attempt["max_length"]) // 2),
+                            "max_completion_length": int(attempt["max_length"]) - min(1024, int(attempt["max_length"]) // 2),
                             "beta": float(settings.dpo_beta),
+                            # KTO weights compensate for class imbalance.
+                            # Recommended: desirable_weight * desirable_rows
+                            # ~= undesirable_weight * undesirable_rows.
+                            "desirable_weight": 1.0 if desirable_rows == 0 else float(undesirable_rows) / float(desirable_rows),
+                            "undesirable_weight": 1.0,
                             "logging_steps": int(settings.logging_steps),
                             "save_strategy": "no",
                             "report_to": "none",
@@ -744,27 +760,35 @@ class RedUpdater:
                             "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                             "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
                         }
-                        dpo_cfg = DPOConfig(**_filter_kwargs_for_init(DPOConfig, dpo_cfg_kwargs))
-                        dpo_kwargs: Dict[str, Any] = {
+                        kto_cfg = KTOConfig(**_filter_kwargs_for_init(KTOConfig, kto_cfg_kwargs))
+                        kto_kwargs: Dict[str, Any] = {
                             "model": model,
                             "ref_model": None,
-                            "args": dpo_cfg,
-                            "train_dataset": dpo_dataset,
+                            "args": kto_cfg,
+                            "train_dataset": kto_dataset,
                             "processing_class": session.tokenizer,
                         }
-                        dpo_sig = set(inspect.signature(DPOTrainer.__init__).parameters.keys())
-                        dpo_sig.discard("self")
-                        if "processing_class" not in dpo_sig and "tokenizer" in dpo_sig:
-                            dpo_kwargs["tokenizer"] = dpo_kwargs.pop("processing_class")
-                        dpo_kwargs = {key: value for key, value in dpo_kwargs.items() if key in dpo_sig}
-                        dpo_trainer = DPOTrainer(**dpo_kwargs)
-                        dpo_trainer.train()
-                        model = dpo_trainer.model
+                        kto_sig = set(inspect.signature(KTOTrainer.__init__).parameters.keys())
+                        kto_sig.discard("self")
+                        if "processing_class" not in kto_sig and "tokenizer" in kto_sig:
+                            kto_kwargs["tokenizer"] = kto_kwargs.pop("processing_class")
+                        kto_kwargs = {key: value for key, value in kto_kwargs.items() if key in kto_sig}
+                        kto_trainer = KTOTrainer(**kto_kwargs)
+                        kto_trainer.train()
+                        model = kto_trainer.model
                         session.model = model
-                        release_trainer_memory(dpo_trainer)
-                        dpo_trainer = None
-                        dpo_dataset = None
+                        release_trainer_memory(kto_trainer)
+                        kto_trainer = None
+                        kto_dataset = None
                         clear_cuda_memory()
+                    else:
+                        self.logger.warning(
+                            "red_kto_skip_imbalanced",
+                            step=step,
+                            attempt=attempt_index,
+                            desirable_rows=desirable_rows,
+                            undesirable_rows=undesirable_rows,
+                        )
 
                 save_dir = self.storage.checkpoint_dir("red", step) / "adapter"
                 model.save_pretrained(str(save_dir))
@@ -784,8 +808,8 @@ class RedUpdater:
                     chosen_red_rewards=[_red_reward_from_example(example) for example in chosen_examples],
                     sft_example_ids=[example.example_id for example in sft_examples],
                     rejected_examples=len(rejected_examples),
-                    red_dpo_pairs=dpo_pair_count,
-                    red_dpo_stats=dpo_stats,
+                    red_kto_rows=kto_row_count,
+                    red_kto_stats=kto_stats,
                     recent_episodes=len(recent_episodes),
                     attempt=attempt_index,
                     max_length=attempt["max_length"],
@@ -794,13 +818,13 @@ class RedUpdater:
                 return RedUpdateResult(
                     adapter_path=str(save_dir),
                     sft_example_ids=[example.example_id for example in sft_examples],
-                    dpo_chosen_example_ids=list(dpo_stats.get("chosen_example_ids") or []),
-                    dpo_rejected_example_ids=list(dpo_stats.get("rejected_example_ids") or []),
+                    dpo_chosen_example_ids=list(kto_stats.get("chosen_example_ids") or []),
+                    dpo_rejected_example_ids=list(kto_stats.get("rejected_example_ids") or []),
                 )
             except RuntimeError as exc:
                 if not is_oom_error(exc):
                     raise
-                for trainer in (dpo_trainer, sft_trainer):
+                for trainer in (kto_trainer, sft_trainer):
                     if trainer is not None:
                         try:
                             release_trainer_memory(trainer)
@@ -820,9 +844,9 @@ class RedUpdater:
                         pass
                 session = None
                 sft_trainer = None
-                dpo_trainer = None
+                kto_trainer = None
                 sft_dataset = None
-                dpo_dataset = None
+                kto_dataset = None
                 model = None
                 # The OOM handler above creates a `for trainer in (...)` loop
                 # whose variable persists in this scope and would otherwise

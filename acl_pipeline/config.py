@@ -65,6 +65,7 @@ class JudgeExample:
     expected_task_quality: float
     expected_task_is_valid_for_socratic: bool
     expected_hint_is_valid_for_socratic: bool
+    expected_hint_paraphrases_solution: bool = False
     explanation: str = ""
 
 
@@ -397,6 +398,7 @@ def _judge_examples(payload: Optional[List[Dict[str, Any]]]) -> List[JudgeExampl
                 expected_task_quality=float(row.get("expected_task_quality", 5.0)),
                 expected_task_is_valid_for_socratic=bool(row.get("expected_task_is_valid_for_socratic", True)),
                 expected_hint_is_valid_for_socratic=bool(row.get("expected_hint_is_valid_for_socratic", True)),
+                expected_hint_paraphrases_solution=bool(row.get("expected_hint_paraphrases_solution", False)),
                 explanation=str(row.get("explanation") or ""),
             )
         )

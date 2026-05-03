@@ -59,6 +59,11 @@ class AdversarialCurriculumPipeline:
         self.socratic_dpo_updater = SocraticDpoUpdater(config, self.model_pool, self.storage, self.logger)
         self.rng = random.Random(config.runtime.seed)
         self._red_adapter_failed_last_iteration = False
+        # Counts consecutive iterations where the LoRA-adapted Red came up
+        # short on valid tasks. We only reset the adapter to base after 2 in
+        # a row (or one severe shortfall), to avoid wiping every fragile
+        # adapter on a single noisy iteration.
+        self._red_adapter_shortfall_streak = 0
         self._red_rejections_by_iteration: Dict[int, List[RedRejectedExample]] = {}
 
         pointers = self.storage.load_pointers()
@@ -1127,27 +1132,63 @@ class AdversarialCurriculumPipeline:
         prompt: Optional[str] = None,
         allowed_stages: Optional[set[str]] = None,
     ) -> Optional[RedRejectedExample]:
+        # Two-pass match: first try exact prompt equality (preserves prior
+        # paired chosen/rejected behavior), then fall back to a relaxed match
+        # by topic + target_function + (optional) stage. Most rejections never
+        # had matching prompt strings because chosen/rejected come from
+        # different stages or repaired prompts, dropping them from DPO.
         prompt_text = str(prompt or "").strip()
-        for payload in episode.task.metadata.get("red_direct_rejections") or []:
+        episode_topic = str(getattr(episode.task, "topic", "") or "").strip().lower()
+        episode_spec = dict(episode.task.metadata.get("red_spec") or {})
+        episode_target_fn = str(episode_spec.get("target_function") or "").strip().lower()
+        rejection_payloads = list(episode.task.metadata.get("red_direct_rejections") or [])
+
+        def _is_trainable(rejected: RedRejectedExample, metadata: Dict[str, Any]) -> bool:
+            if self._is_trainable_red_dpo_rejection(rejected.rejection_reason):
+                return True
+            if self._is_trainable_red_dpo_rejection(metadata.get("rejection_reason")):
+                return True
+            if self._is_trainable_red_dpo_rejection(metadata.get("red_rejection_reason")):
+                return True
+            for reason in metadata.get("validation_reasons") or []:
+                if self._is_trainable_red_dpo_rejection(reason):
+                    return True
+            if str(metadata.get("execution_status") or "").strip().lower() == "passed":
+                return True
+            return False
+
+        # Pass 1: exact prompt match (legacy behavior).
+        if prompt_text:
+            for payload in rejection_payloads:
+                try:
+                    rejected = RedRejectedExample(**payload)
+                except Exception:
+                    continue
+                metadata = dict(rejected.metadata or {})
+                if str(rejected.prompt or "").strip() != prompt_text:
+                    continue
+                if allowed_stages is not None and str(metadata.get("stage") or "") not in allowed_stages:
+                    continue
+                if _is_trainable(rejected, metadata):
+                    return rejected
+
+        # Pass 2: relaxed match on (topic, target_function), optional stage.
+        for payload in rejection_payloads:
             try:
                 rejected = RedRejectedExample(**payload)
             except Exception:
                 continue
             metadata = dict(rejected.metadata or {})
-            if prompt_text and str(rejected.prompt or "").strip() != prompt_text:
-                continue
             if allowed_stages is not None and str(metadata.get("stage") or "") not in allowed_stages:
                 continue
-            if self._is_trainable_red_dpo_rejection(rejected.rejection_reason):
-                return rejected
-            if self._is_trainable_red_dpo_rejection(metadata.get("rejection_reason")):
-                return rejected
-            if self._is_trainable_red_dpo_rejection(metadata.get("red_rejection_reason")):
-                return rejected
-            for reason in metadata.get("validation_reasons") or []:
-                if self._is_trainable_red_dpo_rejection(reason):
-                    return rejected
-            if str(metadata.get("execution_status") or "").strip().lower() == "passed":
+            rejected_topic = str(rejected.topic or "").strip().lower()
+            if episode_topic and rejected_topic and rejected_topic != episode_topic:
+                continue
+            rejected_spec = dict(rejected.spec or metadata.get("red_spec") or {})
+            rejected_target_fn = str(rejected_spec.get("target_function") or "").strip().lower()
+            if episode_target_fn and rejected_target_fn and rejected_target_fn != episode_target_fn:
+                continue
+            if _is_trainable(rejected, metadata):
                 return rejected
         return None
 
@@ -1679,21 +1720,44 @@ class AdversarialCurriculumPipeline:
             and self._using_non_base_red_adapter()
         ):
             missing = target_count - len(result_items)
-            self._handle_red_adapter_failure(
-                iteration_index,
-                len(result_items),
-                reason="too_few_valid_red_tasks",
-            )
-            fallback_items = self._generate_iteration_tasks(missing, iteration_index)
-            result_items.extend(fallback_items)
+            # Reset adapter only on (a) severe shortfall (<40% of target) or
+            # (b) two consecutive shortfalls. Single mild shortfalls (eg. 5/6
+            # tasks accepted) used to wipe useful LoRA weights and produced
+            # the doom loop where Red never accumulated learning.
+            target = max(1, int(target_count))
+            severe_threshold = max(1, int(target * 0.4))
+            self._red_adapter_shortfall_streak += 1
+            severe = len(result_items) < severe_threshold
+            should_reset = severe or self._red_adapter_shortfall_streak >= 2
             self.logger.warning(
-                "red_generation_base_fallback_fill",
+                "red_generation_shortfall",
                 iteration=iteration_index,
-                adapter_generated_tasks=len(final_requests),
-                accepted_before_fallback=len(result_items) - len(fallback_items),
-                fallback_tasks=len(fallback_items),
-                requested_tasks=target_count,
+                accepted=len(result_items),
+                target=target,
+                missing=missing,
+                shortfall_streak=self._red_adapter_shortfall_streak,
+                severe=severe,
+                will_reset_adapter=should_reset,
             )
+            if should_reset:
+                self._handle_red_adapter_failure(
+                    iteration_index,
+                    len(result_items),
+                    reason=("severe_red_task_shortfall" if severe else "consecutive_red_task_shortfalls"),
+                )
+                self._red_adapter_shortfall_streak = 0
+                fallback_items = self._generate_iteration_tasks(missing, iteration_index)
+                result_items.extend(fallback_items)
+                self.logger.warning(
+                    "red_generation_base_fallback_fill",
+                    iteration=iteration_index,
+                    adapter_generated_tasks=len(final_requests),
+                    accepted_before_fallback=len(result_items) - len(fallback_items),
+                    fallback_tasks=len(fallback_items),
+                    requested_tasks=target_count,
+                )
+        else:
+            self._red_adapter_shortfall_streak = 0
         self.logger.event(
             "iteration_red_generation_complete",
             iteration=iteration_index,

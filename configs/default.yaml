@@ -169,10 +169,103 @@ judge:
         socratic_style: 1
         technical_accuracy: 2
       expected_no_solution_reveal: false
+      expected_hint_paraphrases_solution: true
       expected_task_quality: 8
       expected_task_is_valid_for_socratic: true
       expected_hint_is_valid_for_socratic: false
       explanation: "Starts with 'Solution:' and 'let's debug', then states the fix. Not Socratic. Style is the lowest."
+
+    # Anti-example: paraphrased solution leak phrased as a question (closure capture)
+    - statement: "Build a list of N callbacks; each callback should return its own index."
+      code: |
+        def build_callbacks(n):
+            funcs = []
+            for i in range(n):
+                funcs.append(lambda: i)
+            return funcs
+        cbs = build_callbacks(3)
+        assert [cb() for cb in cbs] == [0, 1, 2]
+      observed_failure: "AssertionError: assert [2, 2, 2] == [0, 1, 2]"
+      hint_text: "Could the issue be that the lambda is capturing the loop variable i by reference instead of by value, so all callbacks see the same final i?"
+      expected_criteria_scores:
+        bug_localization: 3
+        usefulness: 3
+        socratic_style: 2
+        technical_accuracy: 7
+      expected_no_solution_reveal: false
+      expected_hint_paraphrases_solution: true
+      expected_task_quality: 9
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Phrased as a question, but it states the cause (late-binding capture) and implies the fix. Paraphrased solution leak; style ≤3."
+
+    # Anti-example: paraphrased operator suggestion as a question
+    - statement: "Return the average of a list as a float."
+      code: |
+        def average(nums):
+            return sum(nums) // len(nums)
+        assert average([1, 2]) == 1.5
+      observed_failure: "AssertionError: assert 1 == 1.5"
+      hint_text: "Is the function using integer division when it should be using regular division on the failing input?"
+      expected_criteria_scores:
+        bug_localization: 3
+        usefulness: 3
+        socratic_style: 3
+        technical_accuracy: 6
+      expected_no_solution_reveal: false
+      expected_hint_paraphrases_solution: true
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Names the wrong operator (integer division) and the right one (regular division). Paraphrased fix even though it ends with a question mark."
+
+    # Good Socratic two-step nudge that does not leak
+    - statement: "Sum positive numbers in a list, ignoring negatives."
+      code: |
+        def sum_positive(nums):
+            total = 0
+            for n in nums:
+                if n > 0:
+                    total = n
+            return total
+        assert sum_positive([1, 2, 3]) == 6
+      observed_failure: "AssertionError: assert 3 == 6"
+      hint_text: "Trace `total` across the loop on the failing input: what value does it hold after the first iteration, and what value after the second? How does that compare to what the test expects?"
+      expected_criteria_scores:
+        bug_localization: 9
+        usefulness: 9
+        socratic_style: 9
+        technical_accuracy: 9
+      expected_no_solution_reveal: true
+      expected_hint_paraphrases_solution: false
+      expected_task_quality: 9
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Asks the student to trace the actual buggy variable on the failing input. Specific and grounded, no fix named."
+
+    # Off-target hint: right topic, wrong bug
+    - statement: "Get the maximum element of a list."
+      code: |
+        def max_value(nums):
+            best = nums[0]
+            for n in nums[1:]:
+                if n > best:
+                    best = n
+            return best
+        assert max_value([]) == 0
+      observed_failure: "IndexError: list index out of range"
+      hint_text: "What does the comparison `n > best` do when the elements come in different orders, and could that affect which value is kept?"
+      expected_criteria_scores:
+        bug_localization: 2
+        usefulness: 3
+        socratic_style: 6
+        technical_accuracy: 3
+      expected_no_solution_reveal: true
+      expected_hint_paraphrases_solution: false
+      expected_task_quality: 7
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Hint targets ordering inside the loop, but the actual error is `nums[0]` on an empty list. Off-target: low localization and accuracy."
 
     # Anti-example: hallucinated bug on a passed task
     - statement: "Check if a number is even."
@@ -262,6 +355,7 @@ judge:
         socratic_style: 0
         technical_accuracy: 2
       expected_no_solution_reveal: false
+      expected_hint_paraphrases_solution: true
       expected_task_quality: 8
       expected_task_is_valid_for_socratic: true
       expected_hint_is_valid_for_socratic: false

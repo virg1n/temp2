@@ -362,6 +362,7 @@ def build_judge_guided_json_schema(expected_count: int) -> Dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "no_solution_reveal": {"type": "boolean"},
+            "hint_paraphrases_solution": {"type": "boolean"},
             "bug_localization": {"type": "integer", "minimum": 0, "maximum": 10},
             "usefulness": {"type": "integer", "minimum": 0, "maximum": 10},
             "socratic_style": {"type": "integer", "minimum": 0, "maximum": 10},
@@ -374,6 +375,7 @@ def build_judge_guided_json_schema(expected_count: int) -> Dict[str, Any]:
         },
         "required": [
             "no_solution_reveal",
+            "hint_paraphrases_solution",
             "bug_localization",
             "usefulness",
             "socratic_style",
@@ -449,8 +451,13 @@ def build_judge_batch_messages(
         "If the broken code/task is mindless, contradictory, already correct, unsolvable from the given information, or otherwise poor Red output, mark task_is_valid_for_socratic false.\n"
         "If the task is fine but the hint is confusing, hallucinated, generic, malformed, or otherwise poor tutoring, keep task_is_valid_for_socratic true and mark hint_is_valid_for_socratic false.\n"
         "Do not mark a valid task as invalid just because the hint is bad.\n"
+        "Paraphrased solution leaks: a hint that names the cause, the fix, the wrong operator/branch/state, or the corrected behavior is leaking the solution even when phrased as a question.\n"
+        "Examples of paraphrased leaks: 'Could the issue be that variable X is captured by reference instead of copied?', 'Specifically with the way the loop variable i is being captured', 'Is the condition checking >= when it should check >?', 'Could it be that you increment hits instead of misses on the miss path?'.\n"
+        "Examples of NOT leaks: 'What value does total hold after the second call?', 'On the failing input, which branch does the code take?', 'Trace the value of i across iterations and compare to what the test expects.'.\n"
+        "If the hint paraphrases the bug or fix in any of these ways, set hint_paraphrases_solution=true, force socratic_style<=3 and no_solution_reveal=false. Set hint_paraphrases_solution=false only if the hint asks the student to investigate without naming the cause.\n"
         "Return one JSON object per item with these fields. Criterion scores are integers 0-10; do NOT use true/false for score fields:\n"
         "- no_solution_reveal: boolean (true = no solution leak; false = solution leak detected)\n"
+        "- hint_paraphrases_solution: boolean (true = the hint names the cause, fix, wrong operator/branch/state, or corrected behavior, even when phrased as a question)\n"
         "- bug_localization: integer 0-10\n"
         "- usefulness: integer 0-10\n"
         "- socratic_style: integer 0-10\n"
@@ -492,6 +499,7 @@ def _judge_example_turns(example: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
     }
     example_output = {
         "no_solution_reveal": bool(getattr(example, "expected_no_solution_reveal", True)),
+        "hint_paraphrases_solution": bool(getattr(example, "expected_hint_paraphrases_solution", False)),
         "bug_localization": int(float(criteria.get("bug_localization", 0))),
         "usefulness": int(float(criteria.get("usefulness", 0))),
         "socratic_style": int(float(criteria.get("socratic_style", 0))),
