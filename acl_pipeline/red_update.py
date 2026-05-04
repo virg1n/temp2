@@ -895,6 +895,7 @@ class RedUpdater:
                 model.save_pretrained(str(save_dir))
                 session.tokenizer.save_pretrained(str(save_dir))
                 self.storage.prune_role_checkpoints("red")
+                self.storage.prune_role_checkpoints("red_tmp")
                 self.logger.event(
                     "red_update_complete",
                     step=step,

@@ -207,6 +207,7 @@ class SocraticGrpoUpdater:
 
             release_trainer_memory(trainer)
             self.storage.prune_role_checkpoints("socratic")
+            self.storage.prune_role_checkpoints("socratic_tmp")
             self.logger.event(
                 "socratic_grpo_complete",
                 step=step,

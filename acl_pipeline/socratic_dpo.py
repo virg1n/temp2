@@ -351,7 +351,22 @@ class SocraticDpoUpdater:
             trainer.train()
 
             save_root = self.storage.checkpoint_dir("socratic", step)
-            if settings.full_ft or not hasattr(trainer.model, "peft_config"):
+            # After trainer.train() the model may be wrapped by Accelerate
+            # (DDP/FSDP/DeepSpeed), in which case `trainer.model.peft_config`
+                # is hidden behind `.module`. Unwrap before checking, otherwise
+            # we accidentally fall into the full-model save path and dump a
+            # 3.4 GB Qwen3-1.7B checkpoint each DPO step instead of a small
+            # LoRA adapter — which fills the disk quota in a few iterations.
+            wrapped = trainer.model
+            unwrapped = wrapped
+            for attr in ("module", "base_model"):
+                if not hasattr(unwrapped, "peft_config") and hasattr(unwrapped, attr):
+                    unwrapped = getattr(unwrapped, attr)
+            has_peft = hasattr(wrapped, "peft_config") or hasattr(unwrapped, "peft_config")
+            use_full_model_save = bool(settings.full_ft) or (
+                not self.config.socratic.lora.enabled and not has_peft
+            )
+            if use_full_model_save:
                 model_dir = save_root / "model"
                 trainer.save_model(str(model_dir))
                 session.tokenizer.save_pretrained(str(model_dir))
@@ -362,7 +377,8 @@ class SocraticDpoUpdater:
                 )
             else:
                 adapter_dir = save_root / "adapter"
-                trainer.model.save_pretrained(str(adapter_dir))
+                target = wrapped if hasattr(wrapped, "peft_config") else unwrapped
+                target.save_pretrained(str(adapter_dir))
                 session.tokenizer.save_pretrained(str(adapter_dir))
                 result = SocraticDpoUpdateResult(
                     model_source=model_source,
@@ -377,6 +393,7 @@ class SocraticDpoUpdater:
             model = None
             clear_cuda_memory()
             self.storage.prune_role_checkpoints("socratic")
+            self.storage.prune_role_checkpoints("socratic_tmp")
             self.logger.event(
                 "socratic_dpo_complete",
                 step=step,
