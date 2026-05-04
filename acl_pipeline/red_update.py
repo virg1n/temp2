@@ -38,14 +38,20 @@ except Exception:  # noqa: BLE001
         raise RuntimeError("TRL with SFT support is required for Red updates.") from exc
 
 try:
-    from trl import KTOConfig, KTOTrainer
+    # KTO was promoted to trl.experimental in TRL 0.x; importing from there
+    # avoids the FutureWarning emitted by the trl.trainer wrapper. Fall back
+    # to the legacy import path for older TRL versions.
+    from trl.experimental.kto import KTOConfig, KTOTrainer
 except Exception:  # noqa: BLE001
     try:
-        from trl.trainer.kto_config import KTOConfig
-        from trl.trainer.kto_trainer import KTOTrainer
+        from trl import KTOConfig, KTOTrainer
     except Exception:  # noqa: BLE001
-        KTOConfig = None
-        KTOTrainer = None
+        try:
+            from trl.trainer.kto_config import KTOConfig
+            from trl.trainer.kto_trainer import KTOTrainer
+        except Exception:  # noqa: BLE001
+            KTOConfig = None
+            KTOTrainer = None
 
 
 @dataclass
@@ -453,7 +459,13 @@ def _build_kto_dataset(
         chosen_example_ids.append(chosen_id)
         chosen_local_uses[chosen_id] = chosen_extra_uses + 1
 
-    for rejected in rejected_examples:
+    # Iterate newest-first. Storage appends rejections in chronological
+    # order, so reversed() gives the most recent first. Recent rejections
+    # reflect Red's *current* failure modes (e.g., the 'buggy_too_correct'
+    # patterns the latest adapter is producing) and are the most informative
+    # negatives. Iterating in append order let stale rejections eat the
+    # budget while the freshest signal sat at the tail.
+    for rejected in reversed(list(rejected_examples)):
         if sum(1 for row in rows if not row.get("label")) >= undesirable_budget:
             break
         if not _rejected_example_is_trainable_for_red_dpo(rejected):
@@ -612,15 +624,25 @@ class RedUpdater:
             return RedUpdateResult(adapter_path=adapter_path, skipped_reason=reason)
 
         full_context_length = max(1024, int(settings.max_length))
+        half_context_length = max(768, full_context_length // 2)
+        configured_per_device = max(1, int(getattr(settings, "per_device_batch_size", 1)))
+        # Three-stage fallback: full-ctx KTO → half-ctx KTO → SFT-only at
+        # half ctx. Previously the second stage disabled KTO entirely, which
+        # discarded the highest-value training step on a single OOM.
         attempts = [
             {
                 "max_length": full_context_length,
-                "per_device_batch_size": 1,
+                "per_device_batch_size": configured_per_device,
                 "kto_enabled": settings.dpo_enabled,
             },
             {
-                "max_length": max(768, full_context_length // 2),
-                "per_device_batch_size": 1,
+                "max_length": half_context_length,
+                "per_device_batch_size": configured_per_device,
+                "kto_enabled": settings.dpo_enabled,
+            },
+            {
+                "max_length": half_context_length,
+                "per_device_batch_size": configured_per_device,
                 "kto_enabled": False,
             },
         ]
@@ -737,15 +759,39 @@ class RedUpdater:
                     desirable_rows = int(kto_stats.get("desirable_rows") or 0)
                     undesirable_rows = int(kto_stats.get("undesirable_rows") or 0)
                     if kto_row_count > 0 and desirable_rows > 0 and undesirable_rows > 0:
+                        # KTO requires per-device batch >= 2 (the KL term is
+                        # estimated from in-batch shuffled samples; with
+                        # batch=1 KL collapses to the implied reward and the
+                        # trainer raises). Keep the effective batch size
+                        # constant by halving gradient_accumulation_steps
+                        # whenever we promote the per-device batch.
+                        sft_per_device = max(1, int(attempt["per_device_batch_size"]))
+                        kto_per_device = max(2, sft_per_device)
+                        accum_steps = max(1, int(settings.gradient_accumulation_steps))
+                        if kto_per_device > sft_per_device:
+                            accum_steps = max(1, accum_steps // (kto_per_device // sft_per_device))
+                        # Tight completion cap. Red completions in the
+                        # KTO buffer are short Python programs (observed
+                        # max ~400 tokens). The previous setting allocated
+                        # max_length - max_prompt_length (≈3000+ tokens),
+                        # which dominated KTO's activation footprint and
+                        # was the practical OOM driver. 768 covers all
+                        # observed completions with margin while shrinking
+                        # the pad-to-max activation peak roughly 4×.
+                        kto_max_prompt_length = min(1024, int(attempt["max_length"]) // 2)
+                        kto_max_completion_length = min(
+                            768,
+                            int(attempt["max_length"]) - kto_max_prompt_length,
+                        )
                         kto_cfg_kwargs: Dict[str, Any] = {
                             "output_dir": output_dir,
                             "learning_rate": float(settings.learning_rate),
                             "num_train_epochs": int(settings.epochs),
-                            "per_device_train_batch_size": int(attempt["per_device_batch_size"]),
-                            "gradient_accumulation_steps": int(settings.gradient_accumulation_steps),
-                            "max_length": int(attempt["max_length"]),
-                            "max_prompt_length": min(1024, int(attempt["max_length"]) // 2),
-                            "max_completion_length": int(attempt["max_length"]) - min(1024, int(attempt["max_length"]) // 2),
+                            "per_device_train_batch_size": kto_per_device,
+                            "gradient_accumulation_steps": accum_steps,
+                            "max_length": kto_max_prompt_length + kto_max_completion_length,
+                            "max_prompt_length": kto_max_prompt_length,
+                            "max_completion_length": kto_max_completion_length,
                             "beta": float(settings.dpo_beta),
                             # KTO weights compensate for class imbalance.
                             # Recommended: desirable_weight * desirable_rows
@@ -757,8 +803,19 @@ class RedUpdater:
                             "report_to": "none",
                             "optim": "adamw_torch",
                             "gradient_checkpointing": True,
+                            # KTO does two forward passes per step (policy +
+                            # shuffled-prompt KL). The default reentrant
+                            # gradient checkpointer cannot match its saved
+                            # activations against the second forward's
+                            # recomputed ones (different shapes), raising
+                            # CheckpointError. Non-reentrant checkpointing
+                            # handles this correctly.
+                            "gradient_checkpointing_kwargs": {"use_reentrant": False},
                             "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                             "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
+                            # DPODataCollatorWithPadding requires this; TRL
+                            # would set it itself with a warning. Silence.
+                            "remove_unused_columns": False,
                         }
                         kto_cfg = KTOConfig(**_filter_kwargs_for_init(KTOConfig, kto_cfg_kwargs))
                         kto_kwargs: Dict[str, Any] = {
@@ -768,11 +825,18 @@ class RedUpdater:
                             "train_dataset": kto_dataset,
                             "processing_class": session.tokenizer,
                         }
-                        kto_sig = set(inspect.signature(KTOTrainer.__init__).parameters.keys())
-                        kto_sig.discard("self")
-                        if "processing_class" not in kto_sig and "tokenizer" in kto_sig:
-                            kto_kwargs["tokenizer"] = kto_kwargs.pop("processing_class")
-                        kto_kwargs = {key: value for key, value in kto_kwargs.items() if key in kto_sig}
+                        # In current TRL, KTOTrainer is re-exported from
+                        # trl.experimental.kto via a thin (*args, **kwargs)
+                        # wrapper; inspecting that wrapper would yield only
+                        # {"args","kwargs"}, and naive filtering would drop
+                        # train_dataset/model. Use _allowed_init_params which
+                        # returns None for variadic signatures, and pass
+                        # kwargs through unchanged in that case.
+                        kto_allowed = _allowed_init_params(KTOTrainer)
+                        if kto_allowed is not None:
+                            if "processing_class" not in kto_allowed and "tokenizer" in kto_allowed:
+                                kto_kwargs["tokenizer"] = kto_kwargs.pop("processing_class")
+                            kto_kwargs = {key: value for key, value in kto_kwargs.items() if key in kto_allowed}
                         kto_trainer = KTOTrainer(**kto_kwargs)
                         kto_trainer.train()
                         model = kto_trainer.model

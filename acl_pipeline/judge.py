@@ -667,8 +667,11 @@ class JudgeService:
         p10 = _percentile(0.10)
         p90 = _percentile(0.90)
         spread = p90 - p10
-        if spread <= 1e-3:
-            # Nothing to stretch yet; pass raw scores through clamped.
+        # Require at least one full point of spread before stretching;
+        # otherwise a window of mostly-zero (paraphrase-multiplied) values
+        # will map any single non-zero outlier to ~10 just because it sits
+        # above a near-degenerate p90. Below that, fall through to clamped.
+        if spread < 1.0:
             return [max(0.0, min(10.0, float(score))) for score in pre_normalize_scores]
 
         post_scores: List[float] = []
@@ -1132,7 +1135,17 @@ class JudgeService:
         post_normalize_scores = self._normalize_post_scores(pre_normalize_scores)
         adjusted_scores = self._apply_batch_spread(post_normalize_scores) if apply_batch_spread else list(post_normalize_scores)
         for index, (corruption, features, assessment, gate) in enumerate(zip(corruption_flags, quality_features, assessments, hard_gates)):
-            if corruption["is_corrupted"] or features["severe_hint_failure"] or gate.get("forced_score") == 0.0:
+            # Also zero out paraphrased solution leaks. Without this, the
+            # 0.1 multiplier alone is not enough — percentile rescaling can
+            # amplify a 0.6 score back up to ~10 when the recent window is
+            # full of similarly-multiplied low values, which would actually
+            # *reward* a leaked hint.
+            if (
+                corruption["is_corrupted"]
+                or features["severe_hint_failure"]
+                or gate.get("forced_score") == 0.0
+                or gate.get("hint_paraphrases_solution")
+            ):
                 raw_unclamped_scores[index] = 0.0
                 pre_normalize_scores[index] = 0.0
                 post_normalize_scores[index] = 0.0
