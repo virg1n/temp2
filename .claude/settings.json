@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(awk ' *)"
+      "Bash(awk ' *)",
+      "Read(//c/Users/bogda/.claude/projects/c--Users-bogda-github-temp2/**)"
     ]
   }
 }

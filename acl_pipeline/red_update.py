@@ -783,6 +783,33 @@ class RedUpdater:
                             768,
                             int(attempt["max_length"]) - kto_max_prompt_length,
                         )
+                        # Force non-reentrant gradient checkpointing on the
+                        # model directly before KTO. The model arrives here
+                        # with reentrant checkpoint hooks already installed
+                        # by load (prepare_model_for_kbit_training +
+                        # gradient_checkpointing_enable with default kwargs)
+                        # and reaffirmed by SFTTrainer.train(). Letting
+                        # KTOConfig.gradient_checkpointing=True re-enable
+                        # via Trainer does not reliably replace those hooks
+                        # on a PEFT-wrapped model — the previously-bound
+                        # functools.partial(checkpoint, use_reentrant=True)
+                        # stays attached to the wrapped modules, so KTO's
+                        # second forward pass (reference logps with adapter
+                        # disabled) hits a reentrant recompute mismatch and
+                        # raises CheckpointError. Disable+re-enable here so
+                        # the kwargs definitely land, then tell the trainer
+                        # not to touch GC at all.
+                        if hasattr(model, "gradient_checkpointing_disable"):
+                            try:
+                                model.gradient_checkpointing_disable()
+                            except Exception:
+                                pass
+                        if hasattr(model, "gradient_checkpointing_enable"):
+                            model.gradient_checkpointing_enable(
+                                gradient_checkpointing_kwargs={"use_reentrant": False}
+                            )
+                        if hasattr(model, "config"):
+                            model.config.use_cache = False
                         kto_cfg_kwargs: Dict[str, Any] = {
                             "output_dir": output_dir,
                             "learning_rate": float(settings.learning_rate),
@@ -802,20 +829,30 @@ class RedUpdater:
                             "save_strategy": "no",
                             "report_to": "none",
                             "optim": "adamw_torch",
-                            "gradient_checkpointing": True,
-                            # KTO does two forward passes per step (policy +
-                            # shuffled-prompt KL). The default reentrant
-                            # gradient checkpointer cannot match its saved
-                            # activations against the second forward's
-                            # recomputed ones (different shapes), raising
-                            # CheckpointError. Non-reentrant checkpointing
-                            # handles this correctly.
-                            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+                            # GC is enabled manually above with
+                            # use_reentrant=False; keep the trainer from
+                            # re-enabling and clobbering those hooks.
+                            "gradient_checkpointing": False,
                             "bf16": bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
                             "fp16": bool(torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
                             # DPODataCollatorWithPadding requires this; TRL
                             # would set it itself with a warning. Silence.
                             "remove_unused_columns": False,
+                            # Avoid the disable_adapter() toggle during
+                            # every training step. With ref_model=None on a
+                            # PEFT model, KTOTrainer normally flips LoRA
+                            # off/on each step to compute reference logps;
+                            # combined with gradient checkpointing this
+                            # produces a forward graph at recompute time
+                            # that doesn't match the one captured during
+                            # the original forward (different number/shape
+                            # of saved tensors), raising CheckpointError on
+                            # backward. Precomputing ref logps once up
+                            # front (no_grad pass with adapter disabled)
+                            # caches them on the dataset, so every training
+                            # step is adapter-on only and the checkpoint
+                            # tape is stable.
+                            "precompute_ref_log_probs": True,
                         }
                         kto_cfg = KTOConfig(**_filter_kwargs_for_init(KTOConfig, kto_cfg_kwargs))
                         kto_kwargs: Dict[str, Any] = {

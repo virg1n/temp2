@@ -67,7 +67,7 @@ socratic:
   model_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/
   tokenizer_name_or_path: /home/jovyan/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/
   base_adapter_path:
-  quantization: 8bit
+  quantization: 
   enable_thinking: false
   hardware:
     gpu_ids: [1]
@@ -82,7 +82,7 @@ socratic:
     do_sample: true
     repetition_penalty: 1.05
   lora:
-    enabled: true
+    enabled: false
     r: 64
     alpha: 128
     dropout: 0.05
@@ -130,7 +130,7 @@ socratic:
     bf16: true
     fp16: false
     gradient_checkpointing: true
-    full_ft: false
+    full_ft: true
     max_uses_per_preference: 3
 
 judge:

@@ -31,9 +31,6 @@ RED_SYSTEM_PROMPT = (
 def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
     observed = (task.observed_failure() or "").strip()
     parts: List[str] = []
-    statement = (task.statement or "").strip()
-    if statement:
-        parts.append("## Task\n" + statement)
     parts.append("## Code\n```python\n" + task.combined_program().rstrip() + "\n```")
     parts.append("## Error\n```text\n" + (observed if observed else "None") + "\n```")
     parts.append(
