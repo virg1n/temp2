@@ -140,6 +140,9 @@ class SocraticDpoSettings:
     warmup_ratio: float = 0.03
     weight_decay: float = 0.0
     beta: float = 0.1
+    loss_type: str = "sigmoid"
+    rpo_alpha: float = 0.0
+    label_smoothing: float = 0.0
     max_length: int = 2048
     max_prompt_length: int = 1536
     logging_steps: int = 10
@@ -186,10 +189,18 @@ class RoleConfig:
 
 
 @dataclass
+class SocraticDiversitySettings:
+    enabled: bool = False
+    candidate_overrides: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_focus_salts: List[str] = field(default_factory=list)
+
+
+@dataclass
 class SocraticConfig(RoleConfig):
     training_method: str = "grpo"
     grpo: SocraticGrpoSettings = field(default_factory=SocraticGrpoSettings)
     dpo: SocraticDpoSettings = field(default_factory=SocraticDpoSettings)
+    candidate_diversity: SocraticDiversitySettings = field(default_factory=SocraticDiversitySettings)
 
 
 @dataclass
@@ -339,6 +350,9 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
         warmup_ratio=float(payload.get("warmup_ratio", 0.03)),
         weight_decay=float(payload.get("weight_decay", 0.0)),
         beta=float(payload.get("beta", 0.1)),
+        loss_type=str(payload.get("loss_type", "sigmoid")).strip().lower(),
+        rpo_alpha=float(payload.get("rpo_alpha", 0.0)),
+        label_smoothing=float(payload.get("label_smoothing", 0.0)),
         max_length=int(payload.get("max_length", 2048)),
         max_prompt_length=int(payload.get("max_prompt_length", 1536)),
         logging_steps=int(payload.get("logging_steps", 10)),
@@ -442,6 +456,22 @@ def _role(payload: Dict[str, Any]) -> RoleConfig:
     )
 
 
+def _socratic_diversity(payload: Optional[Dict[str, Any]]) -> SocraticDiversitySettings:
+    payload = dict(payload or {})
+    overrides_raw = payload.get("candidate_overrides") or []
+    overrides: List[Dict[str, Any]] = []
+    for entry in overrides_raw:
+        if isinstance(entry, dict):
+            overrides.append({str(k): v for k, v in entry.items()})
+    salts_raw = payload.get("candidate_focus_salts") or []
+    salts: List[str] = [str(item) for item in salts_raw if str(item).strip()]
+    return SocraticDiversitySettings(
+        enabled=bool(payload.get("enabled", False)),
+        candidate_overrides=overrides,
+        candidate_focus_salts=salts,
+    )
+
+
 def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
     base = _role(payload)
     training_method = str(payload.get("training_method", "grpo")).strip().lower()
@@ -459,6 +489,7 @@ def _socratic_role(payload: Dict[str, Any]) -> SocraticConfig:
         training_method=training_method,
         grpo=_socratic_grpo(payload.get("grpo")),
         dpo=_socratic_dpo(payload.get("dpo")),
+        candidate_diversity=_socratic_diversity(payload.get("candidate_diversity")),
     )
 
 

@@ -28,7 +28,11 @@ RED_SYSTEM_PROMPT = (
     "Do not include explanations outside the requested plain-text or code output."
 )
 
-def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
+def build_socratic_messages(
+    task: PythonTask,
+    *,
+    focus_salt: Optional[str] = None,
+) -> List[Dict[str, str]]:
     observed = (task.observed_failure() or "").strip()
     parts: List[str] = []
     parts.append("## Code\n```python\n" + task.combined_program().rstrip() + "\n```")
@@ -39,8 +43,11 @@ def build_socratic_messages(task: PythonTask) -> List[Dict[str, str]]:
         "If the error says no failure was reproduced, state that there may be no error in this run and ask what to verify next."
     )
     user_prompt = "\n\n".join(parts).strip() + "\n"
+    system_content = SOCRATIC_SYSTEM_PROMPT
+    if focus_salt and str(focus_salt).strip():
+        system_content = system_content + " " + str(focus_salt).strip()
     return [
-        {"role": "system", "content": SOCRATIC_SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_prompt},
     ]
 

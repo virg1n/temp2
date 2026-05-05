@@ -81,6 +81,24 @@ socratic:
     top_p: 1.0
     do_sample: true
     repetition_penalty: 1.05
+  # Per-candidate diversification of Socratic hints used for DPO ranking.
+  # When enabled, each of the N hint candidates is generated with its own
+  # sampling config and a focus salt appended to the system prompt, so
+  # candidates explore different bug-localization angles instead of
+  # collapsing into one hint family. Falls back to built-in defaults when
+  # candidate_overrides / candidate_focus_salts are empty.
+  candidate_diversity:
+    enabled: true
+    candidate_overrides:
+      - {temperature: 0.7, top_p: 0.9, repetition_penalty: 1.0}
+      - {temperature: 1.0, top_p: 0.95, repetition_penalty: 1.05}
+      - {temperature: 1.3, top_p: 1.0, repetition_penalty: 1.10}
+      - {temperature: 1.0, top_p: 1.0, repetition_penalty: 1.15}
+    candidate_focus_salts:
+      - "Focus your questions on data flow: the inputs, intermediate values, and what each computation produces."
+      - "Focus your questions on control flow: which branch is taken, how loops terminate, how exceptions propagate."
+      - "Focus your questions on state and mutation: what is changed when, and how aliasing or shared references could affect it."
+      - "Focus your questions on the failing assertion: what value the test expects versus what the code actually produces, and where they first diverge."
   lora:
     enabled: true
     r: 64
@@ -114,7 +132,7 @@ socratic:
     max_training_pairs: 128
     num_hint_candidates: 4
     max_pairs_per_task: 2
-    min_score_gap: 0.10
+    min_score_gap: 0.4
     learning_rate: 3.0e-5
     epochs: 1
     per_device_batch_size: 1
@@ -122,6 +140,15 @@ socratic:
     warmup_ratio: 0.03
     weight_decay: 0.0
     beta: 0.1
+    # DPO loss variant. Options (TRL): sigmoid (classic DPO), ipo (IPO,
+    # robust to small/noisy margins), hinge, robust, bco_pair. IPO is a
+    # good default when Judge scores cluster tightly across candidates.
+    loss_type: ipo
+    # Auxiliary NLL-on-chosen weight (RPO). 0.0 disables. Try 0.5 to
+    # supply a positive signal when preference margins are small.
+    rpo_alpha: 0.5
+    # cDPO label smoothing for noisy preferences. 0.0 disables.
+    label_smoothing: 0.0
     max_length: 2048
     max_prompt_length: 1536
     logging_steps: 10

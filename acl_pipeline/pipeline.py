@@ -1790,6 +1790,7 @@ class AdversarialCurriculumPipeline:
                         item["task"],
                         count=candidate_count,
                         logger=self.logger,
+                        diversity=self.config.socratic.candidate_diversity,
                     )
                     item["hint_candidates"] = candidates
                     item["hint"] = candidates[0]

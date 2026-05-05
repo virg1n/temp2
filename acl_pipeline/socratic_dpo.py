@@ -234,6 +234,9 @@ def _compat_dpo_config(config: PipelineConfig, output_dir: str) -> Any:
         "max_length": int(args.max_length),
         "max_prompt_length": int(args.max_prompt_length),
         "beta": float(args.beta),
+        "loss_type": str(args.loss_type),
+        "rpo_alpha": float(args.rpo_alpha),
+        "label_smoothing": float(args.label_smoothing),
         "ddp_find_unused_parameters": False,
         "report_to": "none",
     }
