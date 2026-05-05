@@ -44,13 +44,15 @@ def _parse_or_reject(code: str, label: str) -> tuple[ast.AST | None, list[str]]:
         return None, [f"{label} has a syntax error: {exc.msg} at line {exc.lineno}"]
 
 
-def static_safety_check(code: str, label: str, cfg: ExecutionConfig) -> list[str]:
+def static_safety_check(code: str, label: str, cfg: ExecutionConfig, allow_syntax_error: bool = False) -> list[str]:
     reasons: list[str] = []
     if len(code) > cfg.max_code_chars:
         reasons.append(f"{label} is too long ({len(code)} chars)")
         return reasons
 
     tree, parse_reasons = _parse_or_reject(code, label)
+    if tree is None and allow_syntax_error:
+        return reasons
     reasons.extend(parse_reasons)
     if tree is None:
         return reasons
@@ -114,7 +116,6 @@ def validate_task(task: RedTask, cfg: ExecutionConfig) -> ValidationResult:
     reference_script = build_script(task.reference_solution, task.asserts)
     buggy_script = build_script(task.buggy_solution, task.asserts)
     reasons.extend(static_safety_check(reference_script, "reference_solution", cfg))
-    reasons.extend(static_safety_check(buggy_script, "buggy_solution", cfg))
     if reasons:
         return ValidationResult(valid=False, rejection_reasons=reasons)
 
@@ -130,6 +131,10 @@ def validate_task(task: RedTask, cfg: ExecutionConfig) -> ValidationResult:
             reference_stdout=reference.stdout,
             reference_stderr=reference.stderr,
         )
+
+    buggy_reasons = static_safety_check(buggy_script, "buggy_solution", cfg, allow_syntax_error=True)
+    if buggy_reasons:
+        return ValidationResult(valid=False, rejection_reasons=buggy_reasons)
 
     try:
         buggy = run_python(buggy_script, cfg)

@@ -10,10 +10,7 @@ class RedTask:
     statement: str
     reference_solution: str
     buggy_solution: str
-    intended_bug: str
     asserts: list[str]
-    difficulty: str = "easy"
-    tags: list[str] = field(default_factory=list)
     raw_completion: str = ""
     prompt_text: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)

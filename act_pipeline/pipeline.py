@@ -12,7 +12,7 @@ from .execution import validate_task
 from .judge import SocraticJudge
 from .openai_client import OpenAIChatClient
 from .prompts import format_socratic_prompt
-from .red_generation import generate_red_candidate
+from .red_generation import canonical_red_completion, generate_red_candidate, repair_buggy_solution
 from .schemas import RedTask
 from .socratic_generation import SocraticGenerator
 from .storage import append_jsonl, ensure_dir, write_json
@@ -72,6 +72,17 @@ class ACTPipeline:
                     continue
 
                 validation = validate_task(task, self.cfg.execution)
+                if not validation.valid:
+                    if "buggy_solution passes all asserts" in validation.rejection_reasons:
+                        repair_code, repair_record = repair_buggy_solution(self.red_client, task, self.rng, self.cfg)
+                        candidate_record["repair"] = repair_record
+                        if repair_code is not None:
+                            task.buggy_solution = repair_code
+                            candidate_record["completion"] = canonical_red_completion(task)
+                            validation = validate_task(task, self.cfg.execution)
+                        if not validation.valid:
+                            candidate_record["repair_rejection_reasons"] = validation.rejection_reasons
+
                 if not validation.valid:
                     candidate_record["valid"] = False
                     candidate_record["score"] = 0.0

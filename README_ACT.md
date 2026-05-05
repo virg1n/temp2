@@ -9,7 +9,7 @@ This repo now contains a fresh ACT-only pipeline based on `main.tex`. It does no
 - Hard gates zero punctuation/markdown-dominated hints, cap no-question or too-short hints, and expose a `score_ceiling` so flagged outputs cannot be raised by later normalization.
 - SocraticAI: `Qwen/Qwen3-1.7B` base model.
 - Curriculum: topic EMA sampling weighted toward low Socratic scores.
-- Validation: generated reference code must pass asserts; buggy code must fail.
+- Validation: generated reference code must pass asserts; buggy code is kept if it fails by assertion, runtime error, timeout, or syntax error. If it passes every assert, Red is asked in the same chat to output only a replacement buggy solution.
 - Socratic update: DPO pairs from best/worst judged hints, matching the ACT paper loop.
 - Red update: KPO, not DPO. Each Red prompt stores all candidates with scalar rewards, so invalid, easy, and valid-hard samples all train the Red adapter.
 

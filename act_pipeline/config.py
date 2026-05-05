@@ -33,7 +33,7 @@ class ModelConfig:
 @dataclass
 class GenerationConfig:
     red_candidates_per_topic: int = 3
-    red_max_tokens: int = 1800
+    red_max_tokens: int = 2600
     red_temperature: float = 0.85
     red_top_p: float = 0.9
     jailbreak_probability: float = 0.08

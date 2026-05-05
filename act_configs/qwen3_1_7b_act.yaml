@@ -14,7 +14,7 @@ models:
 
 generation:
   red_candidates_per_topic: 3
-  red_max_tokens: 1800
+  red_max_tokens: 2600
   red_temperature: 0.85
   red_top_p: 0.9
   jailbreak_probability: 0.08
