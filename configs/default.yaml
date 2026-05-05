@@ -82,7 +82,7 @@ socratic:
     do_sample: true
     repetition_penalty: 1.05
   lora:
-    enabled: false
+    enabled: true
     r: 64
     alpha: 128
     dropout: 0.05
@@ -115,7 +115,7 @@ socratic:
     num_hint_candidates: 4
     max_pairs_per_task: 2
     min_score_gap: 0.10
-    learning_rate: 5.0e-5
+    learning_rate: 3.0e-5
     epochs: 1
     per_device_batch_size: 1
     gradient_accumulation_steps: 4
@@ -130,7 +130,7 @@ socratic:
     bf16: true
     fp16: false
     gradient_checkpointing: true
-    full_ft: true
+    full_ft: false
     max_uses_per_preference: 3
 
 judge:
