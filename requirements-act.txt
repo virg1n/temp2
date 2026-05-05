@@ -1,0 +1,8 @@
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+openai>=1.30.0
+peft>=0.11.0
+pyyaml>=6.0.1
+torch>=2.3.0
+transformers>=4.43.0
+vllm>=0.5.0

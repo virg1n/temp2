@@ -1,0 +1,118 @@
+run:
+  output_dir: runs/act_qwen3_1_7b
+  seed: 17
+  language: python
+  max_iterations: 500
+
+models:
+  socratic_base_model: Qwen/Qwen3-1.7B
+  socratic_adapter:
+  red_model: Qwen/Qwen3-32B
+  judge_model: Qwen/Qwen3-32B
+  vllm_base_url: http://127.0.0.1:8000/v1
+  vllm_api_key: EMPTY
+
+generation:
+  red_candidates_per_topic: 3
+  red_max_tokens: 1800
+  red_temperature: 0.85
+  red_top_p: 0.9
+  jailbreak_probability: 0.08
+  socratic_candidates: 4
+  socratic_max_new_tokens: 150
+  socratic_temperature: 0.8
+  socratic_top_p: 0.9
+  judge_max_tokens: 600
+  judge_temperature: 0.0
+  judge_top_p: 1.0
+
+curriculum:
+  ema_alpha: 0.2
+  initial_ema_reward: 0.7
+  low_reward_boost_lambda: 2.0
+  max_same_topic_streak: 3
+  min_score_gap: 1.5
+  hard_reward_max: 6.5
+  topics:
+    - name: lists and indexing
+      base_weight: 1.0
+      notes: off-by-one, wrong index, empty list edge case
+    - name: loops and accumulators
+      base_weight: 1.0
+      notes: wrong initialization, update in wrong branch
+    - name: conditionals
+      base_weight: 1.0
+      notes: boundary condition or inverted comparison
+    - name: strings
+      base_weight: 0.9
+      notes: case handling, slicing, counting characters
+    - name: dictionaries
+      base_weight: 0.9
+      notes: missing key handling, wrong value update
+    - name: sorting
+      base_weight: 0.8
+      notes: wrong key, ascending versus descending, tie break
+    - name: functions and return values
+      base_weight: 0.8
+      notes: forgotten return, returning too early
+    - name: nested loops
+      base_weight: 0.7
+      notes: wrong loop variable or reset location
+    - name: basic recursion
+      base_weight: 0.5
+      notes: base case or recursive argument, keep it short
+
+judge:
+  max_hint_words: 120
+  hard_max_hint_words: 160
+  min_alphabetic_words: 8
+  max_questions: 2
+  no_question_penalty: 1.5
+  no_question_score_ceiling: 2.0
+  low_alpha_words_score_ceiling: 2.0
+  punctuation_markdown_zero_threshold: 0.55
+  markdown_zero_threshold: 0.30
+  too_many_questions_penalty: 1.0
+  too_long_penalty: 2.0
+  code_block_penalty: 3.0
+  generic_penalty: 1.5
+  direct_fix_forced_score: 0.0
+  leakage_multiplier: 0.1
+
+execution:
+  python_executable: python
+  timeout_seconds: 2.0
+  max_code_chars: 6000
+  allowed_imports:
+    - collections
+    - functools
+    - itertools
+    - math
+    - random
+    - statistics
+
+train:
+  socratic_dpo:
+    beta: 0.1
+    learning_rate: 0.000008
+    epochs: 1
+    batch_size: 2
+    gradient_accumulation_steps: 8
+    max_length: 4096
+    lora_r: 64
+    lora_alpha: 128
+    lora_dropout: 0.05
+    load_in_4bit: false
+  red_kpo:
+    beta: 0.08
+    reward_temperature: 0.7
+    learning_rate: 0.0000035
+    epochs: 1
+    batch_size: 1
+    gradient_accumulation_steps: 8
+    max_length: 6144
+    max_candidates_per_group: 4
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    load_in_4bit: true
