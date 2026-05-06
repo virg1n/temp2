@@ -80,6 +80,13 @@ def _under_use_cap(metadata: Dict[str, Any], key: str, max_uses: int) -> bool:
     return _metadata_count(metadata, key) < cap
 
 
+def _freeze_reference_model(model: Any) -> None:
+    for parameter in getattr(model, "parameters", lambda: [])():
+        parameter.requires_grad_(False)
+    if hasattr(model, "eval"):
+        model.eval()
+
+
 def _safe_token_count(tokenizer: Any, text: str) -> Optional[int]:
     try:
         encoded = tokenizer(
@@ -289,9 +296,11 @@ class SocraticDpoUpdater:
 
         set_seed(self.config.runtime.seed + int(step))
         session = None
+        ref_session = None
         trainer = None
         dataset = None
         model = None
+        ref_model = None
         try:
             session = self.model_pool.load_socratic_trainable(
                 model_source=model_source,
@@ -336,9 +345,42 @@ class SocraticDpoUpdater:
                 self.config,
                 output_dir=str(self.storage.checkpoint_dir("socratic_tmp", step)),
             )
+            reference_adapter_mode = str(getattr(settings, "reference_adapter", "base") or "base").strip().lower()
+            if reference_adapter_mode not in {"base", "previous", "previous_adapter"}:
+                self.logger.warning(
+                    "socratic_dpo_reference_adapter_mode_unknown",
+                    step=step,
+                    configured_mode=reference_adapter_mode,
+                    fallback_mode="base",
+                )
+                reference_adapter_mode = "base"
+            if reference_adapter_mode in {"previous", "previous_adapter"} and adapter_path:
+                ref_session = self.model_pool.load_socratic_reference(
+                    model_source=model_source,
+                    adapter_path=adapter_path,
+                )
+                ref_model = ref_session.model
+                _freeze_reference_model(ref_model)
+                self.logger.event(
+                    "socratic_dpo_reference_loaded",
+                    step=step,
+                    reference_adapter=adapter_path,
+                    reference_adapter_mode=reference_adapter_mode,
+                )
+            else:
+                self.logger.event(
+                    "socratic_dpo_reference_base",
+                    step=step,
+                    reference_adapter_mode=reference_adapter_mode,
+                    reason=(
+                        "no_previous_adapter"
+                        if reference_adapter_mode in {"previous", "previous_adapter"} and not adapter_path
+                        else "configured_base_reference"
+                    ),
+                )
             trainer_kwargs: Dict[str, Any] = {
                 "model": model,
-                "ref_model": None,
+                "ref_model": ref_model,
                 "args": cfg,
                 "train_dataset": dataset,
                 "processing_class": session.tokenizer,
@@ -406,6 +448,8 @@ class SocraticDpoUpdater:
                 preference_example_ids=result.preference_example_ids,
                 max_uses_per_preference=max_uses,
                 preference_use_cap_excluded=preference_use_cap_excluded,
+                reference_adapter_mode=reference_adapter_mode,
+                reference_adapter_path=adapter_path if ref_model is not None else None,
             )
             return result
         except RuntimeError as exc:
@@ -423,7 +467,10 @@ class SocraticDpoUpdater:
             self.model_pool.release_socratic()
             if session is not None:
                 session.unload()
+            if ref_session is not None:
+                ref_session.unload()
             trainer = None
             dataset = None
             model = None
+            ref_model = None
             clear_cuda_memory()

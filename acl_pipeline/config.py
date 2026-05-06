@@ -129,7 +129,7 @@ class SocraticGrpoSettings:
 class SocraticDpoSettings:
     update_every_episodes: int = 8
     min_preference_pairs_before_update: int = 8
-    max_training_pairs: int = 128
+    max_training_pairs: int = 64
     num_hint_candidates: int = 4
     max_pairs_per_task: int = 2
     min_score_gap: float = 0.35
@@ -139,7 +139,7 @@ class SocraticDpoSettings:
     gradient_accumulation_steps: int = 4
     warmup_ratio: float = 0.03
     weight_decay: float = 0.0
-    beta: float = 0.1
+    beta: float = 0.2
     loss_type: str = "sigmoid"
     rpo_alpha: float = 0.0
     label_smoothing: float = 0.0
@@ -152,7 +152,8 @@ class SocraticDpoSettings:
     fp16: bool = False
     gradient_checkpointing: bool = True
     full_ft: bool = False
-    max_uses_per_preference: int = 3
+    max_uses_per_preference: int = 1
+    reference_adapter: str = "base"
 
 
 @dataclass
@@ -339,7 +340,7 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
     return SocraticDpoSettings(
         update_every_episodes=int(payload.get("update_every_episodes", 8)),
         min_preference_pairs_before_update=int(payload.get("min_preference_pairs_before_update", 8)),
-        max_training_pairs=int(payload.get("max_training_pairs", 128)),
+        max_training_pairs=int(payload.get("max_training_pairs", 64)),
         num_hint_candidates=int(payload.get("num_hint_candidates", 4)),
         max_pairs_per_task=int(payload.get("max_pairs_per_task", 2)),
         min_score_gap=float(payload.get("min_score_gap", 0.35)),
@@ -349,7 +350,7 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
         gradient_accumulation_steps=int(payload.get("gradient_accumulation_steps", 4)),
         warmup_ratio=float(payload.get("warmup_ratio", 0.03)),
         weight_decay=float(payload.get("weight_decay", 0.0)),
-        beta=float(payload.get("beta", 0.1)),
+        beta=float(payload.get("beta", 0.2)),
         loss_type=str(payload.get("loss_type", "sigmoid")).strip().lower(),
         rpo_alpha=float(payload.get("rpo_alpha", 0.0)),
         label_smoothing=float(payload.get("label_smoothing", 0.0)),
@@ -362,7 +363,8 @@ def _socratic_dpo(payload: Optional[Dict[str, Any]]) -> SocraticDpoSettings:
         fp16=bool(payload.get("fp16", False)),
         gradient_checkpointing=bool(payload.get("gradient_checkpointing", True)),
         full_ft=bool(payload.get("full_ft", False)),
-        max_uses_per_preference=int(payload.get("max_uses_per_preference", 3)),
+        max_uses_per_preference=int(payload.get("max_uses_per_preference", 1)),
+        reference_adapter=str(payload.get("reference_adapter", "base")).strip().lower(),
     )
 
 

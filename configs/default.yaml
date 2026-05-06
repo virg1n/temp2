@@ -129,7 +129,7 @@ socratic:
   dpo:
     update_every_episodes: 8
     min_preference_pairs_before_update: 16
-    max_training_pairs: 128
+    max_training_pairs: 64
     num_hint_candidates: 4
     max_pairs_per_task: 2
     min_score_gap: 0.8
@@ -139,7 +139,7 @@ socratic:
     gradient_accumulation_steps: 4
     warmup_ratio: 0.03
     weight_decay: 0.0
-    beta: 0.1
+    beta: 0.2
     # DPO loss variant. Options (TRL): sigmoid (classic DPO), ipo (IPO,
     # robust to small/noisy margins), hinge, robust, bco_pair. IPO is a
     # good default when Judge scores cluster tightly across candidates.
@@ -158,7 +158,11 @@ socratic:
     fp16: false
     gradient_checkpointing: true
     full_ft: false
-    max_uses_per_preference: 2
+    max_uses_per_preference: 1
+    # "base" keeps TRL's default PEFT reference: base model with LoRA disabled.
+    # "previous" loads the adapter from the start of the update as a frozen
+    # reference, so each DPO step is anchored to the previous Socratic checkpoint.
+    reference_adapter: previous
 
 judge:
   model_name_or_path: Qwen/Qwen3-32B

@@ -974,6 +974,21 @@ class ModelPool:
             gradient_checkpointing=gradient_checkpointing,
         )
 
+    def load_socratic_reference(self, *, model_source: Optional[str] = None, adapter_path: Optional[str] = None) -> RoleSession:
+        source = model_source or self.config.socratic.model_name_or_path
+        return load_role_session(
+            role_name="socratic_ref",
+            model_name_or_path=source,
+            tokenizer_name_or_path=self.config.socratic.tokenizer_name_or_path,
+            hardware=self.config.socratic.hardware,
+            generation=self.config.socratic.generation,
+            quantization=self.config.socratic.quantization,
+            enable_thinking=False,
+            logger=self.logger,
+            adapter_path=adapter_path or self.config.socratic.base_adapter_path,
+            trainable=False,
+        )
+
     def load_red_generation(
         self,
         *,

@@ -9,7 +9,8 @@
       "Bash(awk 'NR>=70 {print}')",
       "Bash(grep -nA1 \"expected_hint_paraphrases_solution\" c:/Users/bogda/github/temp2/configs/default.yaml)",
       "Bash(python3 -c ' *)",
-      "PowerShell(python -c \"import json; eps=[json.loads\\(l\\) for l in open\\('c:/Users/bogda/github/temp2/logs/episodes \\(7\\).jsonl','r',encoding='utf-8'\\) if l.strip\\(\\)]; print\\('total:',len\\(eps\\)\\); print\\('keys:', list\\(eps[0].keys\\(\\)\\)\\)\")"
+      "PowerShell(python -c \"import json; eps=[json.loads\\(l\\) for l in open\\('c:/Users/bogda/github/temp2/logs/episodes \\(7\\).jsonl','r',encoding='utf-8'\\) if l.strip\\(\\)]; print\\('total:',len\\(eps\\)\\); print\\('keys:', list\\(eps[0].keys\\(\\)\\)\\)\")",
+      "Read(//c/Users/bogda/AppData/Local/Programs/Python/Python311/Lib/site-packages/trl/trainer/**)"
     ]
   }
 }

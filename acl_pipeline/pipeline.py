@@ -103,6 +103,12 @@ class AdversarialCurriculumPipeline:
         # so the preference pair should train on that same model output.
         return str(getattr(hint, "raw_text", "") or hint.text or "").strip()
 
+    def _socratic_chosen_preference_text(self, hint) -> str:
+        # Chosen examples should teach Socratic content, not markdown code
+        # styling. Keep rejected hints raw so code fences remain a negative.
+        text = self._socratic_sanitized_text(hint) or self._socratic_preference_text(hint)
+        return text.replace("```python", "").replace("```py", "").replace("```", "").replace("`", "").strip()
+
     def _socratic_sanitized_text(self, hint) -> str:
         return str(getattr(hint, "metadata", {}).get("sanitized_text") or hint.text or "").strip()
 
@@ -1336,7 +1342,7 @@ class AdversarialCurriculumPipeline:
 
             chosen_hint = chosen["hint"]
             rejected_hint = rejected["hint"]
-            chosen_text = self._socratic_preference_text(chosen_hint)
+            chosen_text = self._socratic_chosen_preference_text(chosen_hint)
             rejected_text = self._socratic_preference_text(rejected_hint)
             if not chosen_text or not rejected_text or chosen_text == rejected_text:
                 continue
@@ -1361,7 +1367,9 @@ class AdversarialCurriculumPipeline:
                     "chosen_rank": chosen.get("rank"),
                     "rejected_rank": rejected.get("rank"),
                     "score_gap": chosen_score - rejected_score,
-                    "preference_text_source": "raw_text",
+                    "preference_text_source": "chosen_sanitized_no_backticks_rejected_raw",
+                    "chosen_had_backticks": "`" in self._socratic_preference_text(chosen_hint),
+                    "rejected_had_backticks": "`" in rejected_text,
                     "chosen_clean_hint": self._socratic_sanitized_text(chosen_hint),
                     "rejected_clean_hint": self._socratic_sanitized_text(rejected_hint),
                 },
