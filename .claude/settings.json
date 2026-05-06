@@ -6,7 +6,10 @@
       "Bash(awk '/red_kto_dataset_built.*step.*: 75/,/red_kto_dataset_built.*step.*: 81/' \"c:/Users/bogda/github/temp2/logs/run \\(6\\).log\")",
       "Bash(grep -vE \"judge_batch_complete|judge_hint_ranking_complete|judge_red_task_judge_eval|episode_complete|red_task_judge_complete|topic_sampled|model_load_start|model_loaded|model_unload|task_executed|red_repair_attempt|red_validation|episode_added|hint_generated|loading|Loading|red_task_generated|task_generated|judge_eval|preference_pair|hard_example_added|^Adding|^Tokenizing|train_runtime|^100%|^\\\\s|^$\")",
       "Bash(awk 'BEGIN{n=0; bins=10}{a[n++]=$1} END {chunk=int\\(n/bins\\); for\\(b=0;b<bins;b++\\){s=0; c=0; for\\(i=b*chunk;i<\\(b+1\\)*chunk && i<n;i++\\){s+=a[i]; c++} if\\(c>0\\) printf \"ep %d-%d: mean=%.3f n=%d\\\\n\", b*chunk+1, b*chunk+c, s/c, c}}')",
-      "Bash(awk 'NR>=70 {print}')"
+      "Bash(awk 'NR>=70 {print}')",
+      "Bash(grep -nA1 \"expected_hint_paraphrases_solution\" c:/Users/bogda/github/temp2/configs/default.yaml)",
+      "Bash(python3 -c ' *)",
+      "PowerShell(python -c \"import json; eps=[json.loads\\(l\\) for l in open\\('c:/Users/bogda/github/temp2/logs/episodes \\(7\\).jsonl','r',encoding='utf-8'\\) if l.strip\\(\\)]; print\\('total:',len\\(eps\\)\\); print\\('keys:', list\\(eps[0].keys\\(\\)\\)\\)\")"
     ]
   }
 }

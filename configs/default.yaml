@@ -76,9 +76,9 @@ socratic:
     cpu_offload_gib: 128
   generation:
     batch_size: 1
-    max_new_tokens: 280
-    temperature: 1.20
-    top_p: 1.0
+    max_new_tokens: 200
+    temperature: 0.95
+    top_p: 0.95
     do_sample: true
     repetition_penalty: 1.05
   # Per-candidate diversification of Socratic hints used for DPO ranking.
@@ -132,7 +132,7 @@ socratic:
     max_training_pairs: 128
     num_hint_candidates: 4
     max_pairs_per_task: 2
-    min_score_gap: 0.4
+    min_score_gap: 0.8
     learning_rate: 3.0e-5
     epochs: 1
     per_device_batch_size: 1
@@ -158,7 +158,7 @@ socratic:
     fp16: false
     gradient_checkpointing: true
     full_ft: false
-    max_uses_per_preference: 3
+    max_uses_per_preference: 2
 
 judge:
   model_name_or_path: Qwen/Qwen3-32B
@@ -492,7 +492,7 @@ red:
   quantization:
   generation_quantization: 8bit
   update_quantization: 4bit
-  force_base_generation_after_iteration: 35
+  force_base_generation_after_iteration: 1
   reference_temperature: 0.0
   reference_top_p: 1.0
   reference_do_sample: false
@@ -517,7 +517,7 @@ red:
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
   update:
-    update_every_episodes: 8
+    update_every_episodes: 100000
     min_hard_examples: 24
     max_sft_examples: 256
     max_dpo_pairs: 64

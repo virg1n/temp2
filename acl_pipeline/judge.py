@@ -184,6 +184,39 @@ _CODE_OUTPUT_PATTERNS = [
     re.compile(r"^\s*(?:def|class|if|elif|else|for|while|try|except|finally|with|return|raise|import|from|assert|print)\b"),
     re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]"),
 ]
+# Declarative paraphrase-leak patterns: a Socratic hint should ASK about the
+# bug, not STATE it. These patterns catch declarative cause statements
+# ("the code is raising X because Y", "is being shared", "infinite recursion
+# in func", "did not handle the case where ...") that the LLM Judge has been
+# observed to miss. A match here force-flips hint_paraphrases_solution=true,
+# which downstream caps socratic_style<=3 and applies the no_solution_reveal
+# 0.1 multiplier.
+_PARAPHRASED_LEAK_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bthe\s+(?:code|error|issue|bug|problem|function|method|loop|condition|expression|variable|key|value|line|test|assertion)\s+is\s+(?:causing|raising|producing|returning|attempting|trying|missing|using|treating|failing|not\s+(?:handling|checking|considering|accounting))\b",
+        r"\bbecause\s+(?:the\s+|it\s+|this\s+|of\s+|you\s+|we\s+|it's\s+)",
+        r"\bdue\s+to\b",
+        r"\b(?:is\s+)?caused\s+by\b",
+        r"\bis\s+being\s+(?:shared|modified|captured|overwritten|reset|reused|aliased|reassigned|incremented|decremented|set|updated|appended|copied)\b",
+        r"\bmodifies\s+the\s+\w+",
+        r"\bshared\s+(?:between|across|among)\b",
+        r"\b(?:did|does)\s+not\s+(?:handle|consider|account\s+for|check|validate|raise|return|update)\b",
+        r"\bfails?\s+to\s+(?:handle|consider|account\s+for|check|validate|raise|return|update|increment|reset)\b",
+        r"\binfinite\s+(?:recursion|loop)\b",
+        r"\b(?:missing|forgot)\s+(?:the\s+)?(?:base\s+case|return|check|condition|handler|increment|update|assignment|copy|deepcopy)\b",
+        r"\bnever\s+(?:returns|exits|terminates|reaches|increments|decrements|updates|sets|gets|raises|breaks|stops|reassigns)\b",
+        r"\b(?:trying|attempting)\s+to\s+(?:multiply|add|subtract|divide|access|index|call|cast|convert|compare|append|return|assign|increment|decrement|raise|catch|store|read)\b",
+        r"\bbefore\s+(?:being\s+|it\s+is\s+|it's\s+)?(?:assigned|defined|initialized|set|imported|declared)\b",
+        r"\baccessed\s+before\s+(?:assignment|being\s+assigned)\b",
+        r"\braising\s+(?:an?\s+)?\w+\s+(?:because|due\s+to|since)\b",
+        r"\bexpected\s+\w+\s+(?:was\s+not\s+raised|but)\b",
+        r"\bthe\s+actual\s+(?:error|value|result|return)\s+(?:was|is)\b",
+        r"\bthis\s+(?:is\s+because|happens\s+because|suggests\s+that|means\s+that)\b",
+        r"\bis\s+not\s+being\s+(?:reset|copied|deepcopied|cleared|updated|incremented|stored|returned)\b",
+        r"\brecursively\s+calling\s+itself\b",
+    )
+]
 _SYNTAX_OR_INDENT_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -393,6 +426,13 @@ def _contains_code_output(hint_text: str) -> bool:
         stripped = lines[0].strip()
         return code_like_lines == 1 and "?" not in stripped and bool(re.match(r"^(?:def|class|return|raise|assert|print)\b|^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]", stripped))
     return code_like_lines >= 2
+
+
+def _contains_paraphrased_leak(hint_text: str) -> bool:
+    text = (hint_text or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _PARAPHRASED_LEAK_PATTERNS)
 
 
 def _contains_direct_fix(hint_text: str) -> bool:
@@ -696,6 +736,7 @@ class JudgeService:
         malformed_reasons = list(dict.fromkeys(list(features.get("malformed_reasons") or []) + list(corruption.get("reasons") or [])))
         code_output = _contains_code_output(hint_text)
         direct_fix = _contains_direct_fix(hint_text)
+        paraphrased_leak = _contains_paraphrased_leak(hint_text)
         pass_aware = bool(features.get("references_passed_execution"))
         gate = {
             "skip_llm": False,
@@ -709,6 +750,7 @@ class JudgeService:
             "reasons": [],
             "contains_code_output": code_output,
             "contains_direct_fix": direct_fix,
+            "regex_paraphrased_leak": paraphrased_leak,
         }
 
         related_error = _execution_error_matches_intended_bug(task, str(row.get("execution_status") or ""))
@@ -1073,11 +1115,18 @@ class JudgeService:
         # the regex list can't see.
         paraphrase_flags: List[bool] = []
         for index, (item, gate) in enumerate(zip(raw_items, hard_gates)):
-            paraphrases = self._coerce_paraphrases_solution(item)
+            llm_paraphrases = self._coerce_paraphrases_solution(item)
+            regex_paraphrases = bool(gate.get("regex_paraphrased_leak"))
+            paraphrases = bool(llm_paraphrases or regex_paraphrases)
             paraphrase_flags.append(paraphrases)
             gate["hint_paraphrases_solution"] = paraphrases
+            gate["paraphrase_source_llm"] = bool(llm_paraphrases)
+            gate["paraphrase_source_regex"] = regex_paraphrases
             if paraphrases:
-                gate["reasons"].append("hint_paraphrases_solution")
+                if regex_paraphrases and not llm_paraphrases:
+                    gate["reasons"].append("hint_paraphrases_solution:regex")
+                else:
+                    gate["reasons"].append("hint_paraphrases_solution")
                 gate["force_hint_valid"] = False
                 if not gate.get("hint_rejection_reason"):
                     gate["hint_rejection_reason"] = "paraphrased_solution_leak"
@@ -1125,6 +1174,8 @@ class JudgeService:
                 "contains_code_output": gate["contains_code_output"],
                 "contains_direct_fix": gate["contains_direct_fix"],
                 "hint_paraphrases_solution": bool(gate.get("hint_paraphrases_solution")),
+                "paraphrase_source_llm": bool(gate.get("paraphrase_source_llm")),
+                "paraphrase_source_regex": bool(gate.get("paraphrase_source_regex")),
             }
             raw_unclamped_scores.append(raw_unclamped)
             pre_normalize_scores.append(pre_normalize)
