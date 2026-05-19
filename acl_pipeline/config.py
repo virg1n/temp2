@@ -20,7 +20,13 @@ class RuntimeConfig:
 @dataclass
 class TaskExecutionConfig:
     enabled: bool = True
+    language: str = "python"
     python_executable: str = "python"
+    cpp_compiler: str = "g++"
+    cpp_standard: str = "c++20"
+    cpp_compile_args: List[str] = field(default_factory=lambda: ["-O0", "-Wall", "-Wextra"])
+    allow_compile_error_tasks: bool = False
+    compile_timeout_seconds: int = 12
     timeout_seconds: int = 12
     max_red_generation_attempts: int = 4
     capture_max_chars: int = 1600
@@ -573,9 +579,21 @@ def load_config(path: str, *, debug_all_override: Optional[bool] = None) -> Pipe
     if debug_all_override:
         runtime.debug_all = True
 
+    language = str(task_execution_raw.get("language", "python")).strip().lower()
+    if language in {"c++", "cc", "cxx"}:
+        language = "cpp"
+    if language not in {"python", "cpp"}:
+        raise ValueError("task_execution.language must be either 'python' or 'cpp'")
+
     task_execution = TaskExecutionConfig(
         enabled=bool(task_execution_raw.get("enabled", True)),
+        language=language,
         python_executable=str(task_execution_raw.get("python_executable", "python")),
+        cpp_compiler=str(task_execution_raw.get("cpp_compiler", "g++")),
+        cpp_standard=str(task_execution_raw.get("cpp_standard", "c++20")),
+        cpp_compile_args=[str(item) for item in (task_execution_raw.get("cpp_compile_args", ["-O0", "-Wall", "-Wextra"]) or [])],
+        allow_compile_error_tasks=bool(task_execution_raw.get("allow_compile_error_tasks", False)),
+        compile_timeout_seconds=int(task_execution_raw.get("compile_timeout_seconds", task_execution_raw.get("timeout_seconds", 12))),
         timeout_seconds=int(task_execution_raw.get("timeout_seconds", 12)),
         max_red_generation_attempts=int(task_execution_raw.get("max_red_generation_attempts", 4)),
         capture_max_chars=int(task_execution_raw.get("capture_max_chars", 1600)),

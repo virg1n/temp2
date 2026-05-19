@@ -72,7 +72,7 @@ def _configure_cuda_visibility(config: object) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Adversarial curriculum training for Socratic Python debugging.")
+    parser = argparse.ArgumentParser(description="Adversarial curriculum training for Socratic debugging.")
     parser.add_argument("--config", default="configs/default.yaml", help="Path to the YAML config.")
     parser.add_argument("--debug-all", action="store_true", help="Print full task/hint/judge/reset details.")
     args = parser.parse_args()

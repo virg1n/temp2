@@ -55,6 +55,8 @@ _DIRECT_FIX_PATTERNS = [
 _CODE_LINE_PATTERNS = [
     re.compile(r"^\s*(?:def|class|if|elif|else|for|while|try|except|finally|with|return|raise|import|from|assert|print)\b"),
     re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]"),
+    re.compile(r"^\s*(?:#include|template\b|namespace\b|using\s+namespace\b|struct\b|enum\b|int\s+main\s*\(|auto\b|std::|assert\s*\()"),
+    re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_:<>~*&\s]+\s+[A-Za-z_][A-Za-z0-9_:~]*\s*\([^;{}]*\)\s*(?:const\s*)?[{;]"),
 ]
 
 

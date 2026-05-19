@@ -44,10 +44,17 @@ def _extract_json(text: str) -> Optional[Any]:
     return None
 
 
-_CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_CODE_FENCE_RE = re.compile(r"```(?:python|py|cpp|c\+\+|cc|cxx)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _LABEL_RE = re.compile(
     r"(?im)^\s*(TOPIC|TARGET_FUNCTION|DIFFICULTY|FAILURE_MODE|INTENDED_BUG|EXPECTED_FIRST_FAILURE|STATEMENT)\s*:\s*(.*)$"
 )
+
+
+def _normalize_language(language: str) -> str:
+    value = str(language or "python").strip().lower()
+    if value in {"cpp", "c++", "cc", "cxx"}:
+        return "cpp"
+    return "python"
 
 
 def _strip_python_comments(source: str) -> str:
@@ -93,37 +100,52 @@ def _strip_python_comments(source: str) -> str:
     return "\n".join(line.rstrip() for line in cleaned.splitlines()).strip()
 
 
-def _clean_code_response(text: str) -> str:
+def _clean_code_response(text: str, *, language: str = "python") -> str:
+    language = _normalize_language(language)
     raw = _cleanup_chat_artifacts(text)
     match = _CODE_FENCE_RE.search(raw)
     if match:
         raw = match.group(1)
-    raw = raw.replace("```python", "").replace("```py", "").replace("```", "").strip()
+    raw = (
+        raw.replace("```python", "")
+        .replace("```py", "")
+        .replace("```cpp", "")
+        .replace("```c++", "")
+        .replace("```cc", "")
+        .replace("```cxx", "")
+        .replace("```", "")
+        .strip()
+    )
     lines = raw.splitlines()
     first_code_index: Optional[int] = None
     for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             continue
-        if re.match(r"^(from\s+\S+\s+import\s+|import\s+|def\s+|class\s+|@)", stripped):
+        if language == "cpp" and re.match(r"^(#include\b|using\s+namespace\b|namespace\b|template\b|struct\b|class\b|enum\b|int\s+main\s*\(|auto\b|[A-Za-z_][A-Za-z0-9_:<>~*&\s]+\s+[A-Za-z_][A-Za-z0-9_:~]*\s*\()", stripped):
             first_code_index = index
             break
-        if stripped.startswith("#") and first_code_index is None:
+        if language == "python" and re.match(r"^(from\s+\S+\s+import\s+|import\s+|def\s+|class\s+|@)", stripped):
+            first_code_index = index
+            break
+        if language == "python" and stripped.startswith("#") and first_code_index is None:
             first_code_index = index
             break
     if first_code_index is not None and first_code_index > 0:
         raw = "\n".join(lines[first_code_index:])
-    return _strip_python_comments(raw)
+    if language == "python":
+        return _strip_python_comments(raw)
+    return raw.strip()
 
 
-def _plain_code_from_response(raw: str, *, preferred_key: str) -> str:
+def _plain_code_from_response(raw: str, *, preferred_key: str, language: str = "python") -> str:
     payload = _extract_json(raw)
     if isinstance(payload, dict):
         for key in (preferred_key, "reference_solution", "buggy_solution", "code", "program"):
             value = str(payload.get(key) or "").strip()
             if value:
-                return _clean_code_response(value)
-    return _clean_code_response(raw)
+                return _clean_code_response(value, language=language)
+    return _clean_code_response(raw, language=language)
 
 
 def _extract_labeled_fields(raw: str) -> Dict[str, str]:
@@ -174,7 +196,39 @@ def _is_pytest_raises_with(node: ast.AST) -> bool:
     return False
 
 
-def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
+def _cpp_assert_signatures(program: str) -> List[str]:
+    source = str(program or "")
+    signatures: List[str] = []
+    index = 0
+    while True:
+        match = re.search(r"\bassert\s*\(", source[index:])
+        if not match:
+            break
+        start = index + match.start()
+        pos = index + match.end()
+        depth = 1
+        while pos < len(source) and depth > 0:
+            ch = source[pos]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            pos += 1
+        while pos < len(source) and source[pos : pos + 1].isspace():
+            pos += 1
+        if pos < len(source) and source[pos] == ";":
+            pos += 1
+        snippet = source[start:pos].strip()
+        if snippet:
+            signatures.append(re.sub(r"\s+", " ", snippet))
+        index = max(pos, start + 1)
+    return signatures
+
+
+def _shared_test_signature(program: str, *, language: str = "python") -> tuple[List[str], Optional[str]]:
+    if _normalize_language(language) == "cpp":
+        signatures = _cpp_assert_signatures(program)
+        return signatures, None
     try:
         tree = ast.parse(program or "")
     except SyntaxError as exc:
@@ -186,8 +240,8 @@ def _shared_test_signature(program: str) -> tuple[List[str], Optional[str]]:
     return signature, None
 
 
-def _test_count_reasons(program: str, *, min_tests: int = 3, max_tests: int = 6) -> List[str]:
-    tests, parse_error = _shared_test_signature(program)
+def _test_count_reasons(program: str, *, min_tests: int = 3, max_tests: int = 6, language: str = "python") -> List[str]:
+    tests, parse_error = _shared_test_signature(program, language=language)
     if parse_error:
         return ["reference_solution parse error"]
     count = len(tests)
@@ -286,7 +340,9 @@ def _required_spec_reasons(
     requested_topic: str,
     *,
     require_reference: bool = True,
+    language: str = "python",
 ) -> List[str]:
+    language = _normalize_language(str(payload.get("language") or language))
     topic = str(payload.get("topic") or "").strip()
     metadata = _payload_metadata(payload)
     difficulty = str(metadata.get("difficulty") or "").strip().lower()
@@ -306,7 +362,7 @@ def _required_spec_reasons(
     if difficulty not in {"medium", "hard"}:
         reasons.append("invalid metadata.difficulty")
     if reference_solution:
-        reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
+        reference_tests, reference_parse_error = _shared_test_signature(reference_solution, language=language)
         if reference_parse_error:
             reasons.append("reference_solution parse error")
         if not reference_tests:
@@ -314,28 +370,34 @@ def _required_spec_reasons(
     return list(dict.fromkeys(reasons))
 
 
-def _normalized_spec_payload(payload: Dict[str, Any], requested_topic: str, raw: str) -> Dict[str, Any]:
+def _normalized_spec_payload(payload: Dict[str, Any], requested_topic: str, raw: str, *, language: str = "python") -> Dict[str, Any]:
+    language = _normalize_language(str(payload.get("language") or language))
     metadata = _payload_metadata(payload)
     difficulty = str(metadata.get("difficulty") or "").strip().lower()
     metadata["difficulty"] = difficulty
+    metadata["language"] = language
     return {
         "topic": str(payload.get("topic") or requested_topic).strip(),
+        "language": language,
         "target_function": str(payload.get("target_function") or "").strip(),
         "intended_bug": str(payload.get("intended_bug") or "").strip(),
         "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
         "statement": str(payload.get("statement") or "").strip(),
-        "reference_solution": _clean_code_response(str(payload.get("reference_solution") or "")),
+        "reference_solution": _clean_code_response(str(payload.get("reference_solution") or ""), language=language),
         "metadata": metadata,
         "raw_response": raw,
     }
 
 
-def _normalized_description_payload(payload: Dict[str, Any], requested_topic: str, raw: str) -> Dict[str, Any]:
+def _normalized_description_payload(payload: Dict[str, Any], requested_topic: str, raw: str, *, language: str = "python") -> Dict[str, Any]:
+    language = _normalize_language(str(payload.get("language") or language))
     metadata = _payload_metadata(payload)
     difficulty = str(metadata.get("difficulty") or "").strip().lower()
     metadata["difficulty"] = difficulty
+    metadata["language"] = language
     return {
         "topic": str(payload.get("topic") or requested_topic).strip(),
+        "language": language,
         "target_function": str(payload.get("target_function") or "").strip(),
         "intended_bug": str(payload.get("intended_bug") or "").strip(),
         "expected_first_failure": str(payload.get("expected_first_failure") or "").strip(),
@@ -349,7 +411,8 @@ def _same_text(left: Any, right: Any) -> bool:
     return str(left or "").strip() == str(right or "").strip()
 
 
-def _locked_spec_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any]) -> List[str]:
+def _locked_spec_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any], *, language: str = "python") -> List[str]:
+    language = _normalize_language(str(payload.get("language") or locked_spec.get("language") or language))
     reasons: List[str] = []
     for key in ("topic", "target_function", "intended_bug", "expected_first_failure", "statement"):
         if not _same_text(payload.get(key), locked_spec.get(key)):
@@ -364,8 +427,8 @@ def _locked_spec_reasons(payload: Dict[str, Any], locked_spec: Dict[str, Any]) -
         if not _same_text(metadata.get(key), locked_metadata.get(key)):
             reasons.append(f"changed metadata.{key}")
 
-    locked_tests, locked_parse_error = _shared_test_signature(str(locked_spec.get("reference_solution") or ""))
-    buggy_tests, buggy_parse_error = _shared_test_signature(str(payload.get("buggy_solution") or ""))
+    locked_tests, locked_parse_error = _shared_test_signature(str(locked_spec.get("reference_solution") or ""), language=language)
+    buggy_tests, buggy_parse_error = _shared_test_signature(str(payload.get("buggy_solution") or ""), language=language)
     if locked_parse_error:
         reasons.append("locked reference_solution parse error")
     if buggy_parse_error:
@@ -390,8 +453,9 @@ def _locked_description_reasons(payload: Dict[str, Any], locked_spec: Dict[str, 
 
 
 class RedTaskGenerator:
-    def __init__(self, logger: StructuredLogger) -> None:
+    def __init__(self, logger: StructuredLogger, *, language: str = "python") -> None:
         self.logger = logger
+        self.language = _normalize_language(language)
 
     def generate_raw_response(self, session: "RoleSession", messages: List[Dict[str, str]], *, topic: str) -> str:
         return session.generate([messages])[0]
@@ -407,27 +471,31 @@ class RedTaskGenerator:
         if not isinstance(payload, dict):
             if locked_spec is None:
                 return None, ["non-json response"]
+            language = _normalize_language(str(locked_spec.get("language") or self.language))
             payload = {
                 "topic": locked_spec.get("topic", requested_topic),
+                "language": language,
                 "target_function": locked_spec.get("target_function", ""),
                 "intended_bug": locked_spec.get("intended_bug", ""),
                 "expected_first_failure": locked_spec.get("expected_first_failure", ""),
                 "statement": locked_spec.get("statement", ""),
                 "reference_solution": locked_spec.get("reference_solution", ""),
-                "buggy_solution": _plain_code_from_response(raw, preferred_key="buggy_solution"),
+                "buggy_solution": _plain_code_from_response(raw, preferred_key="buggy_solution", language=language),
                 "metadata": dict(locked_spec.get("metadata") or {}),
             }
             plain_code_response = True
         else:
             plain_code_response = False
+        language = _normalize_language(str(payload.get("language") or (locked_spec or {}).get("language") or self.language))
+        payload["language"] = language
 
         topic = str(payload.get("topic") or "").strip()
         target_function = str(payload.get("target_function") or "").strip()
         intended_bug = str(payload.get("intended_bug") or "").strip()
         expected_first_failure = str(payload.get("expected_first_failure") or "").strip()
         statement = str(payload.get("statement") or "").strip()
-        reference_solution = _clean_code_response(str(payload.get("reference_solution") or ""))
-        solution = _clean_code_response(str(payload.get("buggy_solution") or ""))
+        reference_solution = _clean_code_response(str(payload.get("reference_solution") or ""), language=language)
+        solution = _clean_code_response(str(payload.get("buggy_solution") or ""), language=language)
         payload["reference_solution"] = reference_solution
         payload["buggy_solution"] = solution
         failing_asserts = payload.get("failing_asserts") or payload.get("asserts") or []
@@ -437,12 +505,13 @@ class RedTaskGenerator:
         metadata = _payload_metadata(payload)
         difficulty = str(metadata.get("difficulty") or "").strip().lower()
         metadata["difficulty"] = difficulty
-        reasons: List[str] = _required_spec_reasons(payload, requested_topic)
+        metadata["language"] = language
+        reasons: List[str] = _required_spec_reasons(payload, requested_topic, language=language)
         if not solution:
             reasons.append("missing buggy_solution")
         if reference_solution and solution:
-            reference_tests, reference_parse_error = _shared_test_signature(reference_solution)
-            buggy_tests, buggy_parse_error = _shared_test_signature(solution)
+            reference_tests, reference_parse_error = _shared_test_signature(reference_solution, language=language)
+            buggy_tests, buggy_parse_error = _shared_test_signature(solution, language=language)
             if reference_parse_error:
                 reasons.append("reference_solution parse error")
             if buggy_parse_error:
@@ -452,7 +521,7 @@ class RedTaskGenerator:
             if reference_tests and buggy_tests and reference_tests != buggy_tests:
                 reasons.append("solutions do not share identical tests")
         if locked_spec is not None:
-            reasons.extend(_locked_spec_reasons(payload, locked_spec))
+            reasons.extend(_locked_spec_reasons(payload, locked_spec, language=language))
         if reasons:
             return None, list(dict.fromkeys(reasons))
 
@@ -461,6 +530,7 @@ class RedTaskGenerator:
             target_function=target_function,
             intended_bug=intended_bug,
             expected_first_failure=expected_first_failure,
+            language=language,
             metadata=metadata,
         )
 
@@ -469,6 +539,7 @@ class RedTaskGenerator:
             topic=topic,
             statement=statement,
             buggy_solution=solution,
+            language=language,
             metadata=metadata,
             failing_asserts=failing_asserts,
             reference_solution=reference_solution,
@@ -493,7 +564,7 @@ class RedTaskGenerator:
             task.metadata["red_locked_spec"] = {
                 key: value
                 for key, value in locked_spec.items()
-                if key in {"topic", "target_function", "intended_bug", "expected_first_failure", "statement", "reference_solution", "metadata"}
+                if key in {"topic", "language", "target_function", "intended_bug", "expected_first_failure", "statement", "reference_solution", "metadata"}
             }
         self.logger.debug_dump("red_task", task=task)
         return task, []
@@ -504,6 +575,7 @@ class RedTaskGenerator:
         *,
         requested_topic: str,
     ) -> tuple[Optional[Dict[str, Any]], List[str]]:
+        language = self.language
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
             fields = _extract_labeled_fields(raw)
@@ -519,6 +591,7 @@ class RedTaskGenerator:
             failure_mode = fields.get("FAILURE_MODE", "").strip() or _slug(intended_bug)
             payload = {
                 "topic": fields.get("TOPIC", requested_topic).strip() or requested_topic,
+                "language": language,
                 "target_function": target_function,
                 "intended_bug": intended_bug,
                 "expected_first_failure": expected_first_failure,
@@ -526,16 +599,18 @@ class RedTaskGenerator:
                 "metadata": {
                     "failure_mode": failure_mode,
                     "difficulty": difficulty,
+                    "language": language,
                 },
             }
-        reasons = _required_spec_reasons(payload, requested_topic, require_reference=False)
+        payload["language"] = _normalize_language(str(payload.get("language") or language))
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=False, language=payload["language"])
         if str(payload.get("reference_solution") or "").strip():
             reasons.append("description stage included reference_solution")
         if str(payload.get("buggy_solution") or "").strip():
             reasons.append("description stage included buggy_solution")
         if reasons:
             return None, list(dict.fromkeys(reasons))
-        spec_payload = _normalized_description_payload(payload, requested_topic, raw)
+        spec_payload = _normalized_description_payload(payload, requested_topic, raw, language=payload["language"])
         self.logger.debug_dump("red_task_description", spec=spec_payload)
         return spec_payload, []
 
@@ -546,34 +621,37 @@ class RedTaskGenerator:
         requested_topic: str,
         locked_spec: Dict[str, Any],
     ) -> tuple[Optional[Dict[str, Any]], List[str]]:
+        language = _normalize_language(str(locked_spec.get("language") or self.language))
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
             payload = {
                 "topic": locked_spec.get("topic", requested_topic),
+                "language": language,
                 "target_function": locked_spec.get("target_function", ""),
                 "intended_bug": locked_spec.get("intended_bug", ""),
                 "expected_first_failure": locked_spec.get("expected_first_failure", ""),
                 "statement": locked_spec.get("statement", ""),
-                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution"),
+                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution", language=language),
                 "metadata": dict(locked_spec.get("metadata") or {}),
             }
         else:
             payload = {
                 "topic": locked_spec.get("topic", requested_topic),
+                "language": language,
                 "target_function": locked_spec.get("target_function", payload.get("target_function", "")),
                 "intended_bug": locked_spec.get("intended_bug", payload.get("intended_bug", "")),
                 "expected_first_failure": locked_spec.get("expected_first_failure", payload.get("expected_first_failure", "")),
                 "statement": locked_spec.get("statement", payload.get("statement", "")),
-                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution"),
+                "reference_solution": _plain_code_from_response(raw, preferred_key="reference_solution", language=language),
                 "metadata": dict(locked_spec.get("metadata") or payload.get("metadata") or {}),
             }
-        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True)
-        reasons.extend(_test_count_reasons(str(payload.get("reference_solution") or ""), min_tests=3, max_tests=6))
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True, language=language)
+        reasons.extend(_test_count_reasons(str(payload.get("reference_solution") or ""), min_tests=3, max_tests=6, language=language))
         if str(payload.get("buggy_solution") or "").strip():
             reasons.append("reference stage included buggy_solution")
         if reasons:
             return None, list(dict.fromkeys(reasons))
-        spec_payload = _normalized_spec_payload(payload, requested_topic, raw)
+        spec_payload = _normalized_spec_payload(payload, requested_topic, raw, language=language)
         spec_payload["reference_chosen_completion"] = spec_payload["reference_solution"]
         self.logger.debug_dump("red_reference", spec=spec_payload)
         return spec_payload, []
@@ -587,12 +665,14 @@ class RedTaskGenerator:
         payload = _extract_json(raw)
         if not isinstance(payload, dict):
             return None, ["non-json response"]
-        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True)
+        language = _normalize_language(str(payload.get("language") or self.language))
+        payload["language"] = language
+        reasons = _required_spec_reasons(payload, requested_topic, require_reference=True, language=language)
         if str(payload.get("buggy_solution") or "").strip():
             reasons.append("spec stage included buggy_solution")
         if reasons:
             return None, list(dict.fromkeys(reasons))
-        spec_payload = _normalized_spec_payload(payload, requested_topic, raw)
+        spec_payload = _normalized_spec_payload(payload, requested_topic, raw, language=language)
         self.logger.debug_dump("red_spec", spec=spec_payload)
         return spec_payload, []
 
@@ -605,7 +685,7 @@ class RedTaskGenerator:
     ) -> Optional[PythonTask]:
         raw_description = self.generate_raw_response(
             session,
-            build_red_task_description_messages(topic, weakness_summary),
+            build_red_task_description_messages(topic, weakness_summary, language=self.language),
             topic=topic,
         )
         description_payload, reasons = self.parse_task_description_response(raw_description, requested_topic=topic)
@@ -613,7 +693,7 @@ class RedTaskGenerator:
             return None
         raw_reference = self.generate_raw_response(
             session,
-            build_red_reference_messages(topic, description_payload),
+            build_red_reference_messages(topic, description_payload, language=self.language),
             topic=topic,
         )
         spec_payload, reasons = self.parse_reference_response(
@@ -623,6 +703,6 @@ class RedTaskGenerator:
         )
         if spec_payload is None or reasons:
             return None
-        raw = self.generate_raw_response(session, build_red_buggy_messages(topic, spec_payload), topic=topic)
+        raw = self.generate_raw_response(session, build_red_buggy_messages(topic, spec_payload, language=self.language), topic=topic)
         task, _ = self.parse_task_response(raw, requested_topic=topic, locked_spec=spec_payload)
         return task

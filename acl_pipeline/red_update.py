@@ -24,7 +24,7 @@ from .modeling import (
     release_trainer_memory,
     render_chat_messages,
 )
-from .prompts import RED_SYSTEM_PROMPT, build_red_training_prompt
+from .prompts import RED_CPP_SYSTEM_PROMPT, RED_SYSTEM_PROMPT, build_red_training_prompt
 from .schemas import EpisodeRecord, PythonTask, RedRejectedExample, RedTrainingExample
 from .storage import SimpleStorage
 
@@ -78,6 +78,7 @@ def _task_output_metadata(task: PythonTask) -> Dict[str, Any]:
     return {
         "failure_mode": failure_mode,
         "difficulty": difficulty,
+        "language": str(getattr(task, "language", "") or task.metadata.get("language") or "python"),
     }
 
 
@@ -92,6 +93,7 @@ def serialize_task_json(task: PythonTask) -> str:
     reference_solution = str(task.reference_solution or task.metadata.get("reference_solution") or "").strip()
     payload = {
         "topic": task.topic,
+        "language": str(getattr(task, "language", "") or task.metadata.get("language") or "python"),
         "target_function": spec.get("target_function", ""),
         "intended_bug": spec.get("intended_bug", task.metadata.get("failure_mode", "")),
         "expected_first_failure": spec.get("expected_first_failure", task.observed_failure()),
@@ -192,8 +194,10 @@ def _build_sft_dataset(
     token_counts: List[Optional[int]] = []
     truncated_examples: List[Dict[str, Any]] = []
     for item in ranked:
+        language = str(getattr(item.task, "language", "") or item.task.metadata.get("language") or "").strip().lower()
+        system_prompt = RED_CPP_SYSTEM_PROMPT if language in {"cpp", "c++", "cc", "cxx"} else RED_SYSTEM_PROMPT
         messages = [
-            {"role": "system", "content": RED_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": item.prompt},
             {"role": "assistant", "content": item.chosen_completion},
         ]
@@ -247,6 +251,7 @@ def _is_trainable_red_dpo_rejection_reason(reason: Any) -> bool:
             "buggy_too_correct",
             "blocking_syntax_error",
             "blocking_indentation_error",
+            "blocking_compile_error",
             "blocking_nameerror",
             "blocking_timeout",
             "unrelated_nameerror",
@@ -538,7 +543,14 @@ def _hard_or_low_reward_episode_examples(
             RedTrainingExample(
                 example_id=f"low_reward_recent_{episode.episode_id}",
                 topic=episode.topic,
-                prompt=str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary)),
+                prompt=str(
+                    episode.task.metadata.get("red_prompt")
+                    or build_red_training_prompt(
+                        episode.topic,
+                        weakness_summary,
+                        language=getattr(episode.task, "language", episode.task.metadata.get("language", "python")),
+                    )
+                ),
                 chosen_completion=serialize_red_completion(episode.task),
                 rejected_completion=None,
                 reward=episode.judge.normalized_reward,

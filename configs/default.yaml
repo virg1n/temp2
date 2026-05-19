@@ -8,7 +8,13 @@ runtime:
 
 task_execution:
   enabled: true
+  language: python
   python_executable: python
+  cpp_compiler: g++
+  cpp_standard: c++20
+  cpp_compile_args: [-O0, -Wall, -Wextra]
+  allow_compile_error_tasks: false
+  compile_timeout_seconds: 8
   timeout_seconds: 5
   max_red_generation_attempts: 3
   capture_max_chars: 1600

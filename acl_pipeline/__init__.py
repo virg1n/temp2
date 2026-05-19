@@ -1,4 +1,4 @@
-"""Adversarial curriculum training pipeline for Socratic Python tutoring."""
+"""Adversarial curriculum training pipeline for Socratic debugging tutoring."""
 
 from .config import PipelineConfig, load_config
 

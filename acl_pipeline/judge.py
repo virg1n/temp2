@@ -183,6 +183,8 @@ _DIRECT_FIX_PATTERNS = [
 _CODE_OUTPUT_PATTERNS = [
     re.compile(r"^\s*(?:def|class|if|elif|else|for|while|try|except|finally|with|return|raise|import|from|assert|print)\b"),
     re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^=]"),
+    re.compile(r"^\s*(?:#include|template\b|namespace\b|using\s+namespace\b|struct\b|enum\b|int\s+main\s*\(|auto\b|std::|assert\s*\()"),
+    re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_:<>~*&\s]+\s+[A-Za-z_][A-Za-z0-9_:~]*\s*\([^;{}]*\)\s*(?:const\s*)?[{;]"),
 ]
 # Declarative paraphrase-leak patterns: a Socratic hint should ASK about the
 # bug, not STATE it. These patterns catch declarative cause statements
@@ -245,6 +247,23 @@ _NAME_ERROR_PATTERNS = [
         r"\btypo\b",
         r"\bmisspell",
         r"\brename\b",
+    )
+]
+_COMPILE_ERROR_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bcompile\b",
+        r"\bcompiler\b",
+        r"\bsyntax\b",
+        r"\btemplate\b",
+        r"\boverload\b",
+        r"\bno matching\b",
+        r"\bambiguous\b",
+        r"\bnot declared\b",
+        r"\bundeclared\b",
+        r"\bundefined\b",
+        r"\bmissing include\b",
+        r"\btype error\b",
     )
 ]
 _PASSED_EXECUTION_REWARD = 0.5
@@ -312,6 +331,8 @@ def _infer_execution_status(error_text: str) -> str:
     text = str(error_text or "")
     if "No failing assertion or runtime error was reproduced." in text:
         return "passed"
+    if "Compilation failed" in text or "Compilation timed out" in text:
+        return "compile_error"
     if "IndentationError" in text or "TabError" in text:
         return "indentation_error"
     if "SyntaxError" in text:
@@ -458,12 +479,17 @@ def _intended_bug_signal_text(task: Optional[PythonTask]) -> str:
 
 
 def _execution_error_matches_intended_bug(task: Optional[PythonTask], execution_status: str) -> Optional[bool]:
-    if execution_status not in {"syntax_error", "indentation_error", "nameerror"}:
+    if execution_status not in {"syntax_error", "indentation_error", "nameerror", "compile_error"}:
         return None
     signal = _intended_bug_signal_text(task)
     if not signal:
         return None
-    patterns = _NAME_ERROR_PATTERNS if execution_status == "nameerror" else _SYNTAX_OR_INDENT_PATTERNS
+    if execution_status == "nameerror":
+        patterns = _NAME_ERROR_PATTERNS
+    elif execution_status == "compile_error":
+        patterns = _COMPILE_ERROR_PATTERNS
+    else:
+        patterns = _SYNTAX_OR_INDENT_PATTERNS
     return any(pattern.search(signal) for pattern in patterns)
 
 
@@ -473,6 +499,7 @@ def _build_row(prompt_text: str, completion: str, task: Optional[PythonTask] = N
     error_text = sections.get("error", "")
     execution_status = _infer_execution_status(error_text)
     row = {
+        "language": str(getattr(task, "language", "") or task.metadata.get("language") or "python") if task is not None else "python",
         "statement": task_match.group("body").strip() if task_match else sections.get("task", ""),
         "code": sections.get("code", ""),
         "observed_failure": error_text,
@@ -495,6 +522,7 @@ def _build_red_task_row(task: PythonTask) -> Dict[str, Any]:
     spec = dict(task.metadata.get("red_spec") or {})
     return {
         "task_id": task.task_id,
+        "language": str(getattr(task, "language", "") or task.metadata.get("language") or "python"),
         "topic": task.topic,
         "statement": task.statement,
         "code": task.combined_program()[:6000],

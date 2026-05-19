@@ -53,7 +53,7 @@ class AdversarialCurriculumPipeline:
 
         self.model_pool = ModelPool(config, self.logger)
         self.judge = JudgeService(self.model_pool, self.logger)
-        self.red_generator = RedTaskGenerator(self.logger)
+        self.red_generator = RedTaskGenerator(self.logger, language=config.task_execution.language)
         self.red_updater = RedUpdater(config, self.model_pool, self.storage, self.logger)
         self.socratic_grpo_updater = SocraticGrpoUpdater(config, self.model_pool, self.judge, self.storage, self.logger)
         self.socratic_dpo_updater = SocraticDpoUpdater(config, self.model_pool, self.storage, self.logger)
@@ -94,6 +94,19 @@ class AdversarialCurriculumPipeline:
 
     def _socratic_training_method(self) -> str:
         return str(self.config.socratic.training_method or "grpo").strip().lower()
+
+    def _task_language(self, item: Optional[Dict[str, Any]] = None) -> str:
+        language = str(getattr(self.config.task_execution, "language", "python") or "python").strip().lower()
+        if item is not None:
+            task = item.get("task")
+            spec_payload = item.get("spec_payload")
+            if task is not None:
+                language = str(getattr(task, "language", "") or task.metadata.get("language") or language)
+            elif isinstance(spec_payload, dict):
+                language = str(spec_payload.get("language") or language)
+        if language in {"cpp", "c++", "cc", "cxx"}:
+            return "cpp"
+        return "python"
 
     def _using_socratic_dpo(self) -> bool:
         return self._socratic_training_method() == "dpo"
@@ -164,6 +177,7 @@ class AdversarialCurriculumPipeline:
                 "non_json_response",
                 "blocking_syntax_error",
                 "blocking_indentation_error",
+                "blocking_compile_error",
                 "blocking_nameerror",
                 "blocking_timeout",
                 "unrelated_nameerror",
@@ -199,6 +213,7 @@ class AdversarialCurriculumPipeline:
             target_function=target_function,
             intended_bug=intended_bug,
             expected_first_failure=expected_first_failure,
+            language=str(payload.get("language") or task.metadata.get("language") or getattr(task, "language", "python")),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -354,8 +369,9 @@ class AdversarialCurriculumPipeline:
                 rejection_reasons,
                 spec_payload,
                 repair_context=repair_context,
+                language=self._task_language(item),
             )
-        return build_red_repair_message(str(item["topic"]), rejection_reasons, repair_context=repair_context)
+        return build_red_repair_message(str(item["topic"]), rejection_reasons, repair_context=repair_context, language=self._task_language(item))
 
     def _candidate_rejection_reasons(
         self,
@@ -380,6 +396,33 @@ class AdversarialCurriculumPipeline:
         if execution_result is not None:
             if execution_result.status in {"syntax_error", "indentation_error"}:
                 reasons.append(f"blocking {execution_result.status}")
+            elif execution_result.status == "compile_error":
+                allow_compile_errors = bool(getattr(self.config.task_execution, "allow_compile_error_tasks", False))
+                spec = self._task_spec_from_metadata(task)
+                signal = " ".join(
+                    str(part or "").lower()
+                    for part in (
+                        getattr(spec, "intended_bug", "") if spec is not None else "",
+                        getattr(spec, "expected_first_failure", "") if spec is not None else "",
+                        task.metadata.get("failure_mode"),
+                    )
+                )
+                compile_markers = (
+                    "compile",
+                    "compiler",
+                    "syntax",
+                    "template",
+                    "overload",
+                    "no matching",
+                    "ambiguous",
+                    "not declared",
+                    "undeclared",
+                    "undefined",
+                    "missing include",
+                    "type error",
+                )
+                if not allow_compile_errors or not any(marker in signal for marker in compile_markers):
+                    reasons.append("blocking compile_error")
             elif execution_result.status == "nameerror":
                 spec = self._task_spec_from_metadata(task)
                 signal = " ".join(
@@ -503,8 +546,8 @@ class AdversarialCurriculumPipeline:
         return {
             "topic": topic,
             "weakness_summary": weakness_summary,
-            "description_messages": build_red_task_description_messages(topic, weakness_summary),
-            "description_prompt": build_red_task_description_prompt(topic, weakness_summary),
+            "description_messages": build_red_task_description_messages(topic, weakness_summary, language=self._task_language()),
+            "description_prompt": build_red_task_description_prompt(topic, weakness_summary, language=self._task_language()),
             "description_payload": None,
             "description_raw_response": "",
             "reference_messages": [],
@@ -548,8 +591,8 @@ class AdversarialCurriculumPipeline:
                 if spec_payload is not None and not rejection_reasons:
                     item["description_payload"] = spec_payload
                     item["description_raw_response"] = raw
-                    item["reference_messages"] = build_red_reference_messages(topic, spec_payload)
-                    item["reference_prompt"] = build_red_reference_training_prompt(topic, spec_payload)
+                    item["reference_messages"] = build_red_reference_messages(topic, spec_payload, language=self._task_language(item))
+                    item["reference_prompt"] = build_red_reference_training_prompt(topic, spec_payload, language=self._task_language(item))
                     self.logger.event(
                         "red_task_description_generated",
                         iteration=iteration_index,
@@ -580,7 +623,7 @@ class AdversarialCurriculumPipeline:
                 )
                 item["description_messages"].append({"role": "assistant", "content": raw})
                 item["description_messages"].append(
-                    build_red_task_description_repair_message(topic, item["last_rejection_reasons"])
+                    build_red_task_description_repair_message(topic, item["last_rejection_reasons"], language=self._task_language(item))
                 )
 
         reference_temperature = float(getattr(self.config.red, "reference_temperature", 0.0))
@@ -679,13 +722,14 @@ class AdversarialCurriculumPipeline:
                                         rejection_reasons,
                                         description_payload,
                                         repair_context=self._format_reference_repair_context(reference_execution),
+                                        language=self._task_language(item),
                                     )
                                 )
                                 continue
                     item["spec_payload"] = spec_payload
                     item["spec_raw_response"] = raw
-                    item["messages"] = build_red_buggy_messages(topic, spec_payload)
-                    item["task_prompt"] = build_red_buggy_training_prompt(topic, spec_payload)
+                    item["messages"] = build_red_buggy_messages(topic, spec_payload, language=self._task_language(item))
+                    item["task_prompt"] = build_red_buggy_training_prompt(topic, spec_payload, language=self._task_language(item))
                     self.logger.event(
                         "red_task_spec_generated",
                         iteration=iteration_index,
@@ -725,6 +769,7 @@ class AdversarialCurriculumPipeline:
                         topic,
                         item["last_rejection_reasons"],
                         dict(item.get("description_payload") or {}),
+                        language=self._task_language(item),
                     )
                 )
 
@@ -1077,7 +1122,10 @@ class AdversarialCurriculumPipeline:
         return accepted
 
     def _build_hard_example(self, episode: EpisodeRecord, weakness_summary: str) -> RedTrainingExample:
-        prompt = str(episode.task.metadata.get("red_prompt") or build_red_training_prompt(episode.topic, weakness_summary))
+        prompt = str(
+            episode.task.metadata.get("red_prompt")
+            or build_red_training_prompt(episode.topic, weakness_summary, language=getattr(episode.task, "language", self._task_language()))
+        )
         return RedTrainingExample(
             example_id=uuid4().hex[:16],
             topic=episode.topic,
@@ -1555,7 +1603,10 @@ class AdversarialCurriculumPipeline:
                 rejection_reason = str(judge_output.metadata.get("red_rejection_reason") or "judge_bad_task")
                 self._record_red_rejection(
                     topic=task.topic,
-                    prompt=str(task.metadata.get("red_prompt") or build_red_training_prompt(task.topic, weakness_summary)),
+                    prompt=str(
+                        task.metadata.get("red_prompt")
+                        or build_red_training_prompt(task.topic, weakness_summary, language=getattr(task, "language", self._task_language()))
+                    ),
                     rejected_completion=serialize_red_completion(task),
                     rejection_reason=rejection_reason,
                     spec=spec,

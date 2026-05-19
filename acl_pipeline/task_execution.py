@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -27,6 +30,13 @@ def _failure_status(error_message: str) -> str:
     if "nameerror" in lowered:
         return "nameerror"
     return "failed"
+
+
+def _task_language(config: TaskExecutionConfig) -> str:
+    language = str(getattr(config, "language", "python") or "python").strip().lower()
+    if language in {"c++", "cc", "cxx"}:
+        return "cpp"
+    return "cpp" if language == "cpp" else "python"
 
 
 _TASK_RUNNER = '''
@@ -60,7 +70,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
 '''
 
 
-def execute_program(
+def _execute_python_program(
     program: str,
     config: TaskExecutionConfig,
     *,
@@ -120,6 +130,191 @@ def execute_program(
                 stderr=stderr,
                 duration_seconds=duration,
             )
+
+
+def _compiler_is_msvc(compiler: str) -> bool:
+    name = Path(str(compiler or "")).name.lower()
+    return name in {"cl", "cl.exe"}
+
+
+def _cpp_compile_command(source_path: Path, exe_path: Path, config: TaskExecutionConfig) -> List[str]:
+    compiler = str(getattr(config, "cpp_compiler", "") or "g++")
+    standard = str(getattr(config, "cpp_standard", "") or "").strip()
+    extra_args = [str(item) for item in (getattr(config, "cpp_compile_args", []) or []) if str(item).strip()]
+    if _compiler_is_msvc(compiler):
+        args = [compiler, "/nologo"]
+        if standard:
+            args.append(f"/std:{standard}")
+        args.extend(extra_args)
+        args.extend([str(source_path), f"/Fe:{exe_path}"])
+        return args
+
+    args = [compiler]
+    if standard and not any(arg.startswith("-std=") for arg in extra_args):
+        args.append(f"-std={standard}")
+    args.extend(extra_args)
+    args.extend([str(source_path), "-o", str(exe_path)])
+    return args
+
+
+def _normalize_cpp_diagnostics(text: str, *, temp_dir: str, max_chars: int) -> str:
+    raw = _truncate(text, max_chars)
+    if not raw:
+        return raw
+    normalized = raw.replace("\\", "/")
+    temp_normalized = str(temp_dir).replace("\\", "/").rstrip("/")
+    if temp_normalized:
+        normalized = normalized.replace(temp_normalized + "/", "")
+    normalized = re.sub(r"(?m)^[^\n]*task\.cpp", "task.cpp", normalized)
+    return normalized.strip()
+
+
+def _format_cpp_compile_error(proc: subprocess.CompletedProcess[str], *, temp_dir: str, config: TaskExecutionConfig) -> str:
+    stdout = _normalize_cpp_diagnostics(proc.stdout or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+    stderr = _normalize_cpp_diagnostics(proc.stderr or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+    diagnostic = stderr or stdout or f"Compiler exited with return code {proc.returncode}."
+    return "Compilation failed:\n" + diagnostic
+
+
+def _cpp_failure_status(error_message: str) -> str:
+    lowered = str(error_message or "").lower()
+    if "assertion" in lowered or "assert failed" in lowered:
+        return "failed"
+    if "segmentation fault" in lowered or "access violation" in lowered:
+        return "runtime_error"
+    return "failed"
+
+
+def _execute_cpp_program(
+    program: str,
+    config: TaskExecutionConfig,
+    *,
+    timeout_seconds: Optional[int] = None,
+) -> TaskExecutionResult:
+    program = str(program or "").rstrip() + "\n"
+    start = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="acl_cpp_task_") as temp_dir:
+        source_path = Path(temp_dir) / "task.cpp"
+        exe_path = Path(temp_dir) / ("task.exe" if os.name == "nt" else "task")
+        source_path.write_text(program, encoding="utf-8")
+        compile_timeout = int(getattr(config, "compile_timeout_seconds", 0) or config.timeout_seconds)
+        run_timeout = timeout_seconds if timeout_seconds is not None else config.timeout_seconds
+        compile_cmd = _cpp_compile_command(source_path, exe_path, config)
+        try:
+            compile_proc = subprocess.run(
+                compile_cmd,
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=compile_timeout,
+                check=False,
+            )
+        except OSError as exc:
+            duration = time.perf_counter() - start
+            command_text = " ".join(shlex.quote(part) for part in compile_cmd)
+            return TaskExecutionResult(
+                status="compile_error",
+                returncode=-1,
+                error_message=f"Compilation failed:\nUnable to run C++ compiler. Command: {command_text}\n{type(exc).__name__}: {exc}",
+                stdout="",
+                stderr=str(exc),
+                duration_seconds=duration,
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration = time.perf_counter() - start
+            stdout = _normalize_cpp_diagnostics((exc.stdout or ""), temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            stderr = _normalize_cpp_diagnostics((exc.stderr or ""), temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            return TaskExecutionResult(
+                status="compile_error",
+                returncode=-9,
+                error_message=f"Compilation timed out after {compile_timeout} seconds.",
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+            )
+
+        if compile_proc.returncode != 0:
+            duration = time.perf_counter() - start
+            stdout = _normalize_cpp_diagnostics(compile_proc.stdout or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            stderr = _normalize_cpp_diagnostics(compile_proc.stderr or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            return TaskExecutionResult(
+                status="compile_error",
+                returncode=int(compile_proc.returncode),
+                error_message=_format_cpp_compile_error(compile_proc, temp_dir=temp_dir, config=config),
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+            )
+
+        if not exe_path.exists():
+            duration = time.perf_counter() - start
+            command_text = " ".join(shlex.quote(part) for part in compile_cmd)
+            return TaskExecutionResult(
+                status="compile_error",
+                returncode=-1,
+                error_message=f"Compilation produced no executable: {exe_path.name}. Command: {command_text}",
+                stdout=_normalize_cpp_diagnostics(compile_proc.stdout or "", temp_dir=temp_dir, max_chars=config.capture_max_chars),
+                stderr=_normalize_cpp_diagnostics(compile_proc.stderr or "", temp_dir=temp_dir, max_chars=config.capture_max_chars),
+                duration_seconds=duration,
+            )
+
+        try:
+            proc = subprocess.run(
+                [str(exe_path)],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=run_timeout,
+                check=False,
+            )
+            duration = time.perf_counter() - start
+            stdout = _normalize_cpp_diagnostics(proc.stdout or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            stderr = _normalize_cpp_diagnostics(proc.stderr or "", temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            if proc.returncode == 0:
+                return TaskExecutionResult(
+                    status="passed",
+                    returncode=0,
+                    error_message="Program exited successfully. No failing assertion or runtime error was reproduced.",
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration_seconds=duration,
+                )
+            error_message = stderr or stdout or f"Process failed with return code {proc.returncode}."
+            return TaskExecutionResult(
+                status=_cpp_failure_status(error_message),
+                returncode=int(proc.returncode),
+                error_message=error_message,
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration = time.perf_counter() - start
+            stdout = _normalize_cpp_diagnostics((exc.stdout or ""), temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            stderr = _normalize_cpp_diagnostics((exc.stderr or ""), temp_dir=temp_dir, max_chars=config.capture_max_chars)
+            return TaskExecutionResult(
+                status="timeout",
+                returncode=-9,
+                error_message=f"TimeoutError: task execution exceeded {run_timeout} seconds.",
+                stdout=stdout,
+                stderr=stderr,
+                duration_seconds=duration,
+            )
+
+
+def execute_program(
+    program: str,
+    config: TaskExecutionConfig,
+    *,
+    timeout_seconds: Optional[int] = None,
+) -> TaskExecutionResult:
+    if _task_language(config) == "cpp":
+        return _execute_cpp_program(program, config, timeout_seconds=timeout_seconds)
+    return _execute_python_program(program, config, timeout_seconds=timeout_seconds)
 
 
 def execute_task(task: PythonTask, config: TaskExecutionConfig) -> TaskExecutionResult:
@@ -487,6 +682,19 @@ if __name__ == "__main__":
 
 
 def audit_buggy_solution_asserts(task: PythonTask, config: TaskExecutionConfig) -> List[Dict[str, Any]]:
+    language = str(getattr(task, "language", "") or getattr(config, "language", "python") or "python").strip().lower()
+    if language in {"cpp", "c++", "cc", "cxx"}:
+        return [
+            {
+                "kind": "unsupported_cpp_assert_audit",
+                "test_index": "unsupported",
+                "expression": "C++ assert auditing is not implemented; use compiler/runtime diagnostics.",
+                "args_repr": None,
+                "reference_value": None,
+                "buggy_value": None,
+                "equal": None,
+            }
+        ]
     payload = {
         "reference_solution": str(task.reference_solution or task.metadata.get("reference_solution") or ""),
         "buggy_solution": task.combined_program(),

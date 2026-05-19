@@ -23,11 +23,19 @@ class PythonTask:
     topic: str
     statement: str
     buggy_solution: str
+    language: str = "python"
     metadata: Dict[str, Any] = field(default_factory=dict)
     failing_asserts: List[str] = field(default_factory=list)
     reference_solution: str = ""
 
     def __post_init__(self) -> None:
+        language = str(self.language or self.metadata.get("language") or "python").strip().lower()
+        if language in {"c++", "cpp", "cc", "cxx"}:
+            language = "cpp"
+        elif language not in {"python", "cpp"}:
+            language = "python"
+        self.language = language
+        self.metadata["language"] = language
         reference = str(self.reference_solution or self.metadata.get("reference_solution") or "")
         self.reference_solution = reference
         if reference:
@@ -102,6 +110,7 @@ class RedTaskSpec:
     target_function: str
     intended_bug: str
     expected_first_failure: str
+    language: str = "python"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

@@ -1,0 +1,341 @@
+runtime:
+  seed: 42
+  total_episodes: 250
+  debug_all: false
+  iteration_size: 6
+  checkpoint_every_episodes: 10
+  log_level: INFO
+
+task_execution:
+  enabled: true
+  language: cpp
+  cpp_compiler: g++
+  cpp_standard: c++20
+  cpp_compile_args: [-O0, -g, -Wall, -Wextra, -pedantic]
+  allow_compile_error_tasks: true
+  compile_timeout_seconds: 10
+  timeout_seconds: 5
+  max_red_generation_attempts: 3
+  capture_max_chars: 2200
+  min_code_lines_for_repair: 18
+  probabilistic_repair_probability: 0.5
+  passed_task_keep_probability: 0.1
+
+storage:
+  root_dir: ./runs/cpp_hints_qwen3_1_7b
+  keep_last_n_checkpoints: 2
+  hard_buffer_max_size: 2048
+
+curriculum:
+  reward_ema_alpha: 0.2
+  low_reward_boost: 1.5
+  iteration_weak_topic_boost: 0.15
+  repeat_topic_reset_threshold: 5
+  adaptive_weighting_until_iteration: 150
+  post_adaptation_topic_weight: 1.0
+  topics:
+    - {name: "Vectors and Iterators", weight: 1.0}
+    - {name: "Strings and Parsing", weight: 1.0}
+    - {name: "Maps, Sets, and Hash Tables", weight: 1.0}
+    - {name: "Classes, RAII, and Object State", weight: 1.0}
+    - {name: "References, Moves, and Lifetimes", weight: 1.0}
+    - {name: "Templates and Overload Resolution", weight: 1.0}
+    - {name: "Numeric Types and Integer Overflow", weight: 1.0}
+    - {name: "Algorithms and Comparators", weight: 1.0}
+    - {name: "Recursion and Dynamic Programming", weight: 1.0}
+    - {name: "Exceptions and Error Handling", weight: 1.0}
+    - {name: "Pointers and Ownership", weight: 1.0}
+    - {name: "Const Correctness and Mutability", weight: 1.0}
+
+socratic:
+  training_method: dpo
+  model_name_or_path: Qwen/Qwen3-1.7B
+  tokenizer_name_or_path:
+  base_adapter_path:
+  quantization:
+  enable_thinking: false
+  hardware:
+    gpu_ids: [1]
+    persistent: false
+    per_gpu_memory_gib: 24
+    cpu_offload_gib: 64
+  generation:
+    batch_size: 1
+    max_new_tokens: 180
+    temperature: 0.9
+    top_p: 0.95
+    do_sample: true
+    repetition_penalty: 1.05
+  candidate_diversity:
+    enabled: true
+    candidate_overrides:
+      - {temperature: 0.7, top_p: 0.9, repetition_penalty: 1.0}
+      - {temperature: 1.0, top_p: 0.95, repetition_penalty: 1.05}
+      - {temperature: 1.25, top_p: 1.0, repetition_penalty: 1.1}
+    candidate_focus_salts:
+      - "Focus your questions on compiler or runtime evidence: the exact diagnostic, assert text, and the line it points to."
+      - "Focus your questions on data and ownership: which object, reference, iterator, or container state changes before the failure."
+      - "Focus your questions on control flow: which branch, loop bound, overload, or recursive case is reached first."
+  lora:
+    enabled: true
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
+  dpo:
+    update_every_episodes: 8
+    min_preference_pairs_before_update: 12
+    max_training_pairs: 48
+    num_hint_candidates: 4
+    max_pairs_per_task: 2
+    min_score_gap: 0.8
+    learning_rate: 3.0e-5
+    epochs: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 4
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    beta: 0.2
+    loss_type: ipo
+    rpo_alpha: 0.5
+    label_smoothing: 0.0
+    max_length: 2048
+    max_prompt_length: 1536
+    logging_steps: 10
+    save_steps: 100
+    save_total_limit: 2
+    bf16: true
+    fp16: false
+    gradient_checkpointing: true
+    full_ft: false
+    max_uses_per_preference: 1
+    reference_adapter: previous
+
+judge:
+  model_name_or_path: Qwen/Qwen3-32B
+  tokenizer_name_or_path:
+  base_adapter_path:
+  inference_backend: vllm_server
+  vllm_base_url: http://localhost:8000/v1
+  vllm_api_key: EMPTY
+  vllm_timeout_seconds: 120
+  vllm_max_retries: 2
+  quantization: 8bit
+  enable_thinking: false
+  reward_weights:
+    bug_localization: 0.25
+    usefulness: 0.25
+    socratic_style: 0.25
+    technical_accuracy: 0.25
+  batch_spread_strength: 0.15
+  episode_batch_size: 1
+  bad_task_threshold: 3.0
+  normalize_across_batches: 8
+  red_task_batch_size: 4
+  examples:
+    - statement: "Return the sum of positive values in a vector."
+      code: |
+        #include <cassert>
+        #include <vector>
+        int sum_positive(const std::vector<int>& values) {
+            int total = 0;
+            for (int value : values) {
+                if (value > 0) {
+                    total = value;
+                }
+            }
+            return total;
+        }
+        int main() {
+            assert(sum_positive({1, 2, -5, 3}) == 6);
+            return 0;
+        }
+      observed_failure: "task.cpp:10: int main(): Assertion `sum_positive({1, 2, -5, 3}) == 6' failed."
+      hint_text: "Trace `total` through the loop: after seeing 1 and then 2, what value is kept, and how does that compare with the assertion?"
+      expected_criteria_scores: {bug_localization: 9, usefulness: 9, socratic_style: 9, technical_accuracy: 9}
+      expected_no_solution_reveal: true
+      expected_hint_paraphrases_solution: false
+      expected_task_quality: 9
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Grounded in the failing variable and assertion without stating the assignment fix."
+
+    - statement: "Return the sum of positive values in a vector."
+      code: |
+        #include <cassert>
+        #include <vector>
+        int sum_positive(const std::vector<int>& values) {
+            int total = 0;
+            for (int value : values) {
+                if (value > 0) {
+                    total = value;
+                }
+            }
+            return total;
+        }
+        int main() {
+            assert(sum_positive({1, 2, -5, 3}) == 6);
+            return 0;
+        }
+      observed_failure: "task.cpp:10: int main(): Assertion `sum_positive({1, 2, -5, 3}) == 6' failed."
+      hint_text: "The bug is that `total = value` should add into `total` instead of replacing it."
+      expected_criteria_scores: {bug_localization: 2, usefulness: 2, socratic_style: 0, technical_accuracy: 2}
+      expected_no_solution_reveal: false
+      expected_hint_paraphrases_solution: true
+      expected_task_quality: 9
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: false
+      explanation: "Directly reveals the fix."
+
+    - statement: "Count how many strings have length at least the given limit."
+      code: |
+        #include <cassert>
+        #include <string>
+        #include <vector>
+        int count_long(const std::vector<std::string>& words, int limit) {
+            int count = 0;
+            for (const auto& word : values) {
+                if ((int)word.size() >= limit) {
+                    ++count;
+                }
+            }
+            return count;
+        }
+        int main() {
+            assert(count_long({"a", "abcd"}, 3) == 1);
+            return 0;
+        }
+      observed_failure: "Compilation failed:\ntask.cpp:6:34: error: 'values' was not declared in this scope"
+      hint_text: "Which identifier does the compiler say is unavailable on that line, and what container name is actually in scope for this function?"
+      expected_criteria_scores: {bug_localization: 9, usefulness: 9, socratic_style: 9, technical_accuracy: 9}
+      expected_no_solution_reveal: true
+      expected_hint_paraphrases_solution: false
+      expected_task_quality: 8
+      expected_task_is_valid_for_socratic: true
+      expected_hint_is_valid_for_socratic: true
+      explanation: "Uses compiler evidence and asks the student to compare names without giving the replacement."
+
+  red_examples:
+    - topic: "Vectors and Iterators"
+      statement: "Remove adjacent duplicates from a sorted vector while preserving one copy of each value."
+      code: |
+        #include <cassert>
+        #include <vector>
+        std::vector<int> unique_sorted(const std::vector<int>& values) {
+            std::vector<int> result;
+            for (int value : values) {
+                if (!result.empty() && result.back() == value) {
+                    result.push_back(value);
+                } else {
+                    result.push_back(value);
+                }
+            }
+            return result;
+        }
+        int main() {
+            assert((unique_sorted({1, 1, 2, 2, 3}) == std::vector<int>{1, 2, 3}));
+            return 0;
+        }
+      observed_failure: "task.cpp:14: int main(): Assertion `(unique_sorted({1, 1, 2, 2, 3}) == std::vector<int>{1, 2, 3})' failed."
+      red_spec:
+        topic: "Vectors and Iterators"
+        language: cpp
+        target_function: "unique_sorted"
+        intended_bug: "The duplicate branch appends the duplicate instead of skipping it."
+        expected_first_failure: "assert unique_sorted({1,1,2,2,3}) == {1,2,3}"
+        metadata: {failure_mode: "duplicate_branch_appends", difficulty: "medium", language: cpp}
+      expected_task_quality: 8
+      expected_task_hardness: 6
+      expected_task_is_valid_for_socratic: true
+      expected_red_rejection_reason:
+
+    - topic: "Numeric Types and Integer Overflow"
+      statement: "Compute the average of non-empty integer values as a double."
+      code: |
+        #include <cassert>
+        #include <vector>
+        double average(const std::vector<int>& values) {
+            int total = 0;
+            for (int value : values) {
+                total += value;
+            }
+            return static_cast<double>(total) / values.size();
+        }
+        int main() {
+            assert(average({1, 2}) == 1.5);
+            return 0;
+        }
+      observed_failure: "Program exited successfully. No failing assertion or runtime error was reproduced."
+      red_spec:
+        topic: "Numeric Types and Integer Overflow"
+        language: cpp
+        target_function: "average"
+        intended_bug: "Uses integer division before converting to double."
+        expected_first_failure: "assert average({1,2}) == 1.5"
+        metadata: {failure_mode: "missing_intended_bug", difficulty: "medium", language: cpp}
+      expected_task_quality: 2
+      expected_task_hardness: 2
+      expected_task_is_valid_for_socratic: false
+      expected_red_rejection_reason: "already_correct_code"
+  hardware:
+    gpu_ids: [0]
+    persistent: true
+    per_gpu_memory_gib: 46
+    cpu_offload_gib: 128
+  generation:
+    batch_size: 1
+    max_new_tokens: 2400
+    temperature: 0.5
+    top_p: 0.7
+    do_sample: false
+    repetition_penalty: 1.0
+
+red:
+  model_name_or_path: Qwen/Qwen3-32B
+  tokenizer_name_or_path:
+  base_adapter_path:
+  quantization:
+  generation_quantization: 8bit
+  update_quantization: 4bit
+  force_base_generation_after_iteration: 1
+  reference_temperature: 0.0
+  reference_top_p: 1.0
+  reference_do_sample: false
+  enable_thinking: false
+  hardware:
+    gpu_ids: [2, 3]
+    persistent: true
+    per_gpu_memory_gib: 40
+    cpu_offload_gib: 128
+  generation:
+    batch_size: 1
+    max_new_tokens: 4096
+    max_context_tokens: 16384
+    temperature: 1.0
+    top_p: 0.9
+    do_sample: true
+    repetition_penalty: 1.02
+  lora:
+    enabled: true
+    r: 32
+    alpha: 128
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj, up_proj, down_proj, gate_proj]
+  update:
+    update_every_episodes: 100
+    min_hard_examples: 16
+    max_sft_examples: 192
+    max_dpo_pairs: 64
+    mining_bottom_fraction: 0.25
+    hard_reward_max: 0.80
+    min_red_reward: 0.50
+    learning_rate: 1.0e-5
+    epochs: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 8
+    max_length: 4096
+    logging_steps: 10
+    dpo_enabled: true
+    dpo_beta: 0.1
+    max_sft_uses_per_example: 2
+    max_dpo_uses_per_example: 3
