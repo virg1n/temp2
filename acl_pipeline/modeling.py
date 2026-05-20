@@ -380,6 +380,17 @@ def attach_lora_adapter(model: Any, lora: LoRASettings) -> Any:
         task_type="CAUSAL_LM",
         target_modules=list(lora.target_modules) or None,
     )
+    # PEFT versions that support GPTQModel/AWQ may import the older
+    # AwqGEMMQuantLinear symbol, while GPTQModel 7.x renamed it to
+    # AwqGEMMLinear. The modules are compatible for PEFT's dispatcher
+    # isinstance checks, so alias the new name to the old one when needed.
+    try:
+        import gptqmodel.nn_modules.qlinear.gemm_awq as gemm_awq
+
+        if not hasattr(gemm_awq, "AwqGEMMQuantLinear") and hasattr(gemm_awq, "AwqGEMMLinear"):
+            setattr(gemm_awq, "AwqGEMMQuantLinear", getattr(gemm_awq, "AwqGEMMLinear"))
+    except Exception:
+        pass
     return get_peft_model(model, config)
 
 
